@@ -46,6 +46,8 @@ pub enum AiRequest {
     Ps(String),
     Chat {
         model: String,
+        /// Optional fast decision model consulted first (see `router.rs`).
+        router: Option<String>,
         history: Vec<ChatMsg>,
         scene: String,
         prompt: String,
@@ -69,6 +71,10 @@ pub enum AiEvent {
         secs: f32,
     },
     Error(String),
+    /// The decision model chose a route (shown in the chat before the builder answers).
+    Routed { router: String, route: String, detail: String, secs: f32 },
+    /// The decision model failed; the builder handles the request instead.
+    RouterFailed(String),
     /// (model, fraction of the model in VRAM)
     Ps(String, f32),
     PullProgress(String, f32),
@@ -98,6 +104,7 @@ impl AiClient {
                     .http_status_as_error(false)
                     .build()
                     .into();
+                let mut tool_caps: std::collections::HashMap<String, bool> = Default::default();
                 for req in req_rx {
                     match req {
                         AiRequest::ListModels => {
@@ -110,12 +117,55 @@ impl AiClient {
                         }
                         AiRequest::Chat {
                             model,
+                            router,
                             history,
                             scene,
                             prompt,
                         } => {
                             let t0 = std::time::Instant::now();
                             cancel2.store(false, Ordering::Relaxed);
+                            let mut prompt = prompt;
+                            // ---- stage 1: decision model ----
+                            if let Some(rm) = router.filter(|r| *r != model) {
+                                let tool_mode = *tool_caps.entry(rm.clone()).or_insert_with(|| crate::router::capabilities(&agent, &host, &rm).iter().any(|c| c == "tools"));
+                                match crate::router::decide(&agent, &host, &rm, &history, &scene, &prompt, tool_mode) {
+                                    Ok((route, raw)) => {
+                                        let secs = t0.elapsed().as_secs_f32();
+                                        match route {
+                                            crate::router::Route::Direct { reply, commands } => {
+                                                let raw = json!({"reply": reply, "commands": commands}).to_string();
+                                                let _ = ev_tx.send(AiEvent::Routed { router: rm.clone(), route: "direct".into(), detail: String::new(), secs });
+                                                let _ = ev_tx.send(AiEvent::Reply { reply, commands, raw, secs });
+                                                repaint();
+                                                continue;
+                                            }
+                                            crate::router::Route::Answer(text) => {
+                                                let _ = ev_tx.send(AiEvent::Routed { router: rm.clone(), route: "answer".into(), detail: String::new(), secs });
+                                                let _ = ev_tx.send(AiEvent::Reply { reply: text.clone(), commands: vec![], raw: json!({"reply": text, "commands": []}).to_string(), secs });
+                                                repaint();
+                                                continue;
+                                            }
+                                            crate::router::Route::Delegate { plan, .. } => {
+                                                let _ = ev_tx.send(AiEvent::Routed { router: rm.clone(), route: "delegate".into(), detail: plan.clone(), secs });
+                                                repaint();
+                                                if !plan.trim().is_empty() {
+                                                    prompt = format!("{prompt}\n\n(Plan from the decision model — follow it if it helps: {plan})");
+                                                }
+                                                let _ = raw;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = ev_tx.send(AiEvent::RouterFailed(format!("{rm}: {e}")));
+                                        repaint();
+                                    }
+                                }
+                                if cancel2.load(Ordering::Relaxed) {
+                                    let _ = ev_tx.send(AiEvent::Error("cancelled".into()));
+                                    continue;
+                                }
+                            }
+                            // ---- stage 2: builder model ----
                             let ev = match chat(
                                 &agent, &host, &model, &history, &scene, &prompt, &ev_tx, &repaint,
                                 &cancel2,
@@ -201,7 +251,7 @@ pub fn pick_best_model(installed: &[String]) -> Option<String> {
     // Otherwise prefer anything that isn't an embedding / vision-only model.
     installed
         .iter()
-        .find(|m| !m.contains("embed") && !m.contains("whisper"))
+        .find(|m| !m.contains("embed") && !m.contains("whisper") && !m.to_lowercase().starts_with("tev"))
         .cloned()
 }
 

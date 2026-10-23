@@ -21,6 +21,9 @@ pub struct Settings {
     pub ollama_host: String,
     pub model: String,
     pub auto_select_model: bool,
+    /// Fast decision/router model consulted before the builder model ("" = none).
+    pub decision_model: String,
+    pub auto_decision_model: bool,
     pub auto_execute: bool,
     pub instant_commands: bool,
     pub voice_model: String,
@@ -47,6 +50,8 @@ impl Default for Settings {
                 .unwrap_or_else(|_| "http://localhost:11434".into()),
             model: String::new(),
             auto_select_model: true,
+            decision_model: String::new(),
+            auto_decision_model: true,
             auto_execute: true,
             instant_commands: true,
             voice_model: "base.en".into(),
@@ -113,6 +118,8 @@ struct ChatEntry {
     applied: bool,
     voice: bool,
     instant: bool,
+    /// Which model(s) handled the request, e.g. "handled by tev1".
+    via: Option<String>,
     streaming: bool,
     secs: f32,
 }
@@ -127,6 +134,7 @@ impl ChatEntry {
             applied: false,
             voice: false,
             instant: false,
+            via: None,
             streaming: false,
             secs: 0.0,
         }
@@ -156,6 +164,10 @@ pub struct App {
     /// models we already warned about running partly on the CPU
     warned_cpu: Vec<String>,
     ai_cancelled: bool,
+    /// Current stage of a two-model request ("tev1 deciding", "qwen3:8b building").
+    route_stage: Option<String>,
+    pending_via: Option<String>,
+    router_warned: bool,
     pull: Option<(String, f32)>,
     voice_status: VoiceStatus,
     transcribing: bool,
@@ -223,6 +235,9 @@ impl App {
             streaming: None,
             warned_cpu: vec![],
             ai_cancelled: false,
+            route_stage: None,
+            pending_via: None,
+            router_warned: false,
             pull: None,
             voice_status: VoiceStatus::NotLoaded,
             transcribing: false,
@@ -271,6 +286,9 @@ impl App {
                 AiEvent::Models(Ok(list)) => {
                     self.ollama = OllamaStatus::Online;
                     self.models = list;
+                    if self.settings.auto_decision_model {
+                        self.settings.decision_model = crate::router::pick_decision_model(&self.models).unwrap_or_default();
+                    }
                     if self.settings.auto_select_model
                         || self.settings.model.is_empty()
                         || !self.models.contains(&self.settings.model)
@@ -288,6 +306,31 @@ impl App {
                 AiEvent::Models(Err(e)) => {
                     self.ollama = OllamaStatus::Offline(e);
                 }
+                AiEvent::Routed { router, route, detail, secs } => {
+                    match route.as_str() {
+                        "delegate" => {
+                            self.route_stage = Some(format!("{} building", self.settings.model));
+                            let plan: String = detail.chars().take(240).collect();
+                            let msg = if plan.trim().is_empty() {
+                                format!("🧭 {router} → {} ({secs:.1}s): needs the builder model", self.settings.model)
+                            } else {
+                                format!("🧭 {router} → {} ({secs:.1}s) · plan: {plan}", self.settings.model)
+                            };
+                            self.chat.push(ChatEntry::new(Role::System, msg));
+                        }
+                        _ => {
+                            self.route_stage = None;
+                            self.pending_via = Some(format!("🧭 handled by {router} · {route} · {secs:.1}s"));
+                        }
+                    }
+                }
+                AiEvent::RouterFailed(e) => {
+                    self.route_stage = Some(format!("{} thinking", self.settings.model));
+                    if !self.router_warned {
+                        self.router_warned = true;
+                        self.chat.push(ChatEntry::new(Role::System, format!("⚠ Decision model failed, so {} handled this request instead. ({e})", self.settings.model)));
+                    }
+                }
                 AiEvent::Delta { reply, commands } => {
                     let idx = self.stream_entry();
                     if !reply.is_empty() {
@@ -302,6 +345,7 @@ impl App {
                     secs,
                 } => {
                     self.waiting_ai = None;
+                    self.route_stage = None;
                     self.history.push(ChatMsg {
                         role: "assistant".into(),
                         content: raw,
@@ -332,6 +376,8 @@ impl App {
                 }
                 AiEvent::Error(e) => {
                     self.waiting_ai = None;
+                    self.route_stage = None;
+                    self.pending_via = None;
                     let partial = self.streaming.take();
                     if let Some((i, _)) = partial {
                         self.chat[i].streaming = false;
@@ -419,6 +465,7 @@ impl App {
             return s.0;
         }
         let mut e = ChatEntry::new(Role::Assistant, "…");
+        e.via = self.pending_via.take();
         e.streaming = true;
         self.chat.push(e);
         let idx = self.chat.len() - 1;
@@ -500,8 +547,11 @@ impl App {
             return;
         }
         let scene = self.ed.scene.summary(&self.ed.selection);
+        let router = Some(self.settings.decision_model.clone()).filter(|d| !d.is_empty() && self.models.contains(d));
+        self.route_stage = router.as_ref().map(|r| format!("{r} deciding"));
         self.ai.send(AiRequest::Chat {
             model: self.settings.model.clone(),
+            router,
             history: self.history.clone(),
             scene,
             prompt: text.clone(),
@@ -1029,7 +1079,11 @@ impl App {
                             ui.add_space(6.0);
                             let (dot, label) = match &self.ollama {
                                 OllamaStatus::Online if !self.settings.model.is_empty() => {
-                                    (theme::OK, format!("✦ {}", self.settings.model))
+                                    if !self.settings.decision_model.is_empty() && self.models.contains(&self.settings.decision_model) {
+                                        (theme::OK, format!("✦ {} → {}", short_model(&self.settings.decision_model), short_model(&self.settings.model)))
+                                    } else {
+                                        (theme::OK, format!("✦ {}", self.settings.model))
+                                    }
                                 }
                                 OllamaStatus::Online => (theme::WARN, "✦ no model".into()),
                                 OllamaStatus::Checking => (theme::TEXT_DIM, "✦ connecting…".into()),
@@ -1446,6 +1500,9 @@ impl App {
                                     } else {
                                         ui.label(&e.text);
                                     }
+                                    if let Some(v) = &e.via {
+                                        ui.label(RichText::new(v).small().color(theme::TEXT_DIM));
+                                    }
                                     if !e.commands.is_empty() {
                                         let errs =
                                             e.log.iter().filter(|l| l.starts_with('✖')).count();
@@ -1532,7 +1589,7 @@ impl App {
                 let what = if self.streaming.is_some() {
                     format!("streaming · {n} action{}", if n == 1 { "" } else { "s" })
                 } else {
-                    "thinking".into()
+                    self.route_stage.clone().map(|s| s.trim_start_matches(&format!("{} ", self.settings.model)).to_string()).unwrap_or_else(|| "thinking".into())
                 };
                 ui.label(
                     RichText::new(format!(
@@ -1766,6 +1823,29 @@ impl App {
                             &mut self.settings.auto_select_model,
                             "Auto-pick best installed model",
                         );
+                        ui.end_row();
+                        ui.label("Decision").on_hover_text("A small, fast tool-calling model (e.g. tev1) that reads every request first: it does simple edits itself and hands complex builds to the builder model above.");
+                        ui.horizontal(|ui| {
+                            let sel = if self.settings.decision_model.is_empty() { "None (builder only)".to_string() } else { self.settings.decision_model.clone() };
+                            egui::ComboBox::from_id_salt("decision_model").selected_text(sel).width(160.0).show_ui(ui, |ui| {
+                                if ui.selectable_label(self.settings.decision_model.is_empty(), "None (builder only)").clicked() {
+                                    self.settings.decision_model.clear();
+                                    self.settings.auto_decision_model = false;
+                                }
+                                for m in self.models.clone() {
+                                    if m == self.settings.model {
+                                        continue;
+                                    }
+                                    if ui.selectable_label(self.settings.decision_model == m, &m).clicked() {
+                                        self.settings.decision_model = m;
+                                        self.settings.auto_decision_model = false;
+                                    }
+                                }
+                            });
+                        });
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.settings.auto_decision_model, "Auto-use tev1 when installed");
                         ui.end_row();
                         ui.label("Pull");
                         ui.horizontal(|ui| {
@@ -3268,6 +3348,10 @@ fn material_props(ui: &mut Ui, o: &mut crate::scene::Object) {
                 .color(theme::TEXT_DIM),
         );
     });
+}
+
+fn short_model(m: &str) -> &str {
+    m.strip_suffix(":latest").unwrap_or(m)
 }
 
 fn clean_transcript(t: &str) -> String {

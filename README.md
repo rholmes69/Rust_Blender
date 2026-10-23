@@ -29,6 +29,18 @@ The default is **`qwen3:8b`**. Qwen3 follows JSON-schema "structured outputs" an
 
 The app ranks whatever you have installed and picks the best fit: qwen3 first, then qwen2.5, llama3.1, mistral-nemo, gemma3 and so on. You can always override the choice in **Copilot ⚙ → Model**.
 
+## Two-model AI: decision model + builder
+
+Install a small tool-calling **decision model** (for example `tev1`) alongside qwen3. The app picks up anything named `tev1` automatically; to choose one yourself, use Copilot ⚙ → **Decision**. Every request then goes through two stages:
+
+1. The **decision model** reads the request plus the scene and picks one of Ollama's tools:
+   * `scene_command` handles simple edits ("put a small blue ball on the cube") **itself**, usually in well under a second;
+   * `answer` replies to questions ("how do I extrude?") without touching the scene;
+   * `delegate_to_builder` hands creative, multi-object builds to the builder model, together with a short plan.
+2. When the request is delegated, the **builder model** (qwen3) streams the full build and uses the plan as guidance.
+
+The chat shows who handled each request ("handled by tev1 · direct" or "tev1 → qwen3:8b · plan: …"). If the decision model doesn't support Ollama tools, the app falls back to JSON output with the same routes. If the decision model fails, qwen handles the request. Simple commands like "undo" or "top view" still skip both models.
+
 ## Setup (Windows)
 
 1. Install **Rust**: <https://rustup.rs>. You also need the *MSVC C++ Build Tools*; rustup offers to install them.

@@ -11,6 +11,7 @@ mod gltf;
 mod gpu;
 mod mesh;
 mod render;
+mod router;
 mod scene;
 mod theme;
 mod viewport;

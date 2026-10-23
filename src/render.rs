@@ -28,7 +28,13 @@ pub struct Raster {
 
 impl Default for Raster {
     fn default() -> Self {
-        Self { w: 0, h: 0, color: vec![], depth: vec![], id: vec![] }
+        Self {
+            w: 0,
+            h: 0,
+            color: vec![],
+            depth: vec![],
+            id: vec![],
+        }
     }
 }
 
@@ -52,16 +58,29 @@ impl Raster {
     }
 
     pub fn id_at(&self, x: usize, y: usize) -> u32 {
-        if x < self.w && y < self.h { self.id[y * self.w + x] } else { 0 }
+        if x < self.w && y < self.h {
+            self.id[y * self.w + x]
+        } else {
+            0
+        }
     }
 
     /// Render all primitives. Opaque first, then blended (in given order).
-    pub fn render(&mut self, bg_top: [f32; 3], bg_bot: [f32; 3], prims: &[RPrim], outline: Option<&Outline>) {
+    pub fn render(
+        &mut self,
+        bg_top: [f32; 3],
+        bg_bot: [f32; 3],
+        prims: &[RPrim],
+        outline: Option<&Outline>,
+    ) {
         let (w, h) = (self.w, self.h);
         if w == 0 || h == 0 {
             return;
         }
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 16);
         let band = h.div_ceil(threads).max(8);
         let opaque: Vec<&RPrim> = prims.iter().filter(|p| !p.blend).collect();
         let blended: Vec<&RPrim> = prims.iter().filter(|p| p.blend).collect();
@@ -69,7 +88,8 @@ impl Raster {
         let depth_chunks = self.depth.chunks_mut(band * w);
         let id_chunks = self.id.chunks_mut(band * w);
         std::thread::scope(|s| {
-            for (bi, ((col, dep), ids)) in color_chunks.zip(depth_chunks).zip(id_chunks).enumerate() {
+            for (bi, ((col, dep), ids)) in color_chunks.zip(depth_chunks).zip(id_chunks).enumerate()
+            {
                 let y0 = bi * band;
                 let rows = col.len() / w;
                 let opaque = &opaque;
@@ -78,13 +98,28 @@ impl Raster {
                     // clear with vertical gradient
                     for r in 0..rows {
                         let t = (y0 + r) as f32 / h as f32;
-                        let c = [bg_top[0] + (bg_bot[0] - bg_top[0]) * t, bg_top[1] + (bg_bot[1] - bg_top[1]) * t, bg_top[2] + (bg_bot[2] - bg_top[2]) * t];
-                        let c = Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
+                        let c = [
+                            bg_top[0] + (bg_bot[0] - bg_top[0]) * t,
+                            bg_top[1] + (bg_bot[1] - bg_top[1]) * t,
+                            bg_top[2] + (bg_bot[2] - bg_top[2]) * t,
+                        ];
+                        let c = Color32::from_rgb(
+                            (c[0] * 255.0) as u8,
+                            (c[1] * 255.0) as u8,
+                            (c[2] * 255.0) as u8,
+                        );
                         col[r * w..(r + 1) * w].fill(c);
                     }
                     dep.fill(1.0);
                     ids.fill(0);
-                    let mut band = Band { w, y0, y1: y0 + rows, col, dep, ids };
+                    let mut band = Band {
+                        w,
+                        y0,
+                        y1: y0 + rows,
+                        col,
+                        dep,
+                        ids,
+                    };
                     for p in opaque.iter() {
                         band.prim(p);
                     }
@@ -203,7 +238,11 @@ impl Band<'_> {
         let inv = 1.0 / area;
         let (ca, cb, cc) = (p.c[i0], p.c[i1], p.c[i2]);
         let flat = ca == cb && cb == cc;
-        let flat_px = if flat { to_px(ca) } else { Color32::TRANSPARENT };
+        let flat_px = if flat {
+            to_px(ca)
+        } else {
+            Color32::TRANSPARENT
+        };
         let blend = p.blend;
         for y in miny..=maxy {
             let py = y as f32 + 0.5;
@@ -225,12 +264,20 @@ impl Band<'_> {
                     let s = if flat {
                         ca
                     } else {
-                        [ca[0] * w0 + cb[0] * w1 + cc[0] * w2, ca[1] * w0 + cb[1] * w1 + cc[1] * w2, ca[2] * w0 + cb[2] * w1 + cc[2] * w2, ca[3] * w0 + cb[3] * w1 + cc[3] * w2]
+                        [
+                            ca[0] * w0 + cb[0] * w1 + cc[0] * w2,
+                            ca[1] * w0 + cb[1] * w1 + cc[1] * w2,
+                            ca[2] * w0 + cb[2] * w1 + cc[2] * w2,
+                            ca[3] * w0 + cb[3] * w1 + cc[3] * w2,
+                        ]
                     };
                     let d = self.col[i];
                     let al = s[3].clamp(0.0, 1.0);
-                    let mix = |sv: f32, dv: u8| ((sv * al + dv as f32 / 255.0 * (1.0 - al)) * 255.0).clamp(0.0, 255.0) as u8;
-                    self.col[i] = Color32::from_rgb(mix(s[0], d.r()), mix(s[1], d.g()), mix(s[2], d.b()));
+                    let mix = |sv: f32, dv: u8| {
+                        ((sv * al + dv as f32 / 255.0 * (1.0 - al)) * 255.0).clamp(0.0, 255.0) as u8
+                    };
+                    self.col[i] =
+                        Color32::from_rgb(mix(s[0], d.r()), mix(s[1], d.g()), mix(s[2], d.b()));
                     if p.id != 0 && al > 0.3 {
                         self.ids[i] = p.id;
                     }
@@ -240,7 +287,12 @@ impl Band<'_> {
                     self.col[i] = if flat {
                         flat_px
                     } else {
-                        to_px([ca[0] * w0 + cb[0] * w1 + cc[0] * w2, ca[1] * w0 + cb[1] * w1 + cc[1] * w2, ca[2] * w0 + cb[2] * w1 + cc[2] * w2, 1.0])
+                        to_px([
+                            ca[0] * w0 + cb[0] * w1 + cc[0] * w2,
+                            ca[1] * w0 + cb[1] * w1 + cc[1] * w2,
+                            ca[2] * w0 + cb[2] * w1 + cc[2] * w2,
+                            1.0,
+                        ])
                     };
                 }
             }
@@ -250,7 +302,11 @@ impl Band<'_> {
 
 #[inline]
 fn to_px(c: [f32; 4]) -> Color32 {
-    Color32::from_rgb((c[0].clamp(0.0, 1.0) * 255.0) as u8, (c[1].clamp(0.0, 1.0) * 255.0) as u8, (c[2].clamp(0.0, 1.0) * 255.0) as u8)
+    Color32::from_rgb(
+        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+    )
 }
 
 #[cfg(test)]
@@ -261,7 +317,12 @@ mod tests {
         let mut r = Raster::default();
         r.resize(64, 64);
         let tri = |z: f32, id: u32, col: f32| RPrim {
-            p: [[0.0, 0.0, z], [64.0, 0.0, z], [0.0, 64.0, z], [0.0, 64.0, z]],
+            p: [
+                [0.0, 0.0, z],
+                [64.0, 0.0, z],
+                [0.0, 64.0, z],
+                [0.0, 64.0, z],
+            ],
             c: [[col, 0.0, 0.0, 1.0]; 4],
             n: 3,
             id,
@@ -269,11 +330,21 @@ mod tests {
             no_depth: false,
         };
         // far drawn after near must not overwrite
-        r.render([0.0; 3], [0.0; 3], &[tri(0.2, 1, 1.0), tri(0.8, 2, 0.5)], None);
+        r.render(
+            [0.0; 3],
+            [0.0; 3],
+            &[tri(0.2, 1, 1.0), tri(0.8, 2, 0.5)],
+            None,
+        );
         assert_eq!(r.id_at(5, 5), 1);
         assert_eq!(r.color[5 * 64 + 5].r(), 255);
         assert_eq!(r.id_at(60, 60), 0);
-        let o = Outline { sel: vec![0, 1, 0], selected: Color32::YELLOW, active: Color32::RED, width: 2 };
+        let o = Outline {
+            sel: vec![0, 1, 0],
+            selected: Color32::YELLOW,
+            active: Color32::RED,
+            width: 2,
+        };
         r.render([0.0; 3], [0.0; 3], &[tri(0.2, 1, 1.0)], Some(&o));
         // a pixel just outside the hypotenuse gets outlined
         assert_eq!(r.color[33 * 64 + 33], Color32::YELLOW);

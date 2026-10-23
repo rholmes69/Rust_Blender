@@ -1,8 +1,14 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod ai;
 mod app;
+mod editmesh;
 mod editor;
+mod gltf;
+mod gpu;
 mod mesh;
 mod render;
 mod scene;
@@ -11,10 +17,36 @@ mod viewport;
 mod voice;
 
 fn main() -> eframe::Result<()> {
+    // Headless helper: `rust_blender --export-demo out.glb` builds a demo scene and exports it.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--export-demo" {
+        let mut ed = editor::Editor::default();
+        let cmds: Vec<editor::Command> =
+            serde_json::from_str(include_str!("../docs/demo_scene.json")).expect("demo json");
+        for l in ed.execute(&cmds) {
+            println!("{l}");
+        }
+        let (bytes, st) = gltf::export_glb(&ed.scene, &mut scene::MeshCache::default());
+        std::fs::write(&args[2], bytes).expect("write");
+        println!(
+            "wrote {} ({} meshes, {} lights, {} cameras, {} animations, {} bytes)",
+            args[2], st.meshes, st.lights, st.cameras, st.animations, st.bytes
+        );
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Rust Blender").with_inner_size([1600.0, 950.0]).with_min_inner_size([900.0, 560.0]),
-        multisampling: 4,
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Rust Blender")
+            .with_inner_size([1600.0, 950.0])
+            .with_min_inner_size([900.0, 560.0]),
+        // egui needs no MSAA; the GPU viewport renderer does its own 4x MSAA offscreen.
+        multisampling: 1,
         ..Default::default()
     };
-    eframe::run_native("Rust Blender", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    eframe::run_native(
+        "Rust Blender",
+        options,
+        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+    )
 }

@@ -8,13 +8,14 @@ A Blender-style 3D editor written in Rust. You can drive it with the mouse and k
 
 | Area | What you get |
 |---|---|
-| **Viewport** | A multithreaded software rasterizer with a real depth buffer. It outlines selections the way Blender does (taken from the object-ID buffer), picks objects pixel-exactly, and has Wireframe, Solid (studio light) and Material Preview shading (sun, sky, Fresnel, metallic and roughness). It also has X-ray, a fading floor grid, a 3D cursor and a navigation gizmo you can click or drag. |
-| **Editing** | Cube, plane, UV sphere, ico sphere, cylinder, cone, torus and a "blob" head. You can transform with modal **G / R / S** like Blender: constrain to an axis with X, Y or Z, type an exact number, or hold Ctrl to snap. There are also Move, Rotate and Scale gizmos, box select, duplicate, hide/reveal, unlimited undo/redo, and Array, Mirror and Radial-Array modifiers. |
-| **Animation** | Keyframes with eased interpolation, a timeline with keyframe diamonds, auto-keying and playback. |
-| **Panels** | Outliner (rename with a double-click, visibility toggles, context menu), Properties (Object, Modifiers, Material, World and Scene tabs), F3 command search and a Shift+A add menu. |
-| **AI Copilot** | Chat panel with structured JSON-schema output from Ollama. Each AI batch is a single undo step. Simple commands run **instantly without the LLM**. The app auto-picks the best installed model and can download models from inside the app. |
-| **Voice** | Hands-free mode stops recording automatically when you pause. It shows a live level meter, uses local Whisper (tiny, base, small or distil) and can optionally read replies aloud. |
-| **Files** | Save and open `.rblend` (JSON) scenes and export Wavefront `.obj`. |
+| **Viewport** | A **GPU renderer** (wgpu) with 4× MSAA, a real depth buffer and selection outlines drawn in a shader. Picking is pixel-exact from an ID buffer that is read back asynchronously. A multithreaded **software renderer** takes over automatically if the GPU path isn't available, and you can toggle it under *Overlays*. Shading modes are Wireframe, Solid (studio light) and Material Preview (scene lights, Fresnel, metallic and roughness). Also X-ray, a fading grid, a 3D cursor and a clickable navigation gizmo. |
+| **Object mode** | Cube, plane, UV/ico sphere, cylinder, cone, torus and a "blob" head. Modal **G / R / S** transforms like Blender, with X/Y/Z axis locks, typed numbers and Ctrl to snap. Move, Rotate and Scale gizmos, box select, duplicate, hide/reveal, unlimited undo, and Array, Mirror and Radial-Array modifiers. |
+| **Edit mode** (Tab) | Polygon (n-gon) meshes with **vertex / edge / face** selection (1 / 2 / 3), box select and G/R/S on components. **Extrude** (E, constrained to the face normal), **Inset** (I), **Loop Cut** (Ctrl+R, wheel or +/- sets the cut count) with a live preview, **Subdivide**, **Merge** (M), **Delete** (X) and **Flip Normals** (Alt+N). |
+| **Lights & cameras** | Point, Sun and Spot lights that light the Material Preview, and camera objects. **Numpad 0** looks through the camera, with a passepartout around the frame; **Ctrl+Alt+0** aligns the camera to the view. A "look at" command aims lights and cameras. The default scene is Blender's: a cube, a light and a camera. |
+| **Animation** | Keyframes with eased interpolation, a timeline, auto-keying and playback. |
+| **AI Copilot** | **Streams** replies from Ollama: the text appears live, and each command is applied the moment it finishes generating. There's a Stop button, and the whole answer is a single undo step. Simple commands run instantly without the LLM. The app auto-picks the best installed model and can download models from inside the app. The AI can also edit meshes (select faces, extrude, inset, loop cut and so on). |
+| **Voice** | Local Whisper (tiny, base, small or distil) with hands-free auto-stop and a level meter. Replies can optionally be read aloud. |
+| **Files** | Save and open `.rblend`. Export **glTF 2.0 (.glb)** with meshes (modifiers applied), PBR materials, emissive strength, lights (`KHR_lights_punctual`), cameras and baked animation; the output passes the Khronos glTF-Validator with 0 errors and 0 warnings. Also exports Wavefront `.obj`. |
 
 ## Recommended Ollama model
 
@@ -51,6 +52,8 @@ To build without voice support (smaller and faster to compile), run `cargo run -
 Click the mic (or press **Ctrl+Space** or the **`** key), speak, and pause. Examples:
 
 * "add a blue sphere", "move it up two", "rotate ninety degrees on x", "make it bigger", "top view", "undo". These go through the instant command parser.
+* "extrude the top of the cube by two", "add a loop cut around the middle", "inset the top face" use edit mode.
+* "add a spotlight pointing at the cube", "look through the camera".
 * "build a snowman", "make a solar system with orbiting planets", "create a table with four legs", "put a ring of 8 glowing cubes around the torus", "animate the cube spinning 360 degrees over 60 frames". These go to the LLM.
 
 Follow-ups work because the AI sees the current scene and the conversation history: "make the second one red", "now hide the hat".
@@ -63,12 +66,17 @@ Follow-ups work because the AI sees the current scene and the conversation histo
 | MMB (Alt+LMB), Shift+MMB, wheel | orbit, pan, zoom |
 | G R S then X/Y/Z, digits, Ctrl | grab / rotate / scale, constrain, exact value, snap |
 | Shift+A, Shift+D, X, H / Alt+H | add, duplicate, delete, hide / reveal |
-| 1 3 7 (Ctrl), 5, 0, F, Home | views, ortho toggle, user view, frame selected / all |
+| 1 3 7 (Ctrl), 5, F, Home | views, ortho toggle, frame selected / all |
 | Z, Alt+Z, W | cycle shading, X-ray, cycle tool |
 | I, Space, ← → | keyframe, play, step |
 | F3 / Ctrl+K | command search (falls back to the AI) |
 | / or Ctrl+L, N | focus the AI prompt, toggle the Copilot panel |
 | Ctrl+Z / Ctrl+Shift+Z, Ctrl+S / O / N | undo / redo, save / open / new |
+| Tab | edit mode on the active mesh |
+| 1 / 2 / 3 (edit) | vertex / edge / face select |
+| E, I, Ctrl+R (edit) | extrude, inset, loop cut |
+| M, X, Alt+N (edit) | merge, delete, flip normals |
+| Numpad 0, Ctrl+Alt+0 | look through the camera, align the camera to the view |
 
 ## Architecture
 
@@ -77,15 +85,19 @@ src/
   main.rs      eframe bootstrap
   app.rs       layout, menus, Copilot chat, voice UX, outliner, properties, timeline, palette
   viewport.rs  camera, scene → primitives, navigation, modal transforms, gizmos, HUD
-  render.rs    multithreaded z-buffer rasterizer, ID buffer, selection outline
+  viewport/edit.rs  edit-mode drawing, component picking, extrude / inset / loop-cut tools
+  gpu.rs       wgpu renderer: MSAA colour pass, ID/depth pass + async readback, outline composite
+  render.rs    multithreaded software z-buffer rasterizer (fallback), ID buffer, selection outline
+  editmesh.rs  mesh operators (extrude, inset, loop cut, subdivide, merge, delete …)
+  gltf.rs      glTF 2.0 / .glb exporter
   editor.rs    editor state, undo, and the command executor shared by UI / AI / voice
   ai.rs        Ollama client, model ranking, JSON schema + system prompt, offline parser
   voice.rs     cpal mic capture, VAD, resampling, candle Whisper + tiny BPE decoder
   scene.rs     objects, transforms, materials, modifiers, keyframes, OBJ export
-  mesh.rs      procedural primitives with welded vertices, normals, edge adjacency
+  mesh.rs      PolyMesh (n-gons) + render mesh, ear-clipping triangulation, procedural primitives
   theme.rs     Blender-like dark theme
 ```
 
 The AI never touches the scene directly. It produces a list of flat `Command` records, for example `{"action":"add","primitive":"cone","location":[0,0,2],"color":"orange"}`, which `Editor::execute` validates and applies. That keeps the AI's actions safe, undoable and visible in the chat log.
 
-Run the tests with `cargo test`.
+Run the tests with `cargo test`. `rust_blender --export-demo out.glb` builds a demo scene from `docs/demo_scene.json` without opening a window and exports it, which is handy for checking the glTF exporter.

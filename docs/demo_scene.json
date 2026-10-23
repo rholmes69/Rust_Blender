@@ -1,0 +1,16 @@
+[
+ {"action":"edit_mode","target":"Cube"},
+ {"action":"select_faces","vector":[0,0,1]},
+ {"action":"inset","number":0.3},
+ {"action":"extrude","number":1.5},
+ {"action":"object_mode"},
+ {"action":"set_color","target":"Cube","color":"#3a7bd5","metallic":0.2,"roughness":0.4},
+ {"action":"add","primitive":"torus","name":"Ring","location":[0,0,3.3],"color":"gold","metallic":1,"roughness":0.2},
+ {"action":"keyframe","target":"Ring","number":1,"rotation":[0,0,0]},
+ {"action":"keyframe","target":"Ring","number":48,"rotation":[0,0,180]},
+ {"action":"add","primitive":"uv_sphere","name":"Glow","location":[3,0,1],"scale":0.5,"color":"cyan","emission":3},
+ {"action":"add_modifier","target":"Glow","modifier":"radial","number":6,"vector":[3,0,0]},
+ {"action":"add","primitive":"plane","name":"Ground","location":[0,0,-1],"scale":[8,8,1],"color":"gray"},
+ {"action":"add","primitive":"spot_light","name":"Key","location":[4,-4,6],"look_at":"Cube","power":1500,"color":"#ffe0b0"},
+ {"action":"add","primitive":"sun","name":"Sun","location":[0,0,10],"look_at":[1,1,0],"power":2}
+]

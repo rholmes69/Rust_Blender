@@ -42,7 +42,11 @@ impl VoiceEngine {
             .name("whisper".into())
             .spawn(move || worker(req_rx, ev_tx, rp))
             .expect("spawn whisper thread");
-        Self { tx, rx, recorder: Recorder::new(repaint) }
+        Self {
+            tx,
+            rx,
+            recorder: Recorder::new(repaint),
+        }
     }
     pub fn load(&self, model: &str) {
         let _ = self.tx.send(VoiceRequest::Load(model.to_string()));
@@ -101,7 +105,10 @@ impl Recorder {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
         let dev = host.default_input_device().ok_or("No microphone found")?;
-        self.device_name = dev.description().map(|d| d.to_string()).unwrap_or_else(|_| "Microphone".into());
+        self.device_name = dev
+            .description()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|_| "Microphone".into());
         let cfg = dev.default_input_config().map_err(|e| e.to_string())?;
         let channels = cfg.channels() as usize;
         self.sample_rate = cfg.sample_rate();
@@ -130,19 +137,61 @@ impl Recorder {
         let stream = match fmt {
             cpal::SampleFormat::F32 => {
                 let push = push;
-                dev.build_input_stream::<f32, _, _>(config, move |d, _| push(&mut d.chunks(channels).map(|c| c.iter().sum::<f32>() / channels as f32)), err, None)
+                dev.build_input_stream::<f32, _, _>(
+                    config,
+                    move |d, _| {
+                        push(
+                            &mut d
+                                .chunks(channels)
+                                .map(|c| c.iter().sum::<f32>() / channels as f32),
+                        )
+                    },
+                    err,
+                    None,
+                )
             }
             cpal::SampleFormat::I16 => {
                 let push = push;
-                dev.build_input_stream::<i16, _, _>(config, move |d, _| push(&mut d.chunks(channels).map(|c| c.iter().map(|&x| x as f32 / 32768.0).sum::<f32>() / channels as f32)), err, None)
+                dev.build_input_stream::<i16, _, _>(
+                    config,
+                    move |d, _| {
+                        push(&mut d.chunks(channels).map(|c| {
+                            c.iter().map(|&x| x as f32 / 32768.0).sum::<f32>() / channels as f32
+                        }))
+                    },
+                    err,
+                    None,
+                )
             }
             cpal::SampleFormat::U16 => {
                 let push = push;
-                dev.build_input_stream::<u16, _, _>(config, move |d, _| push(&mut d.chunks(channels).map(|c| c.iter().map(|&x| (x as f32 - 32768.0) / 32768.0).sum::<f32>() / channels as f32)), err, None)
+                dev.build_input_stream::<u16, _, _>(
+                    config,
+                    move |d, _| {
+                        push(&mut d.chunks(channels).map(|c| {
+                            c.iter()
+                                .map(|&x| (x as f32 - 32768.0) / 32768.0)
+                                .sum::<f32>()
+                                / channels as f32
+                        }))
+                    },
+                    err,
+                    None,
+                )
             }
             cpal::SampleFormat::I32 => {
                 let push = push;
-                dev.build_input_stream::<i32, _, _>(config, move |d, _| push(&mut d.chunks(channels).map(|c| c.iter().map(|&x| x as f32 / 2147483648.0).sum::<f32>() / channels as f32)), err, None)
+                dev.build_input_stream::<i32, _, _>(
+                    config,
+                    move |d, _| {
+                        push(&mut d.chunks(channels).map(|c| {
+                            c.iter().map(|&x| x as f32 / 2147483648.0).sum::<f32>()
+                                / channels as f32
+                        }))
+                    },
+                    err,
+                    None,
+                )
             }
             other => return Err(format!("unsupported microphone sample format {other:?}")),
         }
@@ -190,7 +239,8 @@ impl Recorder {
             }
         }
         // hard limit
-        self.started.is_some_and(|s| now.duration_since(s).as_secs_f32() > 28.0)
+        self.started
+            .is_some_and(|s| now.duration_since(s).as_secs_f32() > 28.0)
     }
 }
 
@@ -225,7 +275,11 @@ pub fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
 // ------------------------------------------------------------------------------------------------
 
 pub fn model_dir(name: &str) -> PathBuf {
-    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("rust_blender").join("whisper").join(name)
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("rust_blender")
+        .join("whisper")
+        .join(name)
 }
 
 fn worker(rx: Receiver<VoiceRequest>, tx: Sender<VoiceEvent>, repaint: impl Fn()) {
@@ -259,14 +313,19 @@ fn worker(rx: Receiver<VoiceRequest>, tx: Sender<VoiceEvent>, repaint: impl Fn()
                     let t0 = std::time::Instant::now();
                     match model.as_mut() {
                         None => {
-                            let _ = tx.send(VoiceEvent::Error("Whisper model not loaded yet".into()));
+                            let _ =
+                                tx.send(VoiceEvent::Error("Whisper model not loaded yet".into()));
                         }
                         Some(m) => match m.transcribe(&pcm) {
                             Ok(text) => {
-                                let _ = tx.send(VoiceEvent::Transcript { text, secs: t0.elapsed().as_secs_f32() });
+                                let _ = tx.send(VoiceEvent::Transcript {
+                                    text,
+                                    secs: t0.elapsed().as_secs_f32(),
+                                });
                             }
                             Err(e) => {
-                                let _ = tx.send(VoiceEvent::Error(format!("Transcription failed: {e}")));
+                                let _ = tx
+                                    .send(VoiceEvent::Error(format!("Transcription failed: {e}")));
                             }
                         },
                     }
@@ -298,12 +357,25 @@ mod whisper {
         device: Device,
     }
 
-    fn download(repo: &str, file: &str, dest: &std::path::Path, tx: &Sender<VoiceEvent>, repaint: &dyn Fn()) -> Result<(), String> {
-        if dest.exists() && std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false) {
+    fn download(
+        repo: &str,
+        file: &str,
+        dest: &std::path::Path,
+        tx: &Sender<VoiceEvent>,
+        repaint: &dyn Fn(),
+    ) -> Result<(), String> {
+        if dest.exists()
+            && std::fs::metadata(dest)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
             return Ok(());
         }
         std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
-        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
         let mut last_err = String::new();
         for rev in ["main", "refs%2Fpr%2F15", "refs%2Fpr%2F13", "refs%2Fpr%2F10"] {
             let url = format!("https://huggingface.co/{repo}/resolve/{rev}/{file}");
@@ -318,8 +390,17 @@ mod whisper {
                 last_err = format!("HTTP {} for {url}", resp.status());
                 continue;
             }
-            let total: f32 = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-            let mut reader = resp.into_body().into_with_config().limit(4_000_000_000).reader();
+            let total: f32 = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            let mut reader = resp
+                .into_body()
+                .into_with_config()
+                .limit(4_000_000_000)
+                .reader();
             let tmp = dest.with_extension("part");
             let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             let mut buf = vec![0u8; 1 << 16];
@@ -334,7 +415,10 @@ mod whisper {
                 done += n as f32;
                 if last.elapsed().as_millis() > 150 {
                     last = std::time::Instant::now();
-                    let _ = tx.send(VoiceEvent::Download(file.to_string(), if total > 0.0 { done / total } else { -1.0 }));
+                    let _ = tx.send(VoiceEvent::Download(
+                        file.to_string(),
+                        if total > 0.0 { done / total } else { -1.0 },
+                    ));
                     repaint();
                 }
             }
@@ -342,23 +426,52 @@ mod whisper {
             std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
             return Ok(());
         }
-        Err(format!("could not download {file} from {repo}: {last_err}. You can also download it manually into {}", dest.parent().map(|p| p.display().to_string()).unwrap_or_default()))
+        Err(format!(
+            "could not download {file} from {repo}: {last_err}. You can also download it manually into {}",
+            dest.parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        ))
     }
 
     impl Model {
-        pub fn load(name: &str, tx: &Sender<VoiceEvent>, repaint: &dyn Fn()) -> Result<Self, String> {
-            let repo = WHISPER_MODELS.iter().find(|(n, _)| *n == name).map(|(_, r)| *r).unwrap_or("openai/whisper-base.en");
+        pub fn load(
+            name: &str,
+            tx: &Sender<VoiceEvent>,
+            repaint: &dyn Fn(),
+        ) -> Result<Self, String> {
+            let repo = WHISPER_MODELS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, r)| *r)
+                .unwrap_or("openai/whisper-base.en");
             let dir = model_dir(name);
             for f in ["config.json", "tokenizer.json", "model.safetensors"] {
                 download(repo, f, &dir.join(f), tx, repaint)?;
             }
-            let config: Config = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            let config: Config = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("config.json")).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
             let tok = Tokenizer::load(&dir.join("tokenizer.json"))?;
             let device = Device::Cpu;
-            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], w::DTYPE, &device).map_err(|e| e.to_string())? };
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    &[dir.join("model.safetensors")],
+                    w::DTYPE,
+                    &device,
+                )
+                .map_err(|e| e.to_string())?
+            };
             let model = Whisper::load(&vb, config.clone()).map_err(|e| e.to_string())?;
             let mel_filters = mel_filterbank(config.num_mel_bins, w::N_FFT, w::SAMPLE_RATE as f32);
-            Ok(Self { model, config, mel_filters, tok, device })
+            Ok(Self {
+                model,
+                config,
+                mel_filters,
+                tok,
+                device,
+            })
         }
 
         pub fn transcribe(&mut self, pcm: &[f32]) -> Result<String, String> {
@@ -421,7 +534,12 @@ mod whisper {
                 let t = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
                 let ys = self.model.decoder.forward(&t, &audio, i == 0)?;
                 let (_, seq, _) = ys.dims3()?;
-                let logits = self.model.decoder.final_linear(&ys.i((..1, seq - 1..))?)?.i(0)?.i(0)?;
+                let logits = self
+                    .model
+                    .decoder
+                    .final_linear(&ys.i((..1, seq - 1..))?)?
+                    .i(0)?
+                    .i(0)?;
                 let logits = logits.broadcast_add(&sup)?;
                 let next = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
                 if next == eot {
@@ -452,7 +570,9 @@ mod whisper {
 
     impl Tokenizer {
         fn load(path: &std::path::Path) -> Result<Self, String> {
-            let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
             let mut tok_to_id: HashMap<String, u32> = HashMap::new();
             if let Some(vocab) = v["model"]["vocab"].as_object() {
                 for (k, id) in vocab {
@@ -472,10 +592,19 @@ mod whisper {
             }
             let id_to_tok = tok_to_id.iter().map(|(k, v)| (*v, k.clone())).collect();
             let multilingual = tok_to_id.contains_key("<|fr|>");
-            Ok(Self { id_to_tok, tok_to_id, special_start, byte_dec: byte_decoder(), multilingual })
+            Ok(Self {
+                id_to_tok,
+                tok_to_id,
+                special_start,
+                byte_dec: byte_decoder(),
+                multilingual,
+            })
         }
         fn id(&self, t: &str) -> candle_core::Result<u32> {
-            self.tok_to_id.get(t).copied().ok_or_else(|| candle_core::Error::Msg(format!("token {t} missing")))
+            self.tok_to_id
+                .get(t)
+                .copied()
+                .ok_or_else(|| candle_core::Error::Msg(format!("token {t} missing")))
         }
         fn decode(&self, ids: &[u32]) -> String {
             let mut bytes = vec![];
@@ -496,7 +625,10 @@ mod whisper {
     }
 
     fn byte_decoder() -> HashMap<char, u8> {
-        let mut bs: Vec<u32> = (b'!' as u32..=b'~' as u32).chain(0xA1..=0xAC).chain(0xAE..=0xFF).collect();
+        let mut bs: Vec<u32> = (b'!' as u32..=b'~' as u32)
+            .chain(0xA1..=0xAC)
+            .chain(0xAE..=0xFF)
+            .collect();
         let mut cs = bs.clone();
         let mut n = 0;
         for b in 0..256u32 {
@@ -506,7 +638,10 @@ mod whisper {
                 n += 1;
             }
         }
-        bs.iter().zip(cs.iter()).map(|(b, c)| (char::from_u32(*c).unwrap(), *b as u8)).collect()
+        bs.iter()
+            .zip(cs.iter())
+            .map(|(b, c)| (char::from_u32(*c).unwrap(), *b as u8))
+            .collect()
     }
 
     /// Slaney-style mel filterbank, identical to librosa.filters.mel(sr, n_fft, n_mels) used by Whisper.
@@ -516,12 +651,28 @@ mod whisper {
         let min_log_hz = 1000.0f32;
         let min_log_mel = min_log_hz / f_sp;
         let logstep = (6.4f32).ln() / 27.0;
-        let hz_to_mel = |f: f32| if f >= min_log_hz { min_log_mel + (f / min_log_hz).ln() / logstep } else { f / f_sp };
-        let mel_to_hz = |m: f32| if m >= min_log_mel { min_log_hz * (logstep * (m - min_log_mel)).exp() } else { f_sp * m };
+        let hz_to_mel = |f: f32| {
+            if f >= min_log_hz {
+                min_log_mel + (f / min_log_hz).ln() / logstep
+            } else {
+                f / f_sp
+            }
+        };
+        let mel_to_hz = |m: f32| {
+            if m >= min_log_mel {
+                min_log_hz * (logstep * (m - min_log_mel)).exp()
+            } else {
+                f_sp * m
+            }
+        };
         let fmax = sr / 2.0;
         let (mmin, mmax) = (hz_to_mel(0.0), hz_to_mel(fmax));
-        let mel_f: Vec<f32> = (0..n_mels + 2).map(|i| mel_to_hz(mmin + (mmax - mmin) * i as f32 / (n_mels + 1) as f32)).collect();
-        let fft_f: Vec<f32> = (0..n_bins).map(|i| fmax * i as f32 / (n_bins - 1) as f32).collect();
+        let mel_f: Vec<f32> = (0..n_mels + 2)
+            .map(|i| mel_to_hz(mmin + (mmax - mmin) * i as f32 / (n_mels + 1) as f32))
+            .collect();
+        let fft_f: Vec<f32> = (0..n_bins)
+            .map(|i| fmax * i as f32 / (n_bins - 1) as f32)
+            .collect();
         let mut out = vec![0f32; n_mels * n_bins];
         for m in 0..n_mels {
             let enorm = 2.0 / (mel_f[m + 2] - mel_f[m]);

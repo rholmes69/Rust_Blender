@@ -1,14 +1,26 @@
-//! Procedural mesh primitives (Z-up, like Blender).
+//! Meshes: an editable polygon mesh (`PolyMesh`, n-gon faces) plus the derived render mesh
+//! (`Mesh`: triangles, normals, edge adjacency). Procedural primitives are Z-up like Blender.
 
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::{PI, TAU};
 
+/// Editable polygon mesh (what edit mode works on and what is saved in .rblend files).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PolyMesh {
+    pub verts: Vec<Vec3>,
+    /// Faces as counter-clockwise vertex loops (outward normal by right-hand rule).
+    pub faces: Vec<Vec<u32>>,
+}
+
+/// Render data derived from a `PolyMesh`.
 #[derive(Clone, Debug, Default)]
 pub struct Mesh {
     pub positions: Vec<Vec3>,
     pub tris: Vec<[u32; 3]>,
+    /// Polygon index for each triangle.
+    pub tri_face: Vec<u32>,
     /// Per-vertex smooth normals (same length as positions).
     pub normals: Vec<Vec3>,
     /// Unique edges, each with the (up to two) triangles that share it.
@@ -20,8 +32,8 @@ pub struct Mesh {
 pub struct Edge {
     pub a: u32,
     pub b: u32,
-    pub faces: [u32; 2], // u32::MAX = boundary
-    /// "Hard" edges are drawn in wireframe mode (quad borders, not diagonals).
+    pub faces: [u32; 2], // triangle indices, u32::MAX = boundary
+    /// Polygon edges (drawn in wireframe); triangulation diagonals are not.
     pub feature: bool,
 }
 
@@ -93,6 +105,17 @@ impl Primitive {
     }
 
     pub fn build(self, detail: u32) -> Mesh {
+        self.poly(detail).to_mesh(self.default_smooth())
+    }
+
+    pub fn default_smooth(self) -> bool {
+        matches!(
+            self,
+            Primitive::UvSphere | Primitive::IcoSphere | Primitive::Torus | Primitive::Monkey
+        )
+    }
+
+    pub fn poly(self, detail: u32) -> PolyMesh {
         let d = detail.clamp(1, 6);
         match self {
             Primitive::Cube => cube(),
@@ -107,80 +130,237 @@ impl Primitive {
     }
 }
 
+impl PolyMesh {
+    pub fn face_normal(&self, f: usize) -> Vec3 {
+        // Newell's method (robust for n-gons)
+        let face = &self.faces[f];
+        let mut n = Vec3::ZERO;
+        for i in 0..face.len() {
+            let a = self.verts[face[i] as usize];
+            let b = self.verts[face[(i + 1) % face.len()] as usize];
+            n += Vec3::new(
+                (a.y - b.y) * (a.z + b.z),
+                (a.z - b.z) * (a.x + b.x),
+                (a.x - b.x) * (a.y + b.y),
+            );
+        }
+        n.normalize_or_zero()
+    }
+
+    pub fn face_center(&self, f: usize) -> Vec3 {
+        let face = &self.faces[f];
+        face.iter().map(|&i| self.verts[i as usize]).sum::<Vec3>() / face.len().max(1) as f32
+    }
+
+    /// Unique undirected edges.
+    pub fn edges(&self) -> Vec<(u32, u32)> {
+        let mut set = HashSet::new();
+        let mut out = vec![];
+        for f in &self.faces {
+            for i in 0..f.len() {
+                let (a, b) = (f[i], f[(i + 1) % f.len()]);
+                let k = (a.min(b), a.max(b));
+                if set.insert(k) {
+                    out.push(k);
+                }
+            }
+        }
+        out
+    }
+
+    /// Map from edge -> faces using it.
+    pub fn edge_faces(&self) -> HashMap<(u32, u32), Vec<usize>> {
+        let mut m: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (fi, f) in self.faces.iter().enumerate() {
+            for i in 0..f.len() {
+                let (a, b) = (f[i], f[(i + 1) % f.len()]);
+                m.entry((a.min(b), a.max(b))).or_default().push(fi);
+            }
+        }
+        m
+    }
+
+    /// Merge coincident vertices, drop degenerate faces and unused vertices.
+    pub fn weld(&mut self, eps: f32) {
+        let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        let mut remap = vec![0u32; self.verts.len()];
+        let mut out = Vec::new();
+        let q = |f: f32| (f / eps).round() as i64;
+        for (i, p) in self.verts.iter().enumerate() {
+            let k = (q(p.x), q(p.y), q(p.z));
+            remap[i] = *map.entry(k).or_insert_with(|| {
+                out.push(*p);
+                (out.len() - 1) as u32
+            });
+        }
+        self.verts = out;
+        for f in &mut self.faces {
+            for i in f.iter_mut() {
+                *i = remap[*i as usize];
+            }
+        }
+        self.cleanup();
+    }
+
+    /// Remove consecutive duplicate indices, faces with < 3 verts, and unreferenced vertices.
+    pub fn cleanup(&mut self) {
+        for f in &mut self.faces {
+            f.dedup();
+            while f.len() > 1 && f.first() == f.last() {
+                f.pop();
+            }
+        }
+        self.faces.retain(|f| f.len() >= 3);
+        let mut used = vec![false; self.verts.len()];
+        for f in &self.faces {
+            for &i in f {
+                used[i as usize] = true;
+            }
+        }
+        if used.iter().all(|u| *u) {
+            return;
+        }
+        let mut remap = vec![u32::MAX; self.verts.len()];
+        let mut nv = vec![];
+        for (i, u) in used.iter().enumerate() {
+            if *u {
+                remap[i] = nv.len() as u32;
+                nv.push(self.verts[i]);
+            }
+        }
+        self.verts = nv;
+        for f in &mut self.faces {
+            for i in f.iter_mut() {
+                *i = remap[*i as usize];
+            }
+        }
+    }
+
+    pub fn to_mesh(&self, smooth: bool) -> Mesh {
+        let mut tris = vec![];
+        let mut tri_face = vec![];
+        let mut poly_edges: HashSet<(u32, u32)> = HashSet::new();
+        for (fi, f) in self.faces.iter().enumerate() {
+            for i in 0..f.len() {
+                let (a, b) = (f[i], f[(i + 1) % f.len()]);
+                poly_edges.insert((a.min(b), a.max(b)));
+            }
+            for t in triangulate(&self.verts, f) {
+                tris.push(t);
+                tri_face.push(fi as u32);
+            }
+        }
+        let mut m = Mesh {
+            positions: self.verts.clone(),
+            tris,
+            tri_face,
+            smooth,
+            ..Default::default()
+        };
+        m.compute(&poly_edges);
+        m
+    }
+}
+
+/// Triangulate a polygon (ear clipping in the polygon's plane; fan for convex quads/tris).
+fn triangulate(verts: &[Vec3], f: &[u32]) -> Vec<[u32; 3]> {
+    if f.len() == 3 {
+        return vec![[f[0], f[1], f[2]]];
+    }
+    // normal
+    let mut n = Vec3::ZERO;
+    for i in 0..f.len() {
+        let a = verts[f[i] as usize];
+        let b = verts[f[(i + 1) % f.len()] as usize];
+        n += Vec3::new(
+            (a.y - b.y) * (a.z + b.z),
+            (a.z - b.z) * (a.x + b.x),
+            (a.x - b.x) * (a.y + b.y),
+        );
+    }
+    let n = n.normalize_or_zero();
+    let mut idx: Vec<u32> = f.to_vec();
+    let mut out = vec![];
+    let mut guard = 0;
+    while idx.len() > 3 && guard < 10_000 {
+        guard += 1;
+        let k = idx.len();
+        let mut clipped = false;
+        for i in 0..k {
+            let (ia, ib, ic) = (idx[(i + k - 1) % k], idx[i], idx[(i + 1) % k]);
+            let (a, b, c) = (verts[ia as usize], verts[ib as usize], verts[ic as usize]);
+            if (b - a).cross(c - b).dot(n) <= 1e-9 {
+                continue; // reflex or degenerate
+            }
+            let inside = idx.iter().any(|&j| {
+                if j == ia || j == ib || j == ic {
+                    return false;
+                }
+                let p = verts[j as usize];
+                let s1 = (b - a).cross(p - a).dot(n);
+                let s2 = (c - b).cross(p - b).dot(n);
+                let s3 = (a - c).cross(p - c).dot(n);
+                s1 > 0.0 && s2 > 0.0 && s3 > 0.0
+            });
+            if inside {
+                continue;
+            }
+            out.push([ia, ib, ic]);
+            idx.remove(i);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            // fall back to a fan for weird / non-planar polygons
+            for i in 1..idx.len() - 1 {
+                out.push([idx[0], idx[i], idx[i + 1]]);
+            }
+            return out;
+        }
+    }
+    if idx.len() == 3 {
+        out.push([idx[0], idx[1], idx[2]]);
+    }
+    out
+}
+
 struct Builder {
     p: Vec<Vec3>,
-    t: Vec<[u32; 3]>,
-    /// Diagonal edges created by triangulating quads (hidden in wireframe).
-    diag: Vec<(u32, u32)>,
+    faces: Vec<Vec<u32>>,
 }
 
 impl Builder {
     fn new() -> Self {
-        Self { p: vec![], t: vec![], diag: vec![] }
+        Self {
+            p: vec![],
+            faces: vec![],
+        }
     }
     fn v(&mut self, p: Vec3) -> u32 {
         self.p.push(p);
         (self.p.len() - 1) as u32
     }
     fn tri(&mut self, a: u32, b: u32, c: u32) {
-        self.t.push([a, b, c]);
+        self.faces.push(vec![a, b, c]);
     }
     fn quad(&mut self, a: u32, b: u32, c: u32, d: u32) {
-        self.t.push([a, b, c]);
-        self.t.push([a, c, d]);
-        self.diag.push((a.min(c), a.max(c)));
+        self.faces.push(vec![a, b, c, d]);
     }
-    fn finish(self, smooth: bool) -> Mesh {
-        let mut m = Mesh { positions: self.p, tris: self.t, smooth, ..Default::default() };
-        let remap = m.weld();
-        let diag: std::collections::HashSet<(u32, u32)> = self.diag.into_iter().collect();
-        m.compute(&diag, remap.as_deref());
+    fn ngon(&mut self, f: Vec<u32>) {
+        self.faces.push(f);
+    }
+    fn finish(self) -> PolyMesh {
+        let mut m = PolyMesh {
+            verts: self.p,
+            faces: self.faces,
+        };
+        m.weld(1e-4);
         m
     }
 }
 
 impl Mesh {
-    /// Merge coincident vertices so edges / normals are shared.
-    fn weld(&mut self) -> Option<Vec<u32>> {
-        let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
-        let mut remap = vec![0u32; self.positions.len()];
-        let mut out = Vec::new();
-        let q = |f: f32| (f * 10000.0).round() as i64;
-        for (i, p) in self.positions.iter().enumerate() {
-            let k = (q(p.x), q(p.y), q(p.z));
-            let id = *map.entry(k).or_insert_with(|| {
-                out.push(*p);
-                (out.len() - 1) as u32
-            });
-            remap[i] = id;
-        }
-        // If no welding happened we keep indices (diag set is index based on original).
-        if out.len() == self.positions.len() {
-            return None;
-        }
-        self.positions = out;
-        for t in &mut self.tris {
-            for i in t.iter_mut() {
-                *i = remap[*i as usize];
-            }
-        }
-        self.tris.retain(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]);
-        Some(remap)
-    }
-
-    fn compute(&mut self, diag_orig: &std::collections::HashSet<(u32, u32)>, remap: Option<&[u32]>) {
-        let diag: std::collections::HashSet<(u32, u32)> = diag_orig
-            .iter()
-            .map(|&(a, b)| match remap {
-                Some(r) => {
-                    let (a, b) = (r[a as usize], r[b as usize]);
-                    (a.min(b), a.max(b))
-                }
-                None => (a, b),
-            })
-            .collect();
-
-        // normals
+    fn compute(&mut self, poly_edges: &HashSet<(u32, u32)>) {
         let mut n = vec![Vec3::ZERO; self.positions.len()];
         for t in &self.tris {
             let [a, b, c] = t.map(|i| self.positions[i as usize]);
@@ -190,8 +370,6 @@ impl Mesh {
             }
         }
         self.normals = n.into_iter().map(|v| v.normalize_or_zero()).collect();
-
-        // edges
         let mut emap: HashMap<(u32, u32), usize> = HashMap::new();
         let mut edges: Vec<Edge> = Vec::new();
         for (fi, t) in self.tris.iter().enumerate() {
@@ -210,28 +388,13 @@ impl Mesh {
                             a: key.0,
                             b: key.1,
                             faces: [fi as u32, u32::MAX],
-                            feature: !diag.contains(&key),
+                            feature: poly_edges.contains(&key),
                         });
                     }
                 }
             }
         }
-        // Also hide edges between coplanar faces (e.g. fan triangulated caps).
-        for e in &mut edges {
-            if e.feature && e.faces[1] != u32::MAX {
-                let f0 = self.face_normal(e.faces[0] as usize);
-                let f1 = self.face_normal(e.faces[1] as usize);
-                if f0.dot(f1) > 0.99999 && !self.smooth {
-                    e.feature = false;
-                }
-            }
-        }
         self.edges = edges;
-    }
-
-    pub fn face_normal(&self, f: usize) -> Vec3 {
-        let [a, b, c] = self.tris[f].map(|i| self.positions[i as usize]);
-        (b - a).cross(c - a).normalize_or_zero()
     }
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -241,13 +404,15 @@ impl Mesh {
             lo = lo.min(*p);
             hi = hi.max(*p);
         }
+        if self.positions.is_empty() {
+            return (Vec3::ZERO, Vec3::ZERO);
+        }
         (lo, hi)
     }
 }
 
-pub fn cube() -> Mesh {
+pub fn cube() -> PolyMesh {
     let mut b = Builder::new();
-    // 6 faces, outward CCW winding
     let faces: [(Vec3, Vec3, Vec3); 6] = [
         (Vec3::X, Vec3::Y, Vec3::Z),
         (-Vec3::X, -Vec3::Y, Vec3::Z),
@@ -263,60 +428,83 @@ pub fn cube() -> Mesh {
         let d = b.v(n - u + v);
         b.quad(a, bb, c, d);
     }
-    b.finish(false)
+    b.finish()
 }
 
-pub fn plane() -> Mesh {
+pub fn plane() -> PolyMesh {
     let mut b = Builder::new();
     let a = b.v(Vec3::new(-1.0, -1.0, 0.0));
     let c = b.v(Vec3::new(1.0, -1.0, 0.0));
     let d = b.v(Vec3::new(1.0, 1.0, 0.0));
     let e = b.v(Vec3::new(-1.0, 1.0, 0.0));
     b.quad(a, c, d, e);
-    b.finish(false)
+    b.finish()
 }
 
-pub fn uv_sphere(seg: u32, rings: u32) -> Mesh {
+pub fn uv_sphere(seg: u32, rings: u32) -> PolyMesh {
     let mut b = Builder::new();
     let mut idx = vec![];
     for r in 0..=rings {
         let th = PI * r as f32 / rings as f32;
         for s in 0..seg {
             let ph = TAU * s as f32 / seg as f32;
-            idx.push(b.v(Vec3::new(th.sin() * ph.cos(), th.sin() * ph.sin(), th.cos())));
+            idx.push(b.v(Vec3::new(
+                th.sin() * ph.cos(),
+                th.sin() * ph.sin(),
+                th.cos(),
+            )));
         }
     }
     let at = |r: u32, s: u32| idx[(r * seg + s % seg) as usize];
     for r in 0..rings {
         for s in 0..seg {
             let (a, bb, c, d) = (at(r, s), at(r + 1, s), at(r + 1, s + 1), at(r, s + 1));
-            if r == 0 {
-                b.tri(a, bb, c);
-            } else if r == rings - 1 {
-                b.tri(a, bb, d);
-            } else {
-                b.quad(a, bb, c, d);
-            }
+            b.quad(a, bb, c, d); // poles collapse to triangles when welded
         }
     }
-    b.finish(true)
+    b.finish()
 }
 
-pub fn ico_sphere(sub: u32) -> Mesh {
+pub fn ico_sphere(sub: u32) -> PolyMesh {
     let t = (1.0 + 5f32.sqrt()) / 2.0;
     let mut p: Vec<Vec3> = [
-        (-1., t, 0.), (1., t, 0.), (-1., -t, 0.), (1., -t, 0.),
-        (0., -1., t), (0., 1., t), (0., -1., -t), (0., 1., -t),
-        (t, 0., -1.), (t, 0., 1.), (-t, 0., -1.), (-t, 0., 1.),
+        (-1., t, 0.),
+        (1., t, 0.),
+        (-1., -t, 0.),
+        (1., -t, 0.),
+        (0., -1., t),
+        (0., 1., t),
+        (0., -1., -t),
+        (0., 1., -t),
+        (t, 0., -1.),
+        (t, 0., 1.),
+        (-t, 0., -1.),
+        (-t, 0., 1.),
     ]
     .iter()
     .map(|&(x, y, z)| Vec3::new(x, y, z).normalize())
     .collect();
     let mut f: Vec<[u32; 3]> = vec![
-        [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
-        [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
-        [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
-        [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
+        [0, 11, 5],
+        [0, 5, 1],
+        [0, 1, 7],
+        [0, 7, 10],
+        [0, 10, 11],
+        [1, 5, 9],
+        [5, 11, 4],
+        [11, 10, 2],
+        [10, 7, 6],
+        [7, 1, 8],
+        [3, 9, 4],
+        [3, 4, 2],
+        [3, 2, 6],
+        [3, 6, 8],
+        [3, 8, 9],
+        [4, 9, 5],
+        [2, 4, 11],
+        [6, 2, 10],
+        [8, 6, 7],
+        [9, 8, 1],
     ];
     for _ in 1..sub {
         let mut cache: HashMap<(u32, u32), u32> = HashMap::new();
@@ -336,16 +524,13 @@ pub fn ico_sphere(sub: u32) -> Mesh {
         }
         f = nf;
     }
-    let mut m = Mesh { positions: p, tris: f, smooth: sub > 1, ..Default::default() };
-    m.compute(&Default::default(), None);
-    // Ico spheres show every edge in Blender.
-    for e in &mut m.edges {
-        e.feature = true;
+    PolyMesh {
+        verts: p,
+        faces: f.into_iter().map(|t| t.to_vec()).collect(),
     }
-    m
 }
 
-pub fn cylinder(seg: u32, r_bottom: f32, r_top: f32) -> Mesh {
+pub fn cylinder(seg: u32, r_bottom: f32, r_top: f32) -> PolyMesh {
     let mut b = Builder::new();
     let mut bot = vec![];
     let mut top = vec![];
@@ -355,25 +540,23 @@ pub fn cylinder(seg: u32, r_bottom: f32, r_top: f32) -> Mesh {
         bot.push(b.v(Vec3::new(c * r_bottom, sn * r_bottom, -1.0)));
         top.push(b.v(Vec3::new(c * r_top, sn * r_top, 1.0)));
     }
-    let cb = b.v(Vec3::new(0.0, 0.0, -1.0));
-    let ct = b.v(Vec3::new(0.0, 0.0, 1.0));
+    let apex = (r_top <= 0.0).then(|| b.v(Vec3::new(0.0, 0.0, 1.0)));
     for s in 0..seg as usize {
         let n = (s + 1) % seg as usize;
-        if r_top > 0.0 {
-            b.quad(bot[s], bot[n], top[n], top[s]);
-            b.tri(ct, top[s], top[n]);
-        } else {
-            b.tri(bot[s], bot[n], ct);
+        match apex {
+            None => b.quad(bot[s], bot[n], top[n], top[s]),
+            Some(ap) => b.tri(bot[s], bot[n], ap),
         }
-        b.tri(cb, bot[n], bot[s]);
     }
-    let mut m = b.finish(false);
-    // smooth the sides but keep caps flat: approximate by marking smooth only for shading of sides
-    m.smooth = false;
-    m
+    // n-gon caps, like Blender
+    b.ngon(bot.iter().rev().copied().collect());
+    if apex.is_none() {
+        b.ngon(top.clone());
+    }
+    b.finish()
 }
 
-pub fn torus(seg: u32, sides: u32, r: f32, tube: f32) -> Mesh {
+pub fn torus(seg: u32, sides: u32, r: f32, tube: f32) -> PolyMesh {
     let mut b = Builder::new();
     let mut idx = vec![];
     for i in 0..seg {
@@ -390,64 +573,97 @@ pub fn torus(seg: u32, sides: u32, r: f32, tube: f32) -> Mesh {
             b.quad(at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
         }
     }
-    b.finish(true)
+    b.finish()
 }
 
 /// An organic "blob" head shape (a stand-in for Blender's Suzanne).
-pub fn blob(sub: u32) -> Mesh {
+pub fn blob(sub: u32) -> PolyMesh {
     let mut m = ico_sphere(sub.max(3));
-    for p in &mut m.positions {
+    for p in &mut m.verts {
         let d = *p;
         let mut s = 1.0;
-        // ears
         for sx in [-1.0f32, 1.0] {
             let ear = Vec3::new(sx * 0.9, 0.0, 0.35).normalize();
             s += 0.45 * d.dot(ear).max(0.0).powf(12.0);
         }
-        // snout
         let snout = Vec3::new(0.0, -1.0, -0.25).normalize();
         s += 0.25 * d.dot(snout).max(0.0).powf(6.0);
-        // brow
         s += 0.08 * (d.z * 3.0).sin() * d.y.min(0.0).abs();
         *p = Vec3::new(d.x * 1.05, d.y * 0.85, d.z * 0.9) * s;
     }
-    let mut m2 = Mesh { positions: m.positions, tris: m.tris, smooth: true, ..Default::default() };
-    m2.compute(&Default::default(), None);
-    for e in &mut m2.edges {
-        e.feature = true;
-    }
-    m2
+    m
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn primitives_are_closed_or_valid() {
+    fn primitives_are_valid() {
         for p in Primitive::ALL {
-            let m = p.build(2);
+            let pm = p.poly(2);
+            let m = pm.to_mesh(true);
             assert!(!m.tris.is_empty(), "{p:?}");
             assert_eq!(m.normals.len(), m.positions.len());
+            assert_eq!(m.tri_face.len(), m.tris.len());
             for t in &m.tris {
                 for &i in t {
                     assert!((i as usize) < m.positions.len());
                 }
             }
+            // closed meshes: every edge shared by exactly two faces (except plane)
+            if p != Primitive::Plane {
+                for (e, f) in pm.edge_faces() {
+                    assert_eq!(f.len(), 2, "{p:?} edge {e:?}");
+                }
+            }
         }
-        // cube: 8 welded verts, 12 tris, 12 visible edges
         let c = cube();
-        assert_eq!(c.positions.len(), 8);
-        assert_eq!(c.tris.len(), 12);
-        assert_eq!(c.edges.iter().filter(|e| e.feature).count(), 12);
+        assert_eq!(c.verts.len(), 8);
+        assert_eq!(c.faces.len(), 6);
+        let m = c.to_mesh(false);
+        assert_eq!(m.tris.len(), 12);
+        assert_eq!(m.edges.iter().filter(|e| e.feature).count(), 12);
+        let cyl = cylinder(16, 1.0, 1.0);
+        assert_eq!(cyl.faces.len(), 18);
     }
     #[test]
-    fn cube_normals_point_outward() {
-        let c = cube();
-        for f in 0..c.tris.len() {
-            let n = c.face_normal(f);
-            let ctr = c.tris[f].iter().map(|&i| c.positions[i as usize]).sum::<Vec3>() / 3.0;
-            assert!(n.dot(ctr) > 0.0);
+    fn normals_point_outward() {
+        for p in [
+            Primitive::Cube,
+            Primitive::Cylinder,
+            Primitive::Cone,
+            Primitive::UvSphere,
+        ] {
+            let c = p.poly(2);
+            for f in 0..c.faces.len() {
+                let n = c.face_normal(f);
+                assert!(n.dot(c.face_center(f)) > 0.0, "{p:?} face {f}");
+            }
         }
+    }
+    #[test]
+    fn triangulate_concave() {
+        // L-shape
+        let v = vec![
+            Vec3::new(0., 0., 0.),
+            Vec3::new(2., 0., 0.),
+            Vec3::new(2., 1., 0.),
+            Vec3::new(1., 1., 0.),
+            Vec3::new(1., 2., 0.),
+            Vec3::new(0., 2., 0.),
+        ];
+        let t = triangulate(&v, &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(t.len(), 4);
+        let area: f32 = t
+            .iter()
+            .map(|t| {
+                (v[t[1] as usize] - v[t[0] as usize])
+                    .cross(v[t[2] as usize] - v[t[0] as usize])
+                    .z
+                    * 0.5
+            })
+            .sum();
+        assert!((area - 3.0).abs() < 1e-4, "{area}");
     }
     #[test]
     fn parse_names() {

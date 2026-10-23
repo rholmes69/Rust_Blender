@@ -1,0 +1,33 @@
+[package]
+name = "rust_blender"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+candle-core = { version = "0.11.0", optional = true }
+candle-nn = { version = "0.11.0", optional = true }
+candle-transformers = { version = "0.11.0", optional = true }
+cpal = { version = "0.18.2", optional = true }
+crossbeam-channel = "0.5.17"
+dirs = "7.0.0"
+eframe = "0.37.0"
+glam = { version = "0.34.1", features = ["serde"] }
+rfd = "0.17.2"
+rand = "0.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "3.5.0", features = ["json"] }
+egui = "0.37"
+
+[features]
+default = ["voice"]
+voice = ["dep:cpal", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3

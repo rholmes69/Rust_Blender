@@ -153,6 +153,9 @@ pub struct App {
     waiting_ai: Option<Instant>,
     /// (chat index, undo snapshot taken) for the answer currently streaming
     streaming: Option<(usize, bool)>,
+    /// models we already warned about running partly on the CPU
+    warned_cpu: Vec<String>,
+    ai_cancelled: bool,
     pull: Option<(String, f32)>,
     voice_status: VoiceStatus,
     transcribing: bool,
@@ -218,6 +221,8 @@ impl App {
             input: String::new(),
             waiting_ai: None,
             streaming: None,
+            warned_cpu: vec![],
+            ai_cancelled: false,
             pull: None,
             voice_status: VoiceStatus::NotLoaded,
             transcribing: false,
@@ -251,6 +256,17 @@ impl App {
     // ------------------------------------------------------------------------------------------
     fn poll_events(&mut self) {
         while let Ok(ev) = self.ai.rx.try_recv() {
+            // After Stop, drop whatever the cancelled request still sends.
+            if self.ai_cancelled {
+                match ev {
+                    AiEvent::Delta { .. } => continue,
+                    AiEvent::Reply { .. } | AiEvent::Error(_) => {
+                        self.ai_cancelled = false;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             match ev {
                 AiEvent::Models(Ok(list)) => {
                     self.ollama = OllamaStatus::Online;
@@ -309,6 +325,7 @@ impl App {
                     }
                     self.chat[idx].streaming = false;
                     self.streaming = None;
+                    self.ai.send(AiRequest::Ps(self.settings.model.clone()));
                     if self.settings.speak_replies {
                         speak(&reply);
                     }
@@ -325,6 +342,15 @@ impl App {
                         self.chat
                             .push(ChatEntry::new(Role::System, format!("⚠ {e}")));
                         self.ai.send(AiRequest::ListModels);
+                        self.ai.send(AiRequest::Ps(self.settings.model.clone()));
+                    }
+                }
+                AiEvent::Ps(model, f) => {
+                    if f < 0.9 && !self.warned_cpu.contains(&model) {
+                        self.warned_cpu.push(model.clone());
+                        let pct = ((1.0 - f) * 100.0).round();
+                        let tip = if model.starts_with(ai::LIGHTWEIGHT_MODEL) { "Close other GPU-heavy apps, or try an even smaller model.".to_string() } else { format!("For faster replies try {} (Copilot ⚙ → Pull).", ai::LIGHTWEIGHT_MODEL) };
+                        self.chat.push(ChatEntry::new(Role::System, format!("⚠ {pct}% of {model} is running on your CPU because it doesn't fully fit in GPU memory, so replies will be slow. {tip}")));
                     }
                 }
                 AiEvent::PullProgress(s, f) => self.pull = Some((s, f)),
@@ -1521,10 +1547,21 @@ impl App {
                     .on_hover_text("Stop generating (keeps changes made so far)")
                     .clicked();
             });
+            if self.streaming.is_none() && t0.elapsed().as_secs() >= 20 {
+                ui.label(RichText::new("Still waiting for the first word — the first request loads the model into memory, and models that don't fit in GPU memory run slowly on the CPU.").small().color(theme::TEXT_DIM));
+            }
             if stop {
                 self.ai
                     .cancel
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Stop immediately in the UI even if Ollama is still busy on its side.
+                self.ai_cancelled = true;
+                self.waiting_ai = None;
+                let partial = self.streaming.take();
+                if let Some((i, _)) = partial {
+                    self.chat[i].streaming = false;
+                }
+                self.chat.push(ChatEntry::new(Role::System, if partial.is_some() { "Stopped. Changes made so far are kept (Ctrl+Z undoes them in one step)." } else { "Stopped." }));
             }
             ui.ctx().request_repaint();
         }

@@ -37,8 +37,13 @@ pub struct ChatMsg {
     pub content: String,
 }
 
+/// Give up only if Ollama sends nothing at all for this long.
+pub const STALL_SECS: u64 = 300;
+
 pub enum AiRequest {
     ListModels,
+    /// Ask Ollama how much of a loaded model sits in GPU memory (`/api/ps`).
+    Ps(String),
     Chat {
         model: String,
         history: Vec<ChatMsg>,
@@ -64,6 +69,8 @@ pub enum AiEvent {
         secs: f32,
     },
     Error(String),
+    /// (model, fraction of the model in VRAM)
+    Ps(String, f32),
     PullProgress(String, f32),
     PullDone(Result<String, String>),
 }
@@ -83,9 +90,11 @@ impl AiClient {
         std::thread::Builder::new()
             .name("ollama".into())
             .spawn(move || {
+                // No overall deadline: local models can take minutes (cold load, CPU inference,
+                // multi-GB pulls). Instead fail only if Ollama goes completely silent.
                 let agent: ureq::Agent = ureq::Agent::config_builder()
                     .timeout_connect(Some(Duration::from_secs(3)))
-                    .timeout_global(Some(Duration::from_secs(600)))
+                    .timeout_per_read(Some(Duration::from_secs(STALL_SECS)))
                     .http_status_as_error(false)
                     .build()
                     .into();
@@ -93,6 +102,11 @@ impl AiClient {
                     match req {
                         AiRequest::ListModels => {
                             let _ = ev_tx.send(AiEvent::Models(list_models(&agent, &host)));
+                        }
+                        AiRequest::Ps(model) => {
+                            if let Some(f) = vram_fraction(&agent, &host, &model) {
+                                let _ = ev_tx.send(AiEvent::Ps(model, f));
+                            }
                         }
                         AiRequest::Chat {
                             model,
@@ -112,7 +126,7 @@ impl AiClient {
                                     raw,
                                     secs: t0.elapsed().as_secs_f32(),
                                 },
-                                Err(e) => AiEvent::Error(e),
+                                Err(e) => AiEvent::Error(friendly_error(&e, &model)),
                             };
                             let _ = ev_tx.send(ev);
                         }
@@ -131,6 +145,30 @@ impl AiClient {
     pub fn send(&self, r: AiRequest) {
         let _ = self.tx.send(r);
     }
+}
+
+fn friendly_error(e: &str, model: &str) -> String {
+    let l = e.to_lowercase();
+    if l.contains("timeout") || l.contains("timed out") {
+        format!(
+            "Ollama stopped responding for {} min while running {model}. This usually means the model doesn't fit in your GPU's memory and is running (very slowly) on the CPU. Try a smaller model such as {LIGHTWEIGHT_MODEL} (Copilot ⚙ → Pull), and run `ollama ps` in a terminal to check the CPU/GPU split. (details: {e})",
+            STALL_SECS / 60
+        )
+    } else if l.contains("connection refused") || l.contains("connect") && l.contains("failed") {
+        format!("Can't reach Ollama — is it running? Start the Ollama app or run `ollama serve`. (details: {e})")
+    } else {
+        e.to_string()
+    }
+}
+
+/// Fraction of a loaded model that lives in VRAM, from `/api/ps`.
+fn vram_fraction(agent: &ureq::Agent, host: &str, model: &str) -> Option<f32> {
+    let mut resp = agent.get(&format!("{host}/api/ps")).call().ok()?;
+    let v: Value = resp.body_mut().read_json().ok()?;
+    let m = v["models"].as_array()?.iter().find(|m| m["name"].as_str() == Some(model) || m["model"].as_str() == Some(model))?;
+    let size = m["size"].as_f64()?;
+    let vram = m["size_vram"].as_f64().unwrap_or(0.0);
+    (size > 0.0).then(|| (vram / size) as f32)
 }
 
 fn list_models(agent: &ureq::Agent, host: &str) -> Result<Vec<String>, String> {
@@ -440,9 +478,19 @@ fn chat(
     // few-shot example keeps small models on-format
     messages.push(json!({"role": "user", "content": "put a red ball on top of the cube"}));
     messages.push(json!({"role": "assistant", "content": r#"{"reply":"Added a red ball resting on the cube.","commands":[{"action":"add","primitive":"uv_sphere","name":"Red Ball","location":[0,0,2],"scale":[1,1,1],"color":"red"}]}"#}));
-    for m in history.iter().rev().take(10).rev() {
-        messages.push(json!({"role": m.role, "content": m.content}));
+    // Keep the context small (fits more GPUs, much faster prompt processing): newest turns
+    // first, within a character budget.
+    let mut budget = 6000usize;
+    let mut recent = vec![];
+    for m in history.iter().rev().take(8) {
+        let c: String = m.content.chars().take(1500).collect();
+        if c.len() > budget {
+            break;
+        }
+        budget -= c.len();
+        recent.push(json!({"role": m.role, "content": c}));
     }
+    messages.extend(recent.into_iter().rev());
     messages.push(json!({"role": "user", "content": prompt}));
     let mut body = json!({
         "model": model,
@@ -451,7 +499,7 @@ fn chat(
         "format": command_schema(),
         "think": false,
         "keep_alive": "30m",
-        "options": {"temperature": 0.15, "num_ctx": 8192}
+        "options": {"temperature": 0.15, "num_ctx": 6144}
     });
     for attempt in 0..2 {
         let resp = agent

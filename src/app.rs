@@ -36,6 +36,9 @@ pub struct Settings {
     pub show_assistant: bool,
     pub ui_scale: f32,
     pub gpu_renderer: bool,
+    /// MCP server for external agents (Claude Desktop, Claude Code, Cursor …).
+    pub mcp_enabled: bool,
+    pub mcp_port: u16,
 }
 
 impl Default for Settings {
@@ -65,6 +68,8 @@ impl Default for Settings {
             show_assistant: true,
             ui_scale: 1.0,
             gpu_renderer: true,
+            mcp_enabled: true,
+            mcp_port: crate::mcp::DEFAULT_PORT,
         }
     }
 }
@@ -199,6 +204,10 @@ pub struct App {
     rename: Option<(u64, String)>,
     last_ollama_check: Instant,
     last_title: String,
+    /// Running MCP server (None = disabled or failed to start).
+    mcp: Option<crate::mcp::McpServer>,
+    mcp_status: String,
+    mcp_calls: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,6 +238,15 @@ impl App {
             vp.gpu = crate::gpu::GpuHandle::install(rs);
         }
         vp.use_gpu = settings.gpu_renderer;
+        let (mcp, mcp_status) = if settings.mcp_enabled {
+            let c3 = cc.egui_ctx.clone();
+            match crate::mcp::McpServer::start(settings.mcp_port, move || c3.request_repaint()) {
+                Ok(m) => (Some(m), format!("listening on http://127.0.0.1:{}/mcp", settings.mcp_port)),
+                Err(e) => (None, e),
+            }
+        } else {
+            (None, "off".to_string())
+        };
         let mut chat = vec![];
         chat.push(ChatEntry::new(
             Role::System,
@@ -272,6 +290,9 @@ impl App {
             rename: None,
             last_ollama_check: Instant::now(),
             last_title: String::new(),
+            mcp,
+            mcp_status,
+            mcp_calls: 0,
         }
     }
 
@@ -781,6 +802,114 @@ impl App {
                 Ok(_) => self.toast(format!("Exported {}", p.display()), theme::OK),
                 Err(e) => self.toast(format!("Export failed: {e}"), theme::ERR),
             }
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // MCP: tool calls from external agents, executed on the UI thread
+    // ------------------------------------------------------------------------------------------
+    fn restart_mcp(&mut self, ctx: &egui::Context) {
+        self.mcp = None; // dropping the server frees the port
+        if !self.settings.mcp_enabled {
+            self.mcp_status = "off".into();
+            return;
+        }
+        let c = ctx.clone();
+        match crate::mcp::McpServer::start(self.settings.mcp_port, move || c.request_repaint()) {
+            Ok(m) => {
+                self.mcp_status = format!("listening on http://127.0.0.1:{}/mcp", m.port);
+                self.mcp = Some(m);
+            }
+            Err(e) => self.mcp_status = e,
+        }
+    }
+
+    fn poll_mcp(&mut self) {
+        let calls: Vec<crate::mcp::ToolCall> = match &self.mcp {
+            Some(m) => m.rx.try_iter().collect(),
+            None => return,
+        };
+        for call in calls {
+            self.mcp_calls += 1;
+            let r = self.mcp_tool(&call.name, &call.args, &call.client);
+            let _ = call.reply.send(r);
+        }
+    }
+
+    fn mcp_tool(&mut self, name: &str, args: &serde_json::Value, client: &str) -> crate::mcp::ToolResult {
+        use crate::mcp::ToolResult;
+        let client_short: String = client.split(['/', ' ']).next().unwrap_or("agent").chars().take(24).collect();
+        match name {
+            "run_commands" => {
+                let cmds: Vec<Command> = match serde_json::from_value(args.get("commands").cloned().unwrap_or_default()) {
+                    Ok(c) => c,
+                    Err(e) => return ToolResult::err(format!("invalid commands: {e}")),
+                };
+                if cmds.is_empty() {
+                    return ToolResult::err("no commands given");
+                }
+                let log = self.ed.execute(&cmds);
+                let failed = log.iter().filter(|l| l.starts_with('✖')).count();
+                let mut e = ChatEntry::new(Role::System, format!("⚙ MCP ({client_short}): ran {} command(s)", cmds.len()));
+                e.commands = cmds;
+                e.log = log.clone();
+                e.applied = true;
+                self.chat.push(e);
+                let text = format!("{}\n\n{} ok, {} failed. Objects now: {}", log.join("\n"), log.len() - failed, failed, self.ed.scene.objects.len());
+                if failed == log.len() { ToolResult::err(text) } else { ToolResult::ok(text) }
+            }
+            "get_scene" => {
+                let mut s = crate::agent::bounds_report(&self.ed.scene, &mut self.vp.mesh_cache);
+                let hidden: Vec<&str> = self.ed.scene.objects.iter().filter(|o| !o.visible).map(|o| o.name.as_str()).collect();
+                if !hidden.is_empty() {
+                    s += &format!("hidden: {}\n", hidden.join(", "));
+                }
+                let names = |ids: &[u64]| -> Vec<String> {
+                    ids.iter().filter_map(|id| self.ed.scene.objects.iter().find(|o| o.id == *id)).map(|o| format!("\"{}\"", o.name)).collect()
+                };
+                s += &format!(
+                    "selection: [{}]  active: {}  frame: {}  mode: {}\n",
+                    names(&self.ed.selection).join(", "),
+                    self.ed.active.map(|a| names(&[a]).join("")).unwrap_or_else(|| "none".into()),
+                    self.ed.frame,
+                    if self.ed.edit.is_some() { "edit" } else { "object" }
+                );
+                if self.ed.scene.objects.is_empty() {
+                    s = format!("The scene is empty.\n{s}");
+                }
+                ToolResult::ok(s)
+            }
+            "check_scene" => {
+                let ids: Vec<u64> = self.ed.scene.objects.iter().map(|o| o.id).collect();
+                let issues = crate::agent::inspect(&self.ed.scene, &mut self.vp.mesh_cache, &ids, &[]);
+                if issues.is_empty() {
+                    ToolResult::ok("No problems found (nothing floating, sunken, hidden inside another object or duplicated).")
+                } else {
+                    let lines: Vec<String> = issues.iter().map(|i| if i.object.is_empty() { format!("- {}", i.text) } else { format!("- \"{}\": {}", i.object, i.text) }).collect();
+                    ToolResult::ok(format!("{} possible issue(s) — some may be intentional (e.g. something meant to hover):\n{}", issues.len(), lines.join("\n")))
+                }
+            }
+            "ask_copilot" => {
+                let Some(p) = args["prompt"].as_str().map(str::trim).filter(|p| !p.is_empty()) else {
+                    return ToolResult::err("missing prompt");
+                };
+                if self.waiting_ai.is_some() || self.review.is_some() {
+                    return ToolResult::err("the Copilot is busy with another request; try again shortly");
+                }
+                self.submit_prompt(p.to_string(), false, 0.0);
+                ToolResult::ok(format!("Sent to the Copilot ({}). The build streams into the app; call get_scene in a few seconds to see the result.", self.settings.model))
+            }
+            "export_gltf" => {
+                let Some(path) = args["path"].as_str().filter(|p| !p.is_empty()) else {
+                    return ToolResult::err("missing path");
+                };
+                let (bytes, st) = crate::gltf::export_glb(&self.ed.scene, &mut self.vp.mesh_cache);
+                match std::fs::write(path, bytes) {
+                    Ok(_) => ToolResult::ok(format!("wrote {path}: {} meshes, {} lights, {} cameras, {} animations, {} bytes", st.meshes, st.lights, st.cameras, st.animations, st.bytes)),
+                    Err(e) => ToolResult::err(format!("could not write {path}: {e}")),
+                }
+            }
+            other => ToolResult::err(format!("unknown tool: {other}")),
         }
     }
 
@@ -1969,6 +2098,31 @@ impl App {
                         ui.end_row();
                         ui.label("");
                         ui.checkbox(&mut self.settings.auto_check, "🔍 Check & fix AI builds (agent loop)").on_hover_text("After a build, Rust checks for floating, sunken, hidden or duplicate objects and failed commands; the decision model (or builder) reviews and fixes real mistakes — up to 2 rounds, all in one undo step.");
+                        ui.end_row();
+                        ui.label("MCP");
+                        ui.horizontal(|ui| {
+                            let on = self.mcp.is_some();
+                            ui.label(RichText::new(if on { "●" } else { "○" }).color(if on { theme::OK } else { Color32::GRAY }));
+                            ui.label(RichText::new(&self.mcp_status).small());
+                        })
+                        .response
+                        .on_hover_text(format!("External agents (Claude Desktop, Claude Code, Cursor …) can drive this app. {} tool call(s) so far.", self.mcp_calls));
+                        ui.end_row();
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            let mut changed = ui.checkbox(&mut self.settings.mcp_enabled, "MCP server").changed();
+                            ui.label("port");
+                            changed |= ui.add(egui::DragValue::new(&mut self.settings.mcp_port).range(1024..=65535)).lost_focus();
+                            if changed {
+                                let ctx = ui.ctx().clone();
+                                self.restart_mcp(&ctx);
+                                self.settings.save();
+                            }
+                            if ui.small_button("📋 Copy client config").on_hover_text("Claude Desktop / Cursor JSON (stdio). For Claude Code: claude mcp add --transport http rust-blender http://127.0.0.1:7878/mcp").clicked() {
+                                ui.ctx().copy_text(crate::mcp::client_config());
+                                self.toast("MCP client config copied", theme::OK);
+                            }
+                        });
                         ui.end_row();
                         ui.label("Pull");
                         ui.horizontal(|ui| {
@@ -3532,6 +3686,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_events();
+        self.poll_mcp();
         self.shortcuts(&ctx);
         self.tick_playback(&ctx);
 

@@ -10,6 +10,7 @@ mod editmesh;
 mod editor;
 mod gltf;
 mod gpu;
+mod mcp;
 mod mesh;
 mod render;
 mod router;
@@ -21,6 +22,11 @@ mod voice;
 fn main() -> eframe::Result<()> {
     // Headless helper: `rust_blender --export-demo out.glb` builds a demo scene and exports it.
     let args: Vec<String> = std::env::args().collect();
+    // MCP stdio shim: `rust_blender --mcp-stdio` (launched by Claude Desktop, Cursor, …).
+    if args.get(1).map(String::as_str) == Some("--mcp-stdio") {
+        mcp::run_stdio_bridge();
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--export-demo" {
         let mut ed = editor::Editor::default();
         let cmds: Vec<editor::Command> =

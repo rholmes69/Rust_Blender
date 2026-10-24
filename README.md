@@ -51,6 +51,34 @@ After any AI build, Rust Blender **checks the result** itself, using the real me
 
 Only objects the build touched are checked. The flagged issues and the scene's bounding boxes go to the **reviewer**: the decision model if you have one, otherwise the builder. The reviewer decides which problems are real (a ring meant to hover stays put) and sends fixes. The check runs again, up to 2 rounds. The build and all its fixes form **one undo step**. You can turn the loop off with Copilot ⚙ → "Check & fix AI builds".
 
+## MCP server: let other AI agents drive it
+
+Rust Blender runs a **Model Context Protocol** server, so external agents such as Claude Desktop, Claude Code, Cursor or VS Code can build in the live scene. It starts with the app and listens only on `127.0.0.1:7878` (change the port or turn it off in Copilot ⚙ → **MCP**). Every call shows up in the Copilot chat, and each `run_commands` call is one undo step.
+
+| Tool | What it does |
+|---|---|
+| `run_commands` | Runs a batch of editor commands (the same JSON commands the Copilot uses) and returns a per-command log |
+| `get_scene` | Lists objects with type, transform and world bounding boxes, plus the selection, frame and mode |
+| `check_scene` | Runs the agent-loop geometry checks (floating, sunken, hidden, duplicates) on the whole scene |
+| `ask_copilot` | Hands a plain-English request to the app's own Ollama Copilot |
+| `export_gltf` | Writes the scene to a `.glb` file |
+
+**Claude Code** (HTTP):
+
+```powershell
+claude mcp add --transport http rust-blender http://127.0.0.1:7878/mcp
+```
+
+**Claude Desktop / Cursor** (stdio): click **Copy client config** in Copilot ⚙ and paste it into `%APPDATA%\Claude\claude_desktop_config.json` (Cursor: `.cursor\mcp.json`). It looks like this:
+
+```json
+{ "mcpServers": { "rust-blender": {
+    "command": "C:\\Users\\you\\Rust_Blender\\target\\release\\rust_blender.exe",
+    "args": ["--mcp-stdio"] } } }
+```
+
+`rust_blender --mcp-stdio` is a small bridge that forwards to the running app and starts the app if it isn't open. Requests from web pages on other origins are refused.
+
 ## Setup (Windows)
 
 1. Install **Rust**: <https://rustup.rs>. You also need the *MSVC C++ Build Tools*; rustup offers to install them.
@@ -113,6 +141,7 @@ src/
   editmesh.rs  mesh operators (extrude, inset, loop cut, subdivide, merge, delete …)
   gltf.rs      glTF 2.0 / .glb exporter
   editor.rs    editor state, undo, and the command executor shared by UI / AI / voice
+  mcp.rs       MCP server (Streamable HTTP on 127.0.0.1) + --mcp-stdio bridge
   ai.rs        Ollama client, model ranking, JSON schema + system prompt, offline parser
   voice.rs     cpal mic capture, VAD, resampling, candle Whisper + tiny BPE decoder
   scene.rs     objects, transforms, materials, modifiers, keyframes, OBJ export

@@ -29,6 +29,10 @@ pub struct Mesh {
     pub normals: Vec<Vec3>,
     /// Texture coordinates for each triangle corner.
     pub tri_uv: Vec<[[f32; 2]; 3]>,
+    /// Shading normal for each triangle corner (smooth, flat or split by the auto-smooth angle).
+    pub corner_normals: Vec<[Vec3; 3]>,
+    /// Auto smooth was applied: `corner_normals` differ from the shared vertex normals.
+    pub split_normals: bool,
     /// Unique edges, each with the (up to two) triangles that share it.
     pub edges: Vec<Edge>,
     pub smooth: bool,
@@ -110,9 +114,6 @@ impl Primitive {
         })
     }
 
-    pub fn build(self, detail: u32) -> Mesh {
-        self.poly(detail).to_mesh(self.default_smooth())
-    }
 
     pub fn default_smooth(self) -> bool {
         matches!(
@@ -275,6 +276,18 @@ impl PolyMesh {
     }
 
     pub fn to_mesh(&self, smooth: bool) -> Mesh {
+        self.to_mesh_opts(smooth, 0.0)
+    }
+
+    /// Render mesh; with `smooth` and `auto_smooth_deg` > 0, faces meeting at a sharper
+    /// angle keep hard edges (Blender's "Shade Auto Smooth").
+    pub fn to_mesh_opts(&self, smooth: bool, auto_smooth_deg: f32) -> Mesh {
+        let mut m = self.to_mesh_inner(smooth);
+        m.corner_normals(smooth, auto_smooth_deg);
+        m
+    }
+
+    fn to_mesh_inner(&self, smooth: bool) -> Mesh {
         let mut tris = vec![];
         let mut tri_face = vec![];
         let mut tri_uv = vec![];
@@ -428,6 +441,55 @@ impl Builder {
 }
 
 impl Mesh {
+    fn corner_normals(&mut self, smooth: bool, auto_deg: f32) {
+        let fnrm: Vec<Vec3> = self
+            .tris
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| self.positions[i as usize]);
+                (b - a).cross(c - a)
+            })
+            .collect();
+        if !smooth {
+            self.corner_normals = fnrm.iter().map(|n| [n.normalize_or_zero(); 3]).collect();
+            return;
+        }
+        if auto_deg <= 0.0 || auto_deg >= 180.0 {
+            self.corner_normals = self.tris.iter().map(|t| t.map(|i| self.normals[i as usize])).collect();
+            return;
+        }
+        let cos = auto_deg.to_radians().cos();
+        let mut around: Vec<Vec<u32>> = vec![vec![]; self.positions.len()];
+        for (ti, t) in self.tris.iter().enumerate() {
+            for &i in t {
+                around[i as usize].push(ti as u32);
+            }
+        }
+        let unit: Vec<Vec3> = fnrm.iter().map(|n| n.normalize_or_zero()).collect();
+        let mut split = false;
+        self.corner_normals = self
+            .tris
+            .iter()
+            .enumerate()
+            .map(|(ti, t)| {
+                t.map(|v| {
+                    let mut n = Vec3::ZERO;
+                    for &o in &around[v as usize] {
+                        if unit[o as usize].dot(unit[ti]) >= cos {
+                            n += fnrm[o as usize];
+                        }
+                    }
+                    let n = n.normalize_or_zero();
+                    if n.dot(self.normals[v as usize]) < 0.9999 {
+                        split = true;
+                    }
+                    n
+                })
+            })
+            .collect();
+        self.split_normals = split;
+    }
+
     fn compute(&mut self, poly_edges: &HashSet<(u32, u32)>) {
         let mut n = vec![Vec3::ZERO; self.positions.len()];
         for t in &self.tris {

@@ -57,6 +57,8 @@ pub enum AiRequest {
     Pull(String),
     /// Agent loop check stage: review flagged issues with `model` and propose fixes.
     Review { model: String, prompt: String, round: u32 },
+    /// Ask a vision model to describe a picture as a buildable 3D scene.
+    Describe { model: String, image_b64: String, request: String },
 }
 
 #[derive(Debug)]
@@ -85,6 +87,8 @@ pub enum AiEvent {
     Ps(String, f32),
     PullProgress(String, f32),
     PullDone(Result<String, String>),
+    /// Vision model description of an attached picture.
+    Described { model: String, text: Result<String, String>, secs: f32 },
 }
 
 pub struct AiClient {
@@ -200,6 +204,11 @@ impl AiClient {
                             };
                             let _ = ev_tx.send(AiEvent::Reviewed { model, reply, commands, round, secs: t0.elapsed().as_secs_f32(), error });
                         }
+                        AiRequest::Describe { model, image_b64, request } => {
+                            let t0 = std::time::Instant::now();
+                            let text = describe_image(&agent, &host, &model, &image_b64, &request);
+                            let _ = ev_tx.send(AiEvent::Described { model, text, secs: t0.elapsed().as_secs_f32() });
+                        }
                         AiRequest::Pull(model) => {
                             let r = pull(&agent, &host, &model, &ev_tx, &repaint);
                             let _ = ev_tx.send(AiEvent::PullDone(r.map(|_| model)));
@@ -258,6 +267,70 @@ fn list_models(agent: &ureq::Agent, host: &str) -> Result<Vec<String>, String> {
 }
 
 /// Pick the best installed model according to `PREFERRED_MODELS`.
+/// Vision-capable models, best first (all run in Ollama).
+pub const VISION_MODELS: &[&str] = &["qwen2.5vl", "qwen3-vl", "gemma3", "llama3.2-vision", "minicpm-v", "llava-llama3", "llava", "moondream"];
+pub const RECOMMENDED_VISION: &str = "qwen2.5vl:7b";
+
+pub fn pick_vision_model(installed: &[String]) -> Option<String> {
+    for pref in VISION_MODELS {
+        // gemma3:1b has no vision
+        if let Some(m) = installed.iter().find(|m| (m.as_str() == *pref || m.starts_with(&format!("{pref}:"))) && !m.starts_with("gemma3:1b") && !m.starts_with("gemma3:270m")) {
+            return Some(m.clone());
+        }
+    }
+    None
+}
+
+const DESCRIBE_PROMPT: &str = "You are helping rebuild this picture as a simple 3D scene made of primitives \
+(cube, sphere, cylinder, cone, torus, plane) in a Z-up world measured in metres, standing on the ground (z = 0). \
+List the main objects (at most 15). For each give: name, the primitive(s) that approximate it, approximate size \
+in metres, position relative to the scene centre (x = right, y = away from the viewer, z = up), main colour and \
+material (matte, glossy, metal, glass, glowing). Then one line about the lighting and the background. Be concrete \
+and brief; no introduction.";
+
+/// Ask a vision model to describe a picture (base64 PNG/JPEG) for rebuilding in 3D.
+fn describe_image(agent: &ureq::Agent, host: &str, model: &str, image_b64: &str, request: &str) -> Result<String, String> {
+    let mut prompt = DESCRIBE_PROMPT.to_string();
+    if !request.trim().is_empty() {
+        prompt += &format!("\nThe user wants: {request}");
+    }
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+        "stream": false,
+        "keep_alive": "30m",
+        "options": {"temperature": 0.2, "num_ctx": 8192}
+    });
+    let mut resp = agent.post(&format!("{host}/api/chat")).send_json(&body).map_err(|e| friendly_error(&e.to_string(), model))?;
+    let v: Value = resp.body_mut().read_json().map_err(|e| format!("bad response from {model}: {e}"))?;
+    if let Some(e) = v["error"].as_str() {
+        return Err(format!("{model}: {e}"));
+    }
+    let text = v["message"]["content"].as_str().unwrap_or("").trim().to_string();
+    // drop any <think> block
+    let text = match text.find("</think>") {
+        Some(i) => text[i + 8..].trim().to_string(),
+        None => text,
+    };
+    if text.is_empty() {
+        return Err(format!("{model} returned an empty description"));
+    }
+    Ok(text)
+}
+
+/// Downscale (max 1024 px) and re-encode a picture for a vision model; returns base64 PNG.
+pub fn prepare_image(bytes: &[u8]) -> Result<String, String> {
+    use base64::Engine;
+    let img = image::load_from_memory(bytes).map_err(|e| format!("can't read the picture: {e}"))?.to_rgba8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let src = crate::textures::TexImage { w, h, rgba: img.pixels().map(|p| p.0).collect() };
+    let s = (1024.0 / w.max(h) as f32).min(1.0);
+    let small = if s < 1.0 { src.resized(((w as f32 * s) as usize).max(1), ((h as f32 * s) as usize).max(1)) } else { src };
+    let raw: Vec<u8> = small.rgba.iter().flatten().copied().collect();
+    let png = crate::textures::encode_png(small.w, small.h, &raw)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
+}
+
 pub fn pick_best_model(installed: &[String]) -> Option<String> {
     for pref in PREFERRED_MODELS {
         if let Some(m) = installed.iter().find(|m| {
@@ -271,7 +344,7 @@ pub fn pick_best_model(installed: &[String]) -> Option<String> {
     // Otherwise prefer anything that isn't an embedding / vision-only model.
     installed
         .iter()
-        .find(|m| !m.contains("embed") && !m.contains("whisper") && !m.to_lowercase().starts_with("tev"))
+        .find(|m| !m.contains("embed") && !m.contains("whisper") && !m.to_lowercase().starts_with("tev") && !VISION_MODELS.iter().any(|v| m.starts_with(v) && *v != "gemma3"))
         .cloned()
 }
 
@@ -300,9 +373,11 @@ pub fn command_schema() -> Value {
                         "roughness": {"type": "number"},
                         "emission": {"type": "number"},
                         "alpha": {"type": "number"},
-                        "modifier": {"type": "string", "enum": ["array","mirror","radial"]},
+                        "modifier": {"type": "string", "enum": ["array","mirror","radial","subsurf"]},
                         "view": {"type": "string"},
                         "power": {"type": "number"},
+                        "parent": {"type": "string"},
+                        "collection": {"type": "string"},
                         "segments": {"type": "number"},
                         "look_at": {"type": "string"}
                     },
@@ -346,7 +421,15 @@ pub const ACTIONS: &[&str] = &[
     "camera_view",
     "render",
     "set_texture",
+    "subsurf",
+    "parent",
+    "clear_parent",
+    "move_to_collection",
+    "hide_collection",
+    "show_collection",
+    "auto_smooth",
     "edit_mode",
+    "sculpt_mode",
     "object_mode",
     "select_faces",
     "extrude",
@@ -382,7 +465,7 @@ Each command is an object with "action" plus only the fields it needs:
   or "x,y,z"), color (light color), power (watts for point/spot e.g. 1000, strength for sun e.g. 3).
   Lights/cameras point along their local -Z axis; prefer look_at over rotation for aiming them.
 - set_light: target, color, power, number (spot cone angle in degrees).   look_at: target, look_at.
-- camera_view: look through the scene camera (or view = camera).   render: render a final image through the camera (F12).
+- camera_view: look through the scene camera (or view = camera).   render: render a final image through the camera (F12); name "path" = path traced (realistic, slower), number = samples.
 - delete / select / hide / show / focus / smooth / flat: target
 - move: target, vector [dx,dy,dz] (relative).   rotate: target, vector [deg x,y,z] (relative).
 - scale: target, vector [fx,fy,fz] (multiplicative).   set_transform: target + absolute location/rotation/scale.
@@ -395,6 +478,12 @@ Each command is an object with "action" plus only the fields it needs:
 - shading: view = wireframe|solid|material.   set_detail: target, number 1-6 (mesh resolution).
 - set_background: color; vector = sun direction; number = sun strength.
 - bevel in object mode: target, number = width (e.g. 0.1), segments (rounds every edge of the object).
+- HIERARCHY: add accepts parent = an existing object's name (the new object then moves with it) and
+  collection = a group name (created if needed). parent: target, parent (name). clear_parent: target.
+  move_to_collection: target, collection. hide_collection / show_collection: collection. For multi-part
+  things (a car, a robot, a lamp) add the main body first and give the other parts parent = the body.
+- subsurf: target, number = levels 1-3 (Catmull-Clark smooth subdivision; 0 removes). Use it for organic or
+  rounded shapes (a cube with subsurf 2 becomes a rounded blob). auto_smooth: target, number = angle (30).
 - set_texture: target, name = checker|bricks|wood|marble|tiles|grid|noise|stripes|concrete|grass (or an
   image file path), number = repeats (e.g. 6 for a big floor), optional color = tint; name "none" removes it.
 - MESH EDITING (Blender edit mode, works on the vertices/faces of one mesh object):
@@ -829,6 +918,7 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
             return single("render");
         }
         "edit mode" | "enter edit mode" | "tab" => return single("edit_mode"),
+        "sculpt mode" | "sculpt" | "enter sculpt mode" | "let me sculpt" => return single("sculpt_mode"),
         "object mode" | "exit edit mode" => return single("object_mode"),
         "subdivide" | "subdivide it" => return single("subdivide"),
         "merge" | "merge vertices" => return single("merge"),
@@ -841,6 +931,15 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         {
             let p = crate::textures::match_pattern(t).unwrap_or("checker");
             return Some(vec![Command { action: "set_texture".into(), name: Some(p.into()), ..Default::default() }]);
+        }
+        "subdivision surface" | "add subdivision" | "add subdivision surface" | "subsurf" | "subdivide smooth" | "smooth it out" | "make it smoother" => {
+            return Some(vec![Command { action: "subsurf".into(), number: Some(2.0), ..Default::default() }]);
+        }
+        "remove subdivision" | "no subdivision" => {
+            return Some(vec![Command { action: "subsurf".into(), number: Some(0.0), ..Default::default() }]);
+        }
+        "shade auto smooth" | "auto smooth" => {
+            return Some(vec![Command { action: "auto_smooth".into(), number: Some(30.0), ..Default::default() }]);
         }
         "remove the texture" | "remove texture" | "no texture" => {
             return Some(vec![Command { action: "set_texture".into(), name: Some("none".into()), ..Default::default() }]);

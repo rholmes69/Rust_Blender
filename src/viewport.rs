@@ -209,6 +209,7 @@ pub struct Viewport {
     /// Transient error message shown in the HUD.
     pub flash: Option<(String, Instant)>,
     inset_amount: f32,
+    pub sculpt_ui: sculpt::SculptUi,
     /// Proportional editing (O) and its radius in world units (mouse wheel during G/R/S).
     pub proportional: bool,
     pub prop_radius: f32,
@@ -282,6 +283,7 @@ impl Default for Viewport {
             flash: None,
             inset_amount: 0.0,
             proportional: false,
+            sculpt_ui: Default::default(),
             prop_radius: 1.0,
             bevel_width: 0.0,
             bevel_segments: 1,
@@ -323,6 +325,7 @@ impl Default for Viewport {
 }
 
 mod edit;
+mod sculpt;
 
 /// Triangle ids at or above this value encode a face index of the mesh in edit mode.
 pub const FACE_BASE: u32 = 1 << 24;
@@ -784,7 +787,10 @@ impl Viewport {
             );
         }
         self.draw_cursor(&painter);
-        self.draw_gizmo(&painter, ed);
+        if ed.sculpt.is_none() {
+            self.draw_gizmo(&painter, ed);
+        }
+        self.draw_sculpt_cursor(&painter, ui, ed);
         self.draw_loopcut_preview(&painter, ed);
         self.draw_modal_overlay(&painter, ed);
         if let Some((a, b)) = self.box_select {
@@ -1217,7 +1223,9 @@ impl Viewport {
                 }
                 continue;
             }
-            let mesh = self.mesh_cache.for_object(o);
+            // edit mode shows the editable cage (no subdivision surface)
+            let is_edit = !self.render_mode && ed.edit.as_ref().is_some_and(|s| s.obj == o.id);
+            let mesh = if is_edit { self.mesh_cache.for_object_cage(o) } else { self.mesh_cache.for_object(o) };
             let smooth = mesh.smooth;
             let base = lin(o.material.color);
             let mat = o.material;
@@ -1367,7 +1375,9 @@ impl Viewport {
                         let k = ((edge_px / 14.0).ceil() as usize).clamp(1, 256);
                         let (a, b, c) = (wp[ix[0]], wp[ix[1]], wp[ix[2]]);
                         let (na, nb, nc) = if smooth {
-                            (wn[ix[0]] * sign, wn[ix[1]] * sign, wn[ix[2]] * sign)
+                            let cn = mesh.corner_normals.get(fi).copied().unwrap_or([mesh.normals[ix[0]], mesh.normals[ix[1]], mesh.normals[ix[2]]]);
+                            let w = |n: Vec3| (nm * n).normalize_or_zero() * if flip { -1.0 } else { 1.0 } * sign;
+                            (w(cn[0]), w(cn[1]), w(cn[2]))
                         } else {
                             let f = face_n[fi] * sign;
                             (f, f, f)
@@ -1436,7 +1446,16 @@ impl Viewport {
                         if !blend && !facing[fi] {
                             continue;
                         }
-                        let cols: [[f32; 4]; 3] = if smooth && facing[fi] {
+                        let cols: [[f32; 4]; 3] = if smooth && facing[fi] && mesh.split_normals {
+                            // auto smooth: per-corner normals
+                            let cn = mesh.corner_normals[fi];
+                            let mut out = [[0.0; 4]; 3];
+                            for k in 0..3 {
+                                let n = (nm * cn[k]).normalize_or_zero() * if flip { -1.0 } else { 1.0 };
+                                out[k] = srgb4(shade(wp[t[k] as usize], n), alpha);
+                            }
+                            out
+                        } else if smooth && facing[fi] {
                             t.map(|i| vcol[i as usize])
                         } else {
                             let ctr =
@@ -1544,7 +1563,7 @@ impl Viewport {
     /// Triangle in view space (clipped at the near plane) with per-corner colours and UVs.
     fn push_tri_tex(&mut self, v: [Vec3; 3], c: [[f32; 4]; 3], uv: [[f32; 2]; 3], tex: u32, id: u32, blend: bool) {
         let ortho = self.cam.ortho;
-        let near = if ortho { -1e9 } else { -0.05 };
+        let near = if ortho { 1e9 } else { -0.05 };
         let inside = |p: &Vec3| p.z <= near;
         let proj = self.proj;
         let emit = |this: &mut Self, pts: [Vec3; 3], cols: [[f32; 4]; 3], uvs: [[f32; 2]; 3]| {
@@ -1660,14 +1679,8 @@ impl Viewport {
             .or_else(|| ed.scene.objects.iter().find(is_cam))
     }
 
-    /// Final render (F12): through the scene camera (or the current view when there is none),
-    /// Material Preview shading with the scene lights, no overlays, 2x2 supersampled.
-    pub fn render_image(&mut self, ed: &Editor, width: usize, height: usize, transparent: bool) -> RenderResult {
-        let t0 = Instant::now();
-        let (width, height) = (width.clamp(16, 8192), height.clamp(16, 8192));
-        let ss = if width * height <= 4_200_000 { 2 } else { 1 };
-        let (rw, rh) = (width * ss, height * ss);
-        let aspect = width as f32 / height as f32;
+    /// The camera an F12 render uses: through the scene camera, else the current view.
+    pub fn render_view(&self, ed: &Editor, aspect: f32) -> (Camera, Option<String>) {
         let cam_obj = Self::render_camera(ed);
         let cam = match cam_obj {
             Some(o) => {
@@ -1691,6 +1704,18 @@ impl Viewport {
             }
             None => self.cam,
         };
+        (cam, cam_obj.map(|o| o.name.clone()))
+    }
+
+    /// Final render (F12): through the scene camera (or the current view when there is none),
+    /// Material Preview shading with the scene lights, no overlays, 2x2 supersampled.
+    pub fn render_image(&mut self, ed: &Editor, width: usize, height: usize, transparent: bool) -> RenderResult {
+        let t0 = Instant::now();
+        let (width, height) = (width.clamp(16, 8192), height.clamp(16, 8192));
+        let ss = if width * height <= 4_200_000 { 2 } else { 1 };
+        let (rw, rh) = (width * ss, height * ss);
+        let aspect = width as f32 / height as f32;
+        let (cam, cam_name) = self.render_view(ed, aspect);
         let mut r = Viewport {
             render_mode: true,
             overlays: Overlays { grid: false, wire_overlay: false, stats: false, xray: false },
@@ -1753,7 +1778,7 @@ impl Viewport {
             width,
             height,
             rgba,
-            camera: cam_obj.map(|o| o.name.clone()),
+            camera: cam_name,
             ms: t0.elapsed().as_secs_f32() * 1000.0,
         }
     }
@@ -2274,24 +2299,51 @@ impl Viewport {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let editing = ed.editing();
+                    let sculpting = ed.sculpt.is_some();
                     let label = if editing {
                         "✎ Edit Mode"
+                    } else if sculpting {
+                        "🖌 Sculpt Mode"
                     } else {
                         "▣ Object Mode"
                     };
-                    let b =
-                        egui::Button::new(egui::RichText::new(label).size(12.5)).fill(if editing {
-                            Color32::from_rgb(120, 70, 20)
-                        } else {
-                            Color32::TRANSPARENT
+                    let mut pick = None;
+                    egui::ComboBox::from_id_salt("mode")
+                        .selected_text(egui::RichText::new(label).size(12.5).color(if editing { Color32::from_rgb(255, 170, 90) } else if sculpting { Color32::from_rgb(140, 200, 255) } else { theme::TEXT }))
+                        .width(118.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(!editing && !sculpting, "▣ Object Mode").clicked() {
+                                pick = Some(0);
+                            }
+                            if ui.selectable_label(editing, "✎ Edit Mode   Tab").clicked() {
+                                pick = Some(1);
+                            }
+                            if ui.selectable_label(sculpting, "🖌 Sculpt Mode   Ctrl+Tab").clicked() {
+                                pick = Some(2);
+                            }
                         });
-                    if ui
-                        .add(b)
-                        .on_hover_text("Toggle Object / Edit mode (Tab)")
-                        .clicked()
-                    {
-                        let r = ed.toggle_edit();
-                        self.report(r);
+                    match pick {
+                        Some(0) => ed.exit_edit(),
+                        Some(1) if !editing => {
+                            ed.sculpt = None;
+                            let r = ed.toggle_edit();
+                            self.report(r);
+                        }
+                        Some(2) if !sculpting => {
+                            let r = ed.active.or(ed.selection.last().copied()).ok_or_else(|| "select a mesh object first".to_string()).and_then(|id| {
+                                ed.snapshot();
+                                ed.enter_sculpt(id)
+                            });
+                            if let Ok(m) = &r {
+                                self.flash = Some((m.clone(), Instant::now()));
+                            }
+                            self.report(r);
+                        }
+                        _ => {}
+                    }
+                    if sculpting {
+                        ui.separator();
+                        self.sculpt_header(ui);
                     }
                     if let Some(st) = ed.edit.as_mut() {
                         ui.separator();
@@ -2849,6 +2901,13 @@ impl Viewport {
             }
         }
 
+        // ---------- sculpt mode: LMB strokes, brush keys ----------
+        if ed.sculpt.is_some() {
+            self.gizmo_hover = None;
+            self.sculpt_input(&ctx, resp, ed, mouse, shift, ctrl);
+            return;
+        }
+
         // ---------- gizmo ----------
         self.gizmo_hover = if resp.hovered() {
             self.gizmo_hit(ed, mouse)
@@ -3111,6 +3170,26 @@ mod tests {
         assert_eq!(v.pick(pos2(5.0, 5.0)), None);
         let (o, d) = v.ray(pos2(400.0, 300.0));
         assert!((d - v.cam.forward()).length() < 1e-3, "{o} {d}");
+    }
+
+    #[test]
+    fn ortho_view_renders() {
+        let mut v = Viewport {
+            rect: Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)),
+            ..Default::default()
+        };
+        v.cam.preset(ViewPreset::Front);
+        v.cam.ortho = true;
+        v.vp = v.cam.proj(800.0 / 600.0) * v.cam.view();
+        let ed = Editor::default();
+        v.raster.resize(800, 600);
+        v.proj = v.cam.proj(800.0 / 600.0);
+        v.build_scene(&ed);
+        let tris: Vec<&RPrim> = v.prims.iter().filter(|p| p.n == 3).collect();
+        let zs: Vec<f32> = tris.iter().flat_map(|p| p.p[..3].iter().map(|q| q[2])).collect();
+        let prims = v.prims.clone();
+        v.raster.render([0.2; 3], [0.2; 3], &prims, None);
+        assert_eq!(v.pick(pos2(400.0, 300.0)), ed.scene.objects.first().map(|o| o.id));
     }
 
     #[test]

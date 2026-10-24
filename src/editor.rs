@@ -57,6 +57,10 @@ pub struct Editor {
     pub edit: Option<EditState>,
     /// Set by the `render` command; the app renders an image (F12) and clears it.
     pub render_request: bool,
+    /// Sculpt mode on this mesh object.
+    pub sculpt: Option<u64>,
+    /// Last known world matrix per object, used to make children follow their parents.
+    parent_cache: std::collections::HashMap<u64, glam::Mat4>,
     /// True while a command batch runs (the batch owns the undo step).
     in_batch: bool,
 }
@@ -80,6 +84,8 @@ impl Default for Editor {
             auto_key: false,
             edit: None,
             render_request: false,
+            parent_cache: Default::default(),
+            sculpt: None,
             in_batch: false,
         }
     }
@@ -95,6 +101,43 @@ impl Editor {
         self.redo_stack.clear();
         self.dirty = true;
     }
+    /// Make children follow parents that moved since the last call. Children that were moved
+    /// themselves in the same step (e.g. grabbed together with the parent) are left alone.
+    pub fn propagate_parents(&mut self) {
+        let order = self.scene.hierarchy_order();
+        let mut changed: std::collections::HashMap<u64, (glam::Mat4, glam::Mat4)> = Default::default();
+        for id in order {
+            let parent = self.scene.get(id).and_then(|o| o.parent);
+            if let Some(p) = parent {
+                if self.scene.get(p).is_none() || self.scene.would_cycle(id, p) {
+                    self.scene.get_mut(id).unwrap().parent = None;
+                }
+            }
+            let Some(o) = self.scene.get(id) else { continue };
+            let mut cur = o.transform.matrix();
+            let old = self.parent_cache.get(&id).copied();
+            if let (Some(p), Some(old_m)) = (o.parent, old) {
+                if old_m == cur {
+                    if let Some((po, pn)) = changed.get(&p) {
+                        let new = *pn * po.inverse() * cur;
+                        let o = self.scene.get_mut(id).unwrap();
+                        o.transform = crate::scene::Transform::from_matrix(new);
+                        cur = o.transform.matrix();
+                    }
+                }
+            }
+            if old != Some(cur) {
+                changed.insert(id, (old.unwrap_or(cur), cur));
+            }
+        }
+        self.reset_parent_cache();
+    }
+
+    /// Forget previous positions (after undo, opening a file …) so nothing jumps.
+    pub fn reset_parent_cache(&mut self) {
+        self.parent_cache = self.scene.objects.iter().map(|o| (o.id, o.transform.matrix())).collect();
+    }
+
     pub fn undo(&mut self) -> bool {
         if let Some((s, sel)) = self.undo_stack.pop() {
             self.redo_stack.push((
@@ -102,6 +145,7 @@ impl Editor {
                 std::mem::replace(&mut self.selection, sel),
             ));
             self.fix_active();
+            self.reset_parent_cache();
             true
         } else {
             false
@@ -114,6 +158,7 @@ impl Editor {
                 std::mem::replace(&mut self.selection, sel),
             ));
             self.fix_active();
+            self.reset_parent_cache();
             true
         } else {
             false
@@ -121,6 +166,11 @@ impl Editor {
     }
     /// Leave edit mode if the edited object no longer exists (deleted, undone, …).
     pub fn validate_edit(&mut self) {
+        if let Some(id) = self.sculpt {
+            if !self.scene.get(id).is_some_and(|o| o.is_mesh() && o.mesh.is_some()) {
+                self.sculpt = None;
+            }
+        }
         if let Some(st) = &self.edit {
             if !self
                 .scene
@@ -369,7 +419,9 @@ impl Editor {
     fn execute_batch(&mut self, cmds: &[Command]) -> Vec<String> {
         let mut log = vec![];
         for c in cmds {
-            match self.exec_one(c) {
+            let r = self.exec_one(c);
+            self.propagate_parents();
+            match r {
                 Ok(msg) => log.push(format!("✔ {msg}")),
                 Err(e) => log.push(format!("✖ {}: {e}", c.action)),
             }
@@ -431,8 +483,22 @@ impl Editor {
                     let m = make_modifier(m, c.number, vec3(&c.vector))?;
                     self.scene.get_mut(id).unwrap().modifiers.push(m);
                 }
+                let mut extra = String::new();
+                if let Some(pn) = c.parent.as_deref().filter(|p| !p.is_empty()) {
+                    match self.scene.find_by_name(pn) {
+                        Some(p) if p != id => {
+                            self.scene.get_mut(id).unwrap().parent = Some(p);
+                            extra += &format!(" (child of \"{}\")", self.scene.get(p).unwrap().name);
+                        }
+                        _ => extra += &format!(" (no parent \"{pn}\" found)"),
+                    }
+                }
+                if let Some(cn) = c.collection.as_deref() {
+                    let cid = self.scene.collection_by_name(cn);
+                    self.scene.get_mut(id).unwrap().collection = cid;
+                }
                 self.select_only(id);
-                Ok(format!("Added {kind_label} \"{name}\""))
+                Ok(format!("Added {kind_label} \"{name}\"{extra}"))
             }
             "delete" | "remove" => {
                 let ids = targets();
@@ -606,6 +672,83 @@ impl Editor {
                 self.view_requests.push(ViewRequest::FrameSelected);
                 Ok(format!("Imported {}", st.summary()))
             }
+            "parent" | "set_parent" => {
+                let pname = c.parent.clone().or(c.name.clone()).ok_or("parent needs parent = the parent object's name")?;
+                let p = self.scene.find_by_name(&pname).ok_or(format!("no object named {pname:?}"))?;
+                let ids: Vec<u64> = if c.target.is_some() { targets() } else { self.selection.iter().copied().filter(|i| *i != p).collect() };
+                let mut done = vec![];
+                for id in ids {
+                    if id == p || self.scene.would_cycle(id, p) {
+                        continue;
+                    }
+                    self.scene.get_mut(id).unwrap().parent = Some(p);
+                    done.push(id);
+                }
+                if done.is_empty() {
+                    return Err("nothing to parent (an object can't be its own ancestor)".into());
+                }
+                Ok(format!("Parented {} to \"{}\"", self.names(&done), self.scene.get(p).unwrap().name))
+            }
+            "clear_parent" | "unparent" => {
+                let ids = targets();
+                for id in &ids {
+                    if let Some(o) = self.scene.get_mut(*id) {
+                        o.parent = None;
+                    }
+                }
+                Ok(format!("Cleared parent of {}", self.names(&ids)))
+            }
+            "move_to_collection" | "collection" => {
+                let ids = targets();
+                if ids.is_empty() {
+                    return Err("nothing selected".into());
+                }
+                // children go along with their parents
+                let mut ids = ids;
+                let mut k = 0;
+                while k < ids.len() {
+                    let p = ids[k];
+                    for o in &self.scene.objects {
+                        if o.parent == Some(p) && !ids.contains(&o.id) {
+                            ids.push(o.id);
+                        }
+                    }
+                    k += 1;
+                }
+                let cname = c.collection.clone().or(c.name.clone()).unwrap_or_default();
+                let cid = self.scene.collection_by_name(&cname);
+                let vis = self.scene.collections.iter().find(|x| x.id == cid).map(|x| x.visible).unwrap_or(true);
+                for id in &ids {
+                    if let Some(o) = self.scene.get_mut(*id) {
+                        o.collection = cid;
+                        if !vis {
+                            o.visible = false;
+                        }
+                    }
+                }
+                let cn = self.scene.collections.iter().find(|x| x.id == cid).map(|x| x.name.clone()).unwrap_or("Scene Collection".into());
+                Ok(format!("Moved {} to collection \"{cn}\"", self.names(&ids)))
+            }
+            "delete_collection" => {
+                let cname = c.collection.clone().or(c.name.clone()).ok_or("which collection?")?;
+                let cid = self.scene.collections.iter().find(|x| x.name.eq_ignore_ascii_case(cname.trim())).map(|x| x.id).ok_or(format!("no collection {cname:?}"))?;
+                self.scene.collections.retain(|x| x.id != cid);
+                for o in self.scene.objects.iter_mut().filter(|o| o.collection == cid) {
+                    o.collection = 0;
+                }
+                Ok(format!("Deleted collection \"{cname}\" (objects moved to the Scene Collection)"))
+            }
+            "hide_collection" | "show_collection" => {
+                let cname = c.collection.clone().or(c.name.clone()).ok_or("which collection?")?;
+                let show = action == "show_collection";
+                let col = self.scene.collections.iter_mut().find(|x| x.name.eq_ignore_ascii_case(cname.trim())).ok_or(format!("no collection {cname:?}"))?;
+                col.visible = show;
+                let cid = col.id;
+                for o in self.scene.objects.iter_mut().filter(|o| o.collection == cid) {
+                    o.visible = show;
+                }
+                Ok(format!("{} collection \"{cname}\"", if show { "Showed" } else { "Hid" }))
+            }
             "set_texture" | "texture" => {
                 let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
                 if ids.is_empty() {
@@ -648,6 +791,14 @@ impl Editor {
                 Ok(format!("Applied {label} to {}", self.names(&ids)))
             }
             "render" | "render_image" => {
+                match c.name.as_deref().map(|n| n.to_lowercase()) {
+                    Some(n) if n.contains("path") || n.contains("cycles") || n.contains("quality") => self.scene.output.engine = crate::scene::Engine::PathTraced,
+                    Some(n) if n.contains("fast") || n.contains("preview") => self.scene.output.engine = crate::scene::Engine::Fast,
+                    _ => {}
+                }
+                if let Some(s) = c.number.filter(|s| *s >= 1.0) {
+                    self.scene.output.samples = s as u32;
+                }
                 self.render_request = true;
                 Ok("Rendering an image (F12)".into())
             }
@@ -709,6 +860,15 @@ impl Editor {
                 )?;
                 for id in &ids {
                     if let Some(o) = self.scene.get_mut(*id) {
+                        if let Modifier::Subsurf { levels } = m {
+                            // one Subdivision Surface per object, shaded smooth like Blender's Ctrl+N
+                            o.modifiers.retain(|x| !matches!(x, Modifier::Subsurf { .. }));
+                            if levels > 0 {
+                                o.modifiers.push(m.clone());
+                            }
+                            o.smooth_override = Some(true);
+                            continue;
+                        }
                         o.modifiers.push(m.clone());
                     }
                 }
@@ -847,6 +1007,34 @@ impl Editor {
                 };
                 Ok(format!("Shading: {:?}", self.shading))
             }
+            "subsurf" | "subdivision_surface" | "subdivision" => {
+                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                if ids.is_empty() {
+                    return Err("no mesh object selected".into());
+                }
+                let levels = c.number.unwrap_or(2.0).clamp(0.0, 4.0) as u32;
+                for id in &ids {
+                    if let Some(o) = self.scene.get_mut(*id) {
+                        o.modifiers.retain(|x| !matches!(x, Modifier::Subsurf { .. }));
+                        if levels > 0 {
+                            o.modifiers.push(Modifier::Subsurf { levels });
+                            o.smooth_override = Some(true);
+                        }
+                    }
+                }
+                Ok(if levels == 0 { format!("Removed subdivision from {}", self.names(&ids)) } else { format!("Subdivision level {levels} on {}", self.names(&ids)) })
+            }
+            "auto_smooth" | "shade_auto_smooth" => {
+                let ids = targets();
+                let ang = c.number.unwrap_or(30.0).clamp(1.0, 179.0) as f32;
+                for id in &ids {
+                    if let Some(o) = self.scene.get_mut(*id) {
+                        o.smooth_override = Some(true);
+                        o.auto_smooth = ang;
+                    }
+                }
+                Ok(format!("Shade auto smooth ({ang:.0}°) on {}", self.names(&ids)))
+            }
             "smooth" | "shade_smooth" | "flat" | "shade_flat" => {
                 let ids = targets();
                 let smooth = action.contains("smooth");
@@ -972,6 +1160,7 @@ impl Editor {
             .map(|m| m.verts.len())
             .unwrap_or(0);
         self.select_only(id);
+        self.sculpt = None;
         self.edit = Some(EditState {
             obj: id,
             mode: SelectMode::Vertex,
@@ -982,9 +1171,34 @@ impl Editor {
 
     pub fn exit_edit(&mut self) {
         self.edit = None;
+        self.sculpt = None;
+    }
+
+    /// Enter sculpt mode on a mesh object (converting it to an editable mesh and adding detail
+    /// if it is too coarse to sculpt).
+    pub fn enter_sculpt(&mut self, id: u64) -> Result<String, String> {
+        let o = self.scene.get(id).ok_or("no such object")?;
+        if !o.is_mesh() {
+            return Err("only mesh objects can be sculpted".into());
+        }
+        self.edit = None;
+        let name = o.name.clone();
+        let mut pm = o.poly();
+        let before = pm.verts.len();
+        let densified = crate::sculpt::densify(&mut pm, 4000, o.smooth());
+        let o = self.scene.get_mut(id).unwrap();
+        o.mesh = Some(pm);
+        let after = o.mesh.as_ref().map(|m| m.verts.len()).unwrap_or(0);
+        self.select_only(id);
+        self.sculpt = Some(id);
+        Ok(if densified { format!("Sculpt mode: \"{name}\" (subdivided {before} → {after} vertices for detail)") } else { format!("Sculpt mode: \"{name}\"") })
     }
 
     pub fn toggle_edit(&mut self) -> Result<String, String> {
+        if self.sculpt.is_some() {
+            self.sculpt = None;
+            return Ok("Object mode".into());
+        }
         if self.edit.is_some() {
             self.exit_edit();
             return Ok("Object mode".into());
@@ -1138,6 +1352,17 @@ impl Editor {
                 self.exit_edit();
                 Ok("Object mode".into())
             }
+            "sculpt_mode" | "sculpt" => {
+                match self.resolve_target(c.target.as_deref()).into_iter().find(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())) {
+                    None => Err("no mesh object to sculpt".into()),
+                    Some(id) => {
+                        if !self.in_batch {
+                            self.snapshot();
+                        }
+                        self.enter_sculpt(id)
+                    }
+                }
+            }
             "select_faces" | "select_by_normal" => ensure(self).and_then(|_| {
                 let dir = vec3(&c.vector).unwrap_or(Vec3::Z);
                 self.edit_op(EditOp::SelectNormal(
@@ -1177,6 +1402,13 @@ impl Editor {
                             match em::bevel(&mut pm, &mut sel, w / s, segs) {
                                 Ok(_) => {
                                     o.mesh = Some(pm);
+                                    if segs > 1 {
+                                        // rounded bevels look right with auto smooth
+                                        o.smooth_override = Some(true);
+                                        if o.auto_smooth == 0.0 {
+                                            o.auto_smooth = 30.0;
+                                        }
+                                    }
                                     done.push(*id);
                                 }
                                 Err(e) => err = Some(e),
@@ -1319,13 +1551,17 @@ fn make_modifier(
                 .filter(|r| *r > 0.0)
                 .unwrap_or(3.0),
         }
+    } else if k.contains("subsurf") || k.contains("subdiv") || k.contains("smooth") || k == "subd" {
+        Modifier::Subsurf {
+            levels: number.unwrap_or(2.0).clamp(0.0, 4.0) as u32,
+        }
     } else if k.contains("array") || k.contains("repeat") || k.contains("row") {
         Modifier::Array {
             count: number.unwrap_or(3.0).clamp(1.0, 200.0) as u32,
             offset: vector.unwrap_or(Vec3::new(2.2, 0.0, 0.0)),
         }
     } else {
-        return Err(format!("unknown modifier '{kind}' (array, mirror, radial)"));
+        return Err(format!("unknown modifier '{kind}' (array, mirror, radial, subsurf)"));
     })
 }
 
@@ -1382,6 +1618,12 @@ pub struct Command {
     pub alpha: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modifier: Option<String>,
+    /// Parent object name (for add / parent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Collection name (for add / move_to_collection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
     /// Light power (W) or sun strength.
@@ -1661,5 +1903,45 @@ mod tests {
         e.execute(&[cmd(r#"{"action":"duplicate","number":3,"vector":[0,3,0]}"#)]);
         assert_eq!(e.scene.objects.len(), 6);
         assert_eq!(e.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn parenting_follows_and_undoes() {
+        let mut e = Editor::default();
+        e.execute(&[
+            cmd(r#"{"action":"add","primitive":"cube","name":"Car","location":[0,0,0]}"#),
+            cmd(r#"{"action":"add","primitive":"cylinder","name":"Wheel","location":[1,0,0],"parent":"Car"}"#),
+        ]);
+        let car = e.scene.find_by_name("Car").unwrap();
+        let wheel = e.scene.find_by_name("Wheel").unwrap();
+        assert_eq!(e.scene.get(wheel).unwrap().parent, Some(car));
+        e.execute(&[cmd(r#"{"action":"move","target":"Car","vector":[0,5,0]}"#)]);
+        let w = e.scene.get(wheel).unwrap().transform.location;
+        assert!((w - Vec3::new(1.0, 5.0, 0.0)).length() < 1e-5, "{w}");
+        e.execute(&[cmd(r#"{"action":"rotate","target":"Car","vector":[0,0,90]}"#)]);
+        let w = e.scene.get(wheel).unwrap().transform.location;
+        assert!((w - Vec3::new(0.0, 6.0, 0.0)).length() < 1e-4, "{w}");
+        // moving both together does not double-move the child
+        e.selection = vec![car, wheel];
+        e.execute(&[cmd(r#"{"action":"move","vector":[0,0,1]}"#)]);
+        let w = e.scene.get(wheel).unwrap().transform.location;
+        assert!((w - Vec3::new(0.0, 6.0, 1.0)).length() < 1e-4, "{w}");
+        // undo restores without the child jumping
+        e.undo();
+        e.propagate_parents();
+        let w = e.scene.get(wheel).unwrap().transform.location;
+        assert!((w - Vec3::new(0.0, 6.0, 0.0)).length() < 1e-4, "{w}");
+        // no cycles; clear parent keeps the world position
+        assert!(e.execute(&[cmd(r#"{"action":"parent","target":"Car","parent":"Wheel"}"#)])[0].starts_with('✖'));
+        e.execute(&[cmd(r#"{"action":"clear_parent","target":"Wheel"}"#)]);
+        assert_eq!(e.scene.get(wheel).unwrap().parent, None);
+        // collections
+        e.execute(&[cmd(r#"{"action":"move_to_collection","target":"Wheel","collection":"Parts"}"#)]);
+        assert_eq!(e.scene.collections.len(), 1);
+        e.execute(&[cmd(r#"{"action":"hide_collection","collection":"parts"}"#)]);
+        assert!(!e.scene.get(wheel).unwrap().visible);
+        // deleting the parent leaves no dangling link
+        e.execute(&[cmd(r#"{"action":"parent","target":"Wheel","parent":"Car"}"#), cmd(r#"{"action":"delete","target":"Car"}"#)]);
+        assert_eq!(e.scene.get(wheel).unwrap().parent, None);
     }
 }

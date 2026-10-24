@@ -24,6 +24,13 @@ impl Default for Transform {
 }
 
 impl Transform {
+    /// Decompose a matrix (shear is lost).
+    pub fn from_matrix(m: Mat4) -> Transform {
+        let (s, r, t) = m.to_scale_rotation_translation();
+        let mut tr = Transform { location: t, rotation: Vec3::ZERO, scale: s };
+        tr.set_quat(r);
+        tr
+    }
     pub fn quat(&self) -> Quat {
         let r = self.rotation * (std::f32::consts::PI / 180.0);
         Quat::from_euler(EulerRot::ZYX, r.z, r.y, r.x)
@@ -83,6 +90,8 @@ pub enum Modifier {
     Array { count: u32, offset: Vec3 },
     Mirror { x: bool, y: bool, z: bool },
     Radial { count: u32, radius: f32 },
+    /// Catmull–Clark subdivision surface.
+    Subsurf { levels: u32 },
 }
 
 impl Modifier {
@@ -91,6 +100,7 @@ impl Modifier {
             Modifier::Array { .. } => "Array",
             Modifier::Mirror { .. } => "Mirror",
             Modifier::Radial { .. } => "Radial Array",
+            Modifier::Subsurf { .. } => "Subdivision Surface",
         }
     }
 }
@@ -180,6 +190,24 @@ pub struct Object {
     pub visible: bool,
     #[serde(default)]
     pub smooth_override: Option<bool>,
+    /// Shade Auto Smooth angle in degrees (0 = off).
+    #[serde(default)]
+    pub auto_smooth: f32,
+    /// Parent object: this object follows the parent's movements (transforms stay in world space).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u64>,
+    /// Collection id (0 = the Scene Collection itself).
+    #[serde(default)]
+    pub collection: u32,
+}
+
+/// A named group of objects (like Blender's collections), shown as a folder in the outliner.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Collection {
+    pub id: u32,
+    pub name: String,
+    #[serde(default = "yes")]
+    pub visible: bool,
 }
 
 fn default_detail() -> u32 {
@@ -221,6 +249,10 @@ impl Object {
         self.mesh
             .clone()
             .unwrap_or_else(|| self.primitive.poly(self.detail))
+    }
+    /// Total Catmull–Clark levels from Subdivision Surface modifiers.
+    pub fn subsurf_levels(&self) -> u32 {
+        self.modifiers.iter().map(|m| if let Modifier::Subsurf { levels } = m { *levels } else { 0 }).sum::<u32>().min(6)
     }
     pub fn smooth(&self) -> bool {
         self.smooth_override
@@ -272,6 +304,7 @@ impl Object {
                     }
                     out = next;
                 }
+                Modifier::Subsurf { .. } => {}
             }
         }
         out.truncate(2000);
@@ -348,6 +381,8 @@ pub struct Scene {
     /// Image and procedural textures used by materials.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub textures: Vec<crate::textures::Texture>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<Collection>,
     next_id: u64,
 }
 
@@ -359,11 +394,25 @@ pub struct Output {
     pub height: u32,
     /// Transparent background (alpha) instead of the world colour.
     pub transparent: bool,
+    /// Render engine for F12.
+    pub engine: Engine,
+    /// Path tracer samples per pixel.
+    pub samples: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Engine {
+    /// Rasterized with ray-traced shadows and AO (fast).
+    #[default]
+    Fast,
+    /// Progressive path tracing: bounced light, glossy reflections, glass.
+    PathTraced,
 }
 
 impl Default for Output {
     fn default() -> Self {
-        Self { width: 1920, height: 1080, transparent: false }
+        Self { width: 1920, height: 1080, transparent: false, engine: Engine::Fast, samples: 64 }
     }
 }
 
@@ -378,6 +427,7 @@ impl Default for Scene {
             fps: 24,
             output: Output::default(),
             textures: vec![],
+            collections: vec![],
             next_id: 1,
         };
         s.add(Primitive::Cube, None);
@@ -395,6 +445,60 @@ impl Default for Scene {
 }
 
 impl Scene {
+    /// Find or create a collection by name (case-insensitive); returns its id.
+    pub fn collection_by_name(&mut self, name: &str) -> u32 {
+        let name = name.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("scene collection") || name.eq_ignore_ascii_case("scene") {
+            return 0;
+        }
+        if let Some(c) = self.collections.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+            return c.id;
+        }
+        let id = self.collections.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        self.collections.push(Collection { id, name: name.to_string(), visible: true });
+        id
+    }
+
+    /// Would making `child` a child of `parent` create a loop?
+    pub fn would_cycle(&self, child: u64, parent: u64) -> bool {
+        let mut p = Some(parent);
+        let mut guard = 0;
+        while let Some(id) = p {
+            if id == child {
+                return true;
+            }
+            guard += 1;
+            if guard > 10_000 {
+                return true;
+            }
+            p = self.get(id).and_then(|o| o.parent);
+        }
+        false
+    }
+
+    /// Objects ordered so that every parent comes before its children.
+    pub fn hierarchy_order(&self) -> Vec<u64> {
+        let mut out = Vec::with_capacity(self.objects.len());
+        let mut done: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        fn visit(s: &Scene, id: u64, out: &mut Vec<u64>, done: &mut std::collections::HashSet<u64>, depth: usize) {
+            if done.contains(&id) || depth > 256 {
+                return;
+            }
+            if let Some(p) = s.get(id).and_then(|o| o.parent) {
+                if s.get(p).is_some() {
+                    visit(s, p, out, done, depth + 1);
+                }
+            }
+            if done.insert(id) {
+                out.push(id);
+            }
+        }
+        for o in &self.objects {
+            visit(self, o.id, &mut out, &mut done, 0);
+        }
+        out
+    }
+
     /// Add (or reuse an identical) texture and return its id.
     pub fn add_texture(&mut self, name: &str, source: crate::textures::TexSource) -> u32 {
         if let Some(t) = self.textures.iter().find(|t| t.source == source) {
@@ -459,6 +563,9 @@ impl Scene {
             keyframes: vec![],
             visible: true,
             smooth_override: None,
+            auto_smooth: 0.0,
+            parent: None,
+            collection: 0,
         });
         id
     }
@@ -554,7 +661,19 @@ impl Scene {
                 c[0],
                 c[1],
                 c[2],
-                if o.visible { "" } else { " hidden" },
+                {
+                    let mut x = String::new();
+                    if !o.visible {
+                        x += " hidden";
+                    }
+                    if let Some(p) = o.parent.and_then(|p| self.get(p)) {
+                        x += &format!(" parent=\"{}\"", p.name);
+                    }
+                    if let Some(c) = self.collections.iter().find(|c| c.id == o.collection) {
+                        x += &format!(" collection=\"{}\"", c.name);
+                    }
+                    x
+                },
                 if o.keyframes.is_empty() {
                     String::new()
                 } else {
@@ -598,37 +717,47 @@ impl Scene {
 
 #[derive(Default)]
 pub struct MeshCache {
-    map: HashMap<(Primitive, u32), Mesh>,
-    custom: HashMap<u64, (crate::mesh::PolyMesh, bool, Mesh)>,
+    map: HashMap<(Primitive, u32, bool), Mesh>,
+    /// object id (and whether it's the cage) -> (source mesh, smooth, subsurf levels, auto smooth, result)
+    custom: HashMap<(u64, bool), (Option<crate::mesh::PolyMesh>, (Primitive, u32), bool, u32, u32, Mesh)>,
 }
 
 impl MeshCache {
-    pub fn get(&mut self, p: Primitive, detail: u32) -> &Mesh {
+    pub fn get(&mut self, p: Primitive, detail: u32, smooth: bool) -> &Mesh {
         self.map
-            .entry((p, detail))
-            .or_insert_with(|| p.build(detail))
+            .entry((p, detail, smooth))
+            .or_insert_with(|| p.poly(detail).to_mesh(smooth))
     }
 
-    /// Render mesh for an object (custom edited mesh or cached primitive).
+    /// Render mesh for an object (custom edited mesh or cached primitive), with its
+    /// Subdivision Surface modifiers and auto smooth applied.
     pub fn for_object(&mut self, o: &Object) -> Mesh {
+        self.build(o, false)
+    }
+
+    /// The editable cage (no subdivision), as drawn in edit mode.
+    pub fn for_object_cage(&mut self, o: &Object) -> Mesh {
+        self.build(o, true)
+    }
+
+    fn build(&mut self, o: &Object, cage: bool) -> Mesh {
         let smooth = o.smooth();
-        match &o.mesh {
-            None => {
-                let mut m = self.get(o.primitive, o.detail).clone();
-                m.smooth = smooth;
-                m
-            }
-            Some(pm) => {
-                if let Some((cached, s, m)) = self.custom.get(&o.id) {
-                    if cached == pm && *s == smooth {
-                        return m.clone();
-                    }
-                }
-                let m = pm.to_mesh(smooth);
-                self.custom.insert(o.id, (pm.clone(), smooth, m.clone()));
-                m
+        let levels = if cage { 0 } else { o.subsurf_levels() };
+        let auto = (o.auto_smooth * 100.0).round() as u32;
+        if o.mesh.is_none() && levels == 0 && auto == 0 {
+            return self.get(o.primitive, o.detail, smooth).clone();
+        }
+        let prim = (o.primitive, o.detail);
+        if let Some((src, p, s, l, a, m)) = self.custom.get(&(o.id, cage)) {
+            if *src == o.mesh && *p == prim && *s == smooth && *l == levels && *a == auto {
+                return m.clone();
             }
         }
+        let base = o.poly();
+        let pm = if levels > 0 { crate::editmesh::subdivide_surface(&base, levels) } else { base };
+        let m = pm.to_mesh_opts(smooth, o.auto_smooth);
+        self.custom.insert((o.id, cage), (o.mesh.clone(), prim, smooth, levels, auto, m.clone()));
+        m
     }
 }
 

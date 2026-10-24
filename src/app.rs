@@ -46,6 +46,8 @@ pub struct Settings {
     /// Listen in the background for the wake phrase.
     pub wake_word: bool,
     pub wake_phrase: String,
+    /// Vision model for pictures ("" = pick automatically).
+    pub vision_model: String,
 }
 
 impl Default for Settings {
@@ -81,6 +83,7 @@ impl Default for Settings {
             conversation: true,
             wake_word: false,
             wake_phrase: "blender".into(),
+            vision_model: String::new(),
         }
     }
 }
@@ -215,6 +218,19 @@ pub struct App {
     rename: Option<(u64, String)>,
     last_ollama_check: Instant,
     last_title: String,
+    /// Picture attached to the next Copilot request: (name, base64 PNG, thumbnail).
+    pending_image: Option<(String, String, egui::TextureHandle)>,
+    /// Request text waiting for the vision model's description.
+    vision_request: Option<String>,
+    assistant_rect: egui::Rect,
+    ctx_handle: egui::Context,
+    /// Autosave every couple of minutes; offer recovery after a crash.
+    last_autosave: Instant,
+    recovery: Option<std::path::PathBuf>,
+    outliner_collapsed: std::collections::HashSet<u64>,
+    outliner_collapsed_cols: std::collections::HashSet<u32>,
+    /// "Move to collection" popup (M)
+    collection_menu: bool,
     /// Running MCP server (None = disabled or failed to start).
     mcp: Option<crate::mcp::McpServer>,
     mcp_status: String,
@@ -247,6 +263,9 @@ struct RenderView {
     result: crate::viewport::RenderResult,
     tex: egui::TextureHandle,
     saved: Option<std::path::PathBuf>,
+    /// Running path trace that keeps refining `result`.
+    job: Option<crate::pathtrace::PtJob>,
+    progress: Option<(u32, u32, f32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -329,6 +348,22 @@ impl App {
             rename: None,
             last_ollama_check: Instant::now(),
             last_title: String::new(),
+            pending_image: None,
+            vision_request: None,
+            assistant_rect: egui::Rect::NOTHING,
+            ctx_handle: cc.egui_ctx.clone(),
+            last_autosave: Instant::now(),
+            recovery: {
+                // a lock file left behind means the last session didn't exit cleanly
+                let (lock, auto) = (autosave_dir().join("session.lock"), autosave_dir().join("autosave.rblend"));
+                let crashed = lock.exists() && auto.exists();
+                let _ = std::fs::create_dir_all(autosave_dir());
+                let _ = std::fs::write(&lock, std::process::id().to_string());
+                crashed.then_some(auto)
+            },
+            outliner_collapsed: Default::default(),
+            outliner_collapsed_cols: Default::default(),
+            collection_menu: false,
             mcp,
             mcp_status,
             mcp_calls: 0,
@@ -488,6 +523,7 @@ impl App {
                         self.chat.push(ChatEntry::new(Role::System, format!("⚠ {pct}% of {model} is running on your CPU because it doesn't fully fit in GPU memory, so replies will be slow. {tip}")));
                     }
                 }
+                AiEvent::Described { model, text, secs } => self.on_described(model, text, secs),
                 AiEvent::PullProgress(s, f) => self.pull = Some((s, f)),
                 AiEvent::PullDone(r) => {
                     self.pull = None;
@@ -689,6 +725,10 @@ impl App {
     }
 
     fn submit_prompt(&mut self, text: String, from_voice: bool, stt_secs: f32) {
+        if let Some(img) = self.pending_image.take() {
+            self.submit_with_image(text.trim().to_string(), img, from_voice);
+            return;
+        }
         let text = text.trim().to_string();
         self.last_prompt = text.clone();
         if text.is_empty() {
@@ -812,6 +852,80 @@ impl App {
             self.pending_voice = false;
         } else {
             self.start_recording();
+        }
+    }
+
+    /// Attach a picture (PNG/JPEG bytes) to the next Copilot request.
+    fn attach_image(&mut self, ctx: &egui::Context, name: &str, bytes: &[u8]) {
+        match ai::prepare_image(bytes) {
+            Ok(b64) => {
+                use base64::Engine;
+                let png = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap_or_default();
+                let thumb = image::load_from_memory(&png).map(|i| i.thumbnail(96, 96).to_rgba8());
+                let tex = match thumb {
+                    Ok(t) => ctx.load_texture("attach", egui::ColorImage::from_rgba_unmultiplied([t.width() as usize, t.height() as usize], t.as_raw()), egui::TextureOptions::LINEAR),
+                    Err(_) => ctx.load_texture("attach", egui::ColorImage::new([1, 1], vec![Color32::GRAY]), egui::TextureOptions::LINEAR),
+                };
+                self.pending_image = Some((name.to_string(), b64, tex));
+                self.settings.show_assistant = true;
+                self.focus_prompt = true;
+                self.toast("Picture attached — describe what to build (or just press Enter to recreate it)", theme::OK);
+            }
+            Err(e) => self.toast(e, theme::ERR),
+        }
+    }
+
+    fn vision_model(&self) -> Option<String> {
+        if !self.settings.vision_model.is_empty() && self.models.contains(&self.settings.vision_model) {
+            return Some(self.settings.vision_model.clone());
+        }
+        ai::pick_vision_model(&self.models)
+    }
+
+    /// Picture → vision model description → builder model.
+    fn submit_with_image(&mut self, text: String, img: (String, String, egui::TextureHandle), from_voice: bool) {
+        let (name, b64, _) = img;
+        let request = if text.is_empty() { "Recreate this picture as a 3D scene".to_string() } else { text };
+        let mut u = ChatEntry::new(Role::User, format!("🖼 {name}\n{request}"));
+        u.voice = from_voice;
+        self.chat.push(u);
+        self.last_prompt = request.clone();
+        if self.ollama != OllamaStatus::Online {
+            self.chat.push(ChatEntry::new(Role::System, "Ollama isn't running, so pictures can't be read right now. Start Ollama and try again."));
+            return;
+        }
+        let Some(vm) = self.vision_model() else {
+            self.chat.push(ChatEntry::new(Role::System, format!("To build from pictures, install a vision model: `ollama pull {}` (Copilot ⚙ → Pull → {}). gemma3:4b and llama3.2-vision work too.", ai::RECOMMENDED_VISION, ai::RECOMMENDED_VISION)));
+            return;
+        };
+        self.vision_request = Some(request.clone());
+        self.route_stage = Some(format!("{} looking at the picture", short_model(&vm)));
+        self.waiting_ai = Some(Instant::now());
+        self.ai.send(AiRequest::Describe { model: vm, image_b64: b64, request });
+    }
+
+    fn on_described(&mut self, model: String, text: Result<String, String>, secs: f32) {
+        self.waiting_ai = None;
+        self.route_stage = None;
+        let Some(request) = self.vision_request.take() else { return };
+        match text {
+            Err(e) => self.chat.push(ChatEntry::new(Role::System, format!("⚠ Couldn't read the picture: {e}"))),
+            Ok(desc) => {
+                let shown: String = desc.chars().take(1500).collect();
+                let mut e = ChatEntry::new(Role::System, format!("🖼 {} sees ({secs:.1}s):\n{shown}", short_model(&model)));
+                e.via = Some(format!("👁 vision: {}", short_model(&model)));
+                self.chat.push(e);
+                if self.settings.model.is_empty() {
+                    self.chat.push(ChatEntry::new(Role::System, "No builder model installed — pull qwen3:8b to build the scene."));
+                    return;
+                }
+                let prompt = format!("{request}\n\nBuild it from this description of the user's picture (written by a vision model). Use several objects, keep everything on the ground (z >= 0) unless it floats in the picture, and match the colours:\n{desc}");
+                let scene = self.ed.scene.summary(&self.ed.selection);
+                self.route_stage = Some(format!("{} building", self.settings.model));
+                self.ai.send(AiRequest::Chat { model: self.settings.model.clone(), router: None, history: self.history.clone(), scene, prompt, voice: false });
+                self.history.push(ChatMsg { role: "user".into(), content: format!("{request} (from a picture: {})", desc.chars().take(400).collect::<String>()) });
+                self.waiting_ai = Some(Instant::now());
+            }
         }
     }
 
@@ -989,6 +1103,7 @@ impl App {
                 self.ed.snapshot();
                 self.ed.exit_edit();
                 self.ed.scene = s;
+                self.ed.reset_parent_cache();
                 self.ed.selection.clear();
                 self.ed.active = None;
                 self.ed.file_path = Some(p.to_path_buf());
@@ -1105,6 +1220,19 @@ impl App {
                 if self.waiting_ai.is_some() || self.review.is_some() {
                     return ToolResult::err("the Copilot is busy with another request; try again shortly");
                 }
+                if let Some(ip) = args["image_path"].as_str().filter(|p| !p.is_empty()) {
+                    match std::fs::read(ip) {
+                        Ok(b) => {
+                            let ctx = self.ctx_handle.clone();
+                            let name = std::path::Path::new(ip).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                            self.attach_image(&ctx, &name, &b);
+                            if self.pending_image.is_none() {
+                                return ToolResult::err(format!("could not read the picture {ip}"));
+                            }
+                        }
+                        Err(e) => return ToolResult::err(format!("can't read {ip}: {e}")),
+                    }
+                }
                 self.submit_prompt(p.to_string(), false, 0.0);
                 ToolResult::ok(format!("Sent to the Copilot ({}). The build streams into the app; call get_scene in a few seconds to see the result.", self.settings.model))
             }
@@ -1132,7 +1260,17 @@ impl App {
                 let w = args["width"].as_u64().map(|v| v as usize).unwrap_or(if args["path"].is_string() { out.width as usize } else { 960 });
                 let h = args["height"].as_u64().map(|v| v as usize).unwrap_or(w * out.height as usize / out.width.max(1) as usize);
                 let transparent = args["transparent"].as_bool().unwrap_or(out.transparent);
-                let r = self.vp.render_image(&self.ed, w, h, transparent);
+                let path_traced = matches!(args["engine"].as_str(), Some("path" | "path_traced" | "cycles"));
+                let r = if path_traced {
+                    let t0 = Instant::now();
+                    let samples = args["samples"].as_u64().unwrap_or(16).clamp(1, 256) as u32;
+                    let (cam, cam_name) = self.vp.render_view(&self.ed, w as f32 / h as f32);
+                    let sc = crate::pathtrace::PtScene::gather(&self.ed.scene, &mut self.vp.mesh_cache, &mut self.vp.tex_cache, cam);
+                    let rgba = crate::pathtrace::render_blocking(&sc, w, h, samples);
+                    crate::viewport::RenderResult { width: w, height: h, rgba, camera: cam_name, ms: t0.elapsed().as_secs_f32() * 1000.0 }
+                } else {
+                    self.vp.render_image(&self.ed, w, h, transparent)
+                };
                 let png = match crate::textures::encode_png(r.width, r.height, &r.rgba) {
                     Ok(b) => b,
                     Err(e) => return ToolResult::err(e),
@@ -1162,6 +1300,10 @@ impl App {
     // ------------------------------------------------------------------------------------------
     fn render_now(&mut self, ctx: &egui::Context) {
         let out = self.ed.scene.output;
+        if out.engine == crate::scene::Engine::PathTraced {
+            self.start_path_trace(ctx);
+            return;
+        }
         let res = self.vp.render_image(&self.ed, out.width as usize, out.height as usize, out.transparent);
         let img = egui::ColorImage::from_rgba_unmultiplied([res.width, res.height], &res.rgba);
         let tex = ctx.load_texture("f12-render", img, egui::TextureOptions::LINEAR);
@@ -1175,8 +1317,98 @@ impl App {
             ),
             theme::OK,
         );
-        self.render = Some(RenderView { result: res, tex, saved: None });
+        self.render = Some(RenderView { result: res, tex, saved: None, job: None, progress: None });
         self.show_render = true;
+    }
+
+    /// Write `autosave.rblend` every two minutes while there are unsaved changes, and show the
+    /// recovery prompt after a crash.
+    fn autosave_tick(&mut self, ctx: &egui::Context) {
+        if self.ed.dirty && self.last_autosave.elapsed().as_secs() >= 120 && self.vp.modal.is_none() {
+            self.last_autosave = Instant::now();
+            let scene = self.ed.scene.clone();
+            std::thread::spawn(move || {
+                if let Ok(js) = serde_json::to_string(&scene) {
+                    let p = autosave_dir().join("autosave.rblend");
+                    let tmp = p.with_extension("tmp");
+                    if std::fs::write(&tmp, js).is_ok() {
+                        let _ = std::fs::rename(&tmp, &p);
+                    }
+                }
+            });
+        }
+        let Some(p) = self.recovery.clone() else { return };
+        let when = std::fs::metadata(&p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| {
+            let m = d.as_secs() / 60;
+            if m < 60 { format!("{m} min ago") } else { format!("{} h ago", m / 60) }
+        });
+        let mut choice = None;
+        egui::Window::new("Recover unsaved work?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!("Rust Blender didn't close normally last time. An autosave{} is available.", when.map(|w| format!(" from {w}")).unwrap_or_default()));
+                ui.horizontal(|ui| {
+                    if ui.button("♻ Recover").clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Discard").clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+        match choice {
+            Some(true) => {
+                self.open_path(&p);
+                self.ed.file_path = None;
+                self.ed.dirty = true;
+                self.recovery = None;
+            }
+            Some(false) => {
+                let _ = std::fs::remove_file(&p);
+                self.recovery = None;
+            }
+            None => {}
+        }
+    }
+
+    fn start_path_trace(&mut self, ctx: &egui::Context) {
+        let out = self.ed.scene.output;
+        let (w, h) = ((out.width as usize).clamp(16, 8192), (out.height as usize).clamp(16, 8192));
+        let (cam, cam_name) = self.vp.render_view(&self.ed, w as f32 / h as f32);
+        let t0 = Instant::now();
+        let sc = crate::pathtrace::PtScene::gather(&self.ed.scene, &mut self.vp.mesh_cache, &mut self.vp.tex_cache, cam);
+        let c = ctx.clone();
+        let job = crate::pathtrace::start(sc, w, h, out.samples.clamp(1, 4096), move || c.request_repaint());
+        let blank = vec![0u8; w * h * 4];
+        let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &blank);
+        let tex = ctx.load_texture("f12-render", img, egui::TextureOptions::LINEAR);
+        let result = crate::viewport::RenderResult { width: w, height: h, rgba: blank, camera: cam_name, ms: t0.elapsed().as_secs_f32() * 1000.0 };
+        self.render = Some(RenderView { result, tex, saved: None, job: Some(job), progress: Some((0, out.samples, 0.0)) });
+        self.show_render = true;
+    }
+
+    /// Pull refined images from a running path trace.
+    fn poll_path_trace(&mut self) {
+        let Some(rv) = self.render.as_mut() else { return };
+        let Some(job) = &rv.job else { return };
+        let mut last = None;
+        while let Ok(u) = job.rx.try_recv() {
+            last = Some(u);
+        }
+        if let Some(u) = last {
+            let img = egui::ColorImage::from_rgba_unmultiplied([u.width, u.height], &u.rgba);
+            rv.tex.set(img, egui::TextureOptions::LINEAR);
+            rv.result.rgba = u.rgba;
+            rv.result.ms = u.secs * 1000.0;
+            rv.progress = Some((u.samples, u.total, u.secs));
+            if u.samples >= u.total {
+                rv.job = None;
+                let msg = format!("Path traced {}×{}, {} samples in {:.1} s", u.width, u.height, u.total, u.secs);
+                self.toast(msg, theme::OK);
+            }
+        }
     }
 
     fn save_render(&mut self) {
@@ -1230,10 +1462,40 @@ impl App {
                             rerender = true;
                         }
                     }
-                    if ui.checkbox(&mut out.transparent, "Transparent").changed() {
+                    if out.engine == crate::scene::Engine::Fast && ui.checkbox(&mut out.transparent, "Transparent").changed() {
                         rerender = true;
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Engine");
+                    let before = out.engine;
+                    ui.selectable_value(&mut out.engine, crate::scene::Engine::Fast, "⚡ Fast").on_hover_text("Rasterized with ray-traced shadows and ambient occlusion — about a second");
+                    ui.selectable_value(&mut out.engine, crate::scene::Engine::PathTraced, "✨ Path traced").on_hover_text("Bounced light, soft shadows, glossy reflections and glass; refines progressively");
+                    if before != out.engine {
+                        rerender = true;
+                    }
+                    if out.engine == crate::scene::Engine::PathTraced {
+                        ui.label("Samples");
+                        ui.add(egui::DragValue::new(&mut out.samples).range(1..=4096));
+                        let running = self.render.as_ref().is_some_and(|r| r.job.is_some());
+                        if running && ui.button("⏹ Stop").clicked() {
+                            if let Some(rv) = self.render.as_mut() {
+                                rv.job = None;
+                            }
+                        }
+                    }
+                });
+                if let Some((done, total, secs)) = self.render.as_ref().and_then(|r| r.progress) {
+                    let running = self.render.as_ref().is_some_and(|r| r.job.is_some());
+                    ui.horizontal(|ui| {
+                        ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_width(260.0).text(format!("{done} / {total} samples · {secs:.1} s")));
+                        if running {
+                            let eta = if done > 0 { secs / done as f32 * (total - done) as f32 } else { 0.0 };
+                            ui.label(RichText::new(format!("≈ {eta:.0} s left")).small().color(theme::TEXT_DIM));
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                        }
+                    });
+                }
                 if let Some(rv) = &self.render {
                     let r = &rv.result;
                     ui.label(
@@ -1339,6 +1601,7 @@ impl App {
     fn new_scene(&mut self) {
         self.ed.snapshot();
         self.ed.scene = Scene::default();
+        self.ed.reset_parent_cache();
         self.ed.selection = self.ed.scene.objects.iter().map(|o| o.id).collect();
         self.ed.active = self.ed.selection.first().copied();
         self.ed.file_path = None;
@@ -1366,6 +1629,21 @@ impl App {
         let over_vp = ctx
             .pointer_hover_pos()
             .is_some_and(|p| self.vp.rect().contains(p));
+        if !typing && over_vp && c(M::COMMAND, Key::Tab) {
+            ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+            let r = if self.ed.sculpt.is_some() {
+                self.ed.sculpt = None;
+                Ok("Object mode".to_string())
+            } else {
+                let log = self.ed.execute(&[Command::new("sculpt_mode")]);
+                let l = log.first().cloned().unwrap_or_default();
+                if l.starts_with('✔') { Ok(l.trim_start_matches(['✔', ' ']).to_string()) } else { Err(l.trim_start_matches(['✖', ' ']).to_string()) }
+            };
+            match r {
+                Ok(m) => self.toast(m, theme::OK),
+                Err(e) => self.toast(e, theme::WARN),
+            }
+        }
         if !typing && over_vp && c(M::NONE, Key::Tab) {
             ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
             self.vp.loopcut = None;
@@ -1384,6 +1662,37 @@ impl App {
         }
         if c(M::COMMAND, Key::N) {
             self.new_scene();
+        }
+        // Ctrl+P parent to active, Alt+P clear parent, M move to collection (object mode, over the viewport)
+        if !typing && !self.ed.editing() {
+            let mut cmd = None;
+            if c(M::COMMAND, Key::P) {
+                if let Some(a) = self.ed.active {
+                    let an = self.ed.scene.get(a).map(|o| o.name.clone()).unwrap_or_default();
+                    cmd = Some(Command { action: "parent".into(), parent: Some(an), ..Default::default() });
+                }
+            } else if c(M::ALT, Key::P) {
+                cmd = Some(Command::new("clear_parent"));
+            } else if over_vp && !self.ed.selection.is_empty() && c(M::NONE, Key::M) {
+                self.collection_menu = true;
+            }
+            if let Some(cmd) = cmd {
+                let log = self.ed.execute(&[cmd]);
+                if let Some(l) = log.first() {
+                    self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                }
+            }
+        }
+        // Alt+0..4: Subdivision Surface levels on the selected objects (object mode)
+        if !typing && !self.ed.editing() {
+            for (k, n) in [(Key::Num0, 0.0), (Key::Num1, 1.0), (Key::Num2, 2.0), (Key::Num3, 3.0), (Key::Num4, 4.0)] {
+                if c(M::ALT, k) {
+                    let log = self.ed.execute(&[Command { action: "subsurf".into(), number: Some(n), ..Default::default() }]);
+                    if let Some(l) = log.first() {
+                        self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                    }
+                }
+            }
         }
         if c(M::NONE, Key::F12) {
             self.render_now(ctx);
@@ -1985,6 +2294,7 @@ impl App {
                     .inner_margin(Margin::same(10)),
             )
             .show(ui, |ui| {
+                self.assistant_rect = ui.max_rect();
                 // Header
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("✦").size(20.0).color(theme::AI_ACCENT));
@@ -2389,8 +2699,23 @@ impl App {
                         }
                     });
                 }
+                let mut drop_image = false;
+                if let Some((name, _, tex)) = &self.pending_image {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Image::new(tex).max_size(vec2(48.0, 48.0)).corner_radius(4.0));
+                        ui.label(RichText::new(format!("🖼 {name}")).small());
+                        if ui.small_button("✖").on_hover_text("Remove the picture").clicked() {
+                            drop_image = true;
+                        }
+                    });
+                }
+                if drop_image {
+                    self.pending_image = None;
+                }
                 let hint = if self.voice.recorder.recording {
                     "Speak now…"
+                } else if self.pending_image.is_some() {
+                    "What should I build from this picture?  (Enter = recreate it)"
                 } else {
                     "Describe what to build or change…  (Enter to send)"
                 };
@@ -2412,6 +2737,15 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     self.mic_button(ui, 13.0);
+                    if ui.add(egui::Button::new(RichText::new("📎").size(14.0)).frame(false)).on_hover_text("Attach a picture or sketch: a vision model describes it and the Copilot builds it (you can also drop an image on this panel)").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file() {
+                            if let Ok(b) = std::fs::read(&p) {
+                                let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                                let ctx = ui.ctx().clone();
+                                self.attach_image(&ctx, &name, &b);
+                            }
+                        }
+                    }
                     ui.label(
                         RichText::new(if self.voice.recorder.recording && self.listen_purpose == Listen::Wake {
                             format!("say “{}…”", self.settings.wake_phrase)
@@ -2428,7 +2762,7 @@ impl App {
                         .color(theme::TEXT_DIM),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let can = !self.input.trim().is_empty() && self.waiting_ai.is_none();
+                        let can = (!self.input.trim().is_empty() || self.pending_image.is_some()) && self.waiting_ai.is_none();
                         let send = ui.add_enabled(
                             can,
                             egui::Button::new(RichText::new("Send ➤").strong())
@@ -2570,6 +2904,23 @@ impl App {
                             if ui.small_button("📋 Copy client config").on_hover_text("Claude Desktop / Cursor JSON (stdio). For Claude Code: claude mcp add --transport http rust-blender http://127.0.0.1:7878/mcp").clicked() {
                                 ui.ctx().copy_text(crate::mcp::client_config());
                                 self.toast("MCP client config copied", theme::OK);
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Vision");
+                        ui.horizontal(|ui| {
+                            let auto = ai::pick_vision_model(&self.models);
+                            let cur = if self.settings.vision_model.is_empty() { format!("auto ({})", auto.as_deref().map(short_model).unwrap_or("none installed")) } else { self.settings.vision_model.clone() };
+                            egui::ComboBox::from_id_salt("vision_model").selected_text(cur).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.settings.vision_model, String::new(), "auto");
+                                for m in self.models.iter().filter(|m| ai::VISION_MODELS.iter().any(|v| m.starts_with(v))) {
+                                    ui.selectable_value(&mut self.settings.vision_model, m.clone(), m.as_str());
+                                }
+                            }).response.on_hover_text("Reads pictures you attach (📎 or drop on this panel) so the Copilot can build them");
+                            let have = self.models.iter().any(|m| m.starts_with("qwen2.5vl"));
+                            if !have && ui.add_enabled(self.pull.is_none() && self.ollama == OllamaStatus::Online, egui::Button::new(RichText::new(format!("Pull {}", ai::RECOMMENDED_VISION)).small())).clicked() {
+                                self.ai.send(AiRequest::Pull(ai::RECOMMENDED_VISION.into()));
+                                self.pull = Some(("starting".into(), -1.0));
                             }
                         });
                         ui.end_row();
@@ -2748,18 +3099,109 @@ impl App {
             .id_salt("outliner")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.label(RichText::new("🗀 Scene Collection").color(theme::TEXT_DIM));
-                let ids: Vec<u64> = self.ed.scene.objects.iter().map(|o| o.id).collect();
+                // rows: collections as folders, objects as a parent/child tree inside them
+                enum Row {
+                    Col(u32),
+                    Obj(u64, usize, bool),
+                }
+                let mut rows = vec![];
+                {
+                    let sc = &self.ed.scene;
+                    let mut cols: Vec<u32> = vec![0];
+                    cols.extend(sc.collections.iter().map(|c| c.id));
+                    fn push_tree(sc: &Scene, id: u64, depth: usize, rows: &mut Vec<Row>, collapsed: &std::collections::HashSet<u64>) {
+                        let col = sc.get(id).map(|o| o.collection).unwrap_or(0);
+                        let kids: Vec<u64> = sc.objects.iter().filter(|c| c.parent == Some(id) && c.collection == col).map(|c| c.id).collect();
+                        rows.push(Row::Obj(id, depth, !kids.is_empty()));
+                        if depth < 32 && !collapsed.contains(&id) {
+                            for k in kids {
+                                push_tree(sc, k, depth + 1, rows, collapsed);
+                            }
+                        }
+                    }
+                    for c in cols {
+                        rows.push(Row::Col(c));
+                        if self.outliner_collapsed_cols.contains(&c) {
+                            continue;
+                        }
+                        for o in sc.objects.iter().filter(|o| o.collection == c) {
+                            let root = match o.parent.and_then(|p| sc.get(p)) {
+                                Some(p) => p.collection != c,
+                                None => true,
+                            };
+                            if root {
+                                push_tree(sc, o.id, 0, &mut rows, &self.outliner_collapsed);
+                            }
+                        }
+                    }
+                }
                 let mut select = None;
                 let mut toggle_vis = None;
                 let mut delete = None;
                 let mut start_rename = None;
-                for (row, id) in ids.iter().enumerate() {
+                let mut cmd: Option<Command> = None;
+                for (row, r) in rows.iter().enumerate() {
+                    let (id, depth, has_kids) = match r {
+                        Row::Col(cid) => {
+                            let cid = *cid;
+                            let (name, vis) = if cid == 0 {
+                                ("Scene Collection".to_string(), true)
+                            } else {
+                                self.ed.scene.collections.iter().find(|c| c.id == cid).map(|c| (c.name.clone(), c.visible)).unwrap_or_default()
+                            };
+                            ui.horizontal(|ui| {
+                                let open = !self.outliner_collapsed_cols.contains(&cid);
+                                if ui.add(egui::Button::new(RichText::new(if open { "⏷" } else { "⏵" }).small()).frame(false)).clicked() {
+                                    if open {
+                                        self.outliner_collapsed_cols.insert(cid);
+                                    } else {
+                                        self.outliner_collapsed_cols.remove(&cid);
+                                    }
+                                }
+                                let lr = ui.add(egui::Label::new(RichText::new(format!("🗀 {name}")).color(if vis { theme::TEXT_DIM } else { Color32::from_gray(90) })).sense(Sense::click()));
+                                lr.context_menu(|ui| {
+                                    if ui.button("Move selection here   M").clicked() {
+                                        cmd = Some(Command { action: "move_to_collection".into(), collection: Some(name.clone()), ..Default::default() });
+                                        ui.close();
+                                    }
+                                    if cid != 0 && ui.button("Delete collection (keep objects)").clicked() {
+                                        cmd = Some(Command { action: "delete_collection".into(), collection: Some(name.clone()), ..Default::default() });
+                                        ui.close();
+                                    }
+                                });
+                                if cid != 0 {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.add_space(6.0);
+                                        if ui.add(egui::Button::new(RichText::new(if vis { "👁" } else { "–" }).size(13.0)).frame(false)).on_hover_text("Show / hide everything in this collection").clicked() {
+                                            cmd = Some(Command { action: if vis { "hide_collection" } else { "show_collection" }.into(), collection: Some(name.clone()), ..Default::default() });
+                                        }
+                                    });
+                                }
+                            });
+                            continue;
+                        }
+                        Row::Obj(id, d, k) => (*id, *d, *k),
+                    };
+                    let id = &id;
                     let o = self.ed.scene.get(*id).unwrap().clone();
                     let selected = self.ed.selection.contains(id);
                     let active = self.ed.active == Some(*id);
-                    let (rect, resp) =
+                    let (rect_full, resp) =
                         ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+                    let indent = 10.0 + depth as f32 * 14.0;
+                    let rect = egui::Rect::from_min_max(rect_full.min + vec2(indent, 0.0), rect_full.max);
+                    if has_kids {
+                        let tri = egui::Rect::from_center_size(rect.left_center() + vec2(2.0, 0.0), vec2(14.0, 18.0));
+                        let tr = ui.interact(tri, ui.scope_id().with(("fold", id)), Sense::click());
+                        let open = !self.outliner_collapsed.contains(id);
+                        if tr.clicked() {
+                            if open {
+                                self.outliner_collapsed.insert(*id);
+                            } else {
+                                self.outliner_collapsed.remove(id);
+                            }
+                        }
+                    }
                     let bg = if active {
                         Color32::from_rgb(52, 78, 120)
                     } else if selected {
@@ -2771,8 +3213,11 @@ impl App {
                     } else {
                         Color32::from_rgb(40, 40, 40)
                     };
-                    ui.painter().rect_filled(rect, 3.0, bg);
+                    ui.painter().rect_filled(rect_full, 3.0, bg);
                     let p = ui.painter();
+                    if has_kids {
+                        p.text(rect.left_center() + vec2(2.0, 0.0), Align2::CENTER_CENTER, if self.outliner_collapsed.contains(id) { "⏵" } else { "⏷" }, FontId::proportional(9.0), theme::TEXT_DIM);
+                    }
                     let (icon, icol) = match &o.kind {
                         crate::scene::ObjectKind::Mesh => ("▽", Color32::from_rgb(255, 160, 80)),
                         crate::scene::ObjectKind::Light(_) => {
@@ -2853,7 +3298,7 @@ impl App {
                         }
                     }
                     let eye = egui::Rect::from_center_size(
-                        rect.right_center() - vec2(16.0, 0.0),
+                        rect_full.right_center() - vec2(16.0, 0.0),
                         vec2(20.0, 20.0),
                     );
                     let eye_resp =
@@ -2891,7 +3336,40 @@ impl App {
                             delete = Some(*id);
                             ui.close();
                         }
+                        ui.separator();
+                        if let Some(a) = self.ed.active.filter(|a| a != id) {
+                            let an = self.ed.scene.get(a).map(|o| o.name.clone()).unwrap_or_default();
+                            if ui.button(format!("Parent to \"{an}\"   Ctrl+P")).clicked() {
+                                cmd = Some(Command { action: "parent".into(), target: Some(o.name.clone()), parent: Some(an), ..Default::default() });
+                                ui.close();
+                            }
+                        }
+                        if o.parent.is_some() && ui.button("Clear Parent   Alt+P").clicked() {
+                            cmd = Some(Command { action: "clear_parent".into(), target: Some(o.name.clone()), ..Default::default() });
+                            ui.close();
+                        }
+                        ui.menu_button("Move to Collection", |ui| {
+                            let mut names = vec!["Scene Collection".to_string()];
+                            names.extend(self.ed.scene.collections.iter().map(|c| c.name.clone()));
+                            for n in names {
+                                if ui.button(&n).clicked() {
+                                    cmd = Some(Command { action: "move_to_collection".into(), target: Some(o.name.clone()), collection: Some(n), ..Default::default() });
+                                    ui.close();
+                                }
+                            }
+                            if ui.button("＋ New Collection").clicked() {
+                                let n = (1..).map(|i| format!("Collection {i}")).find(|n| !self.ed.scene.collections.iter().any(|c| &c.name == n)).unwrap();
+                                cmd = Some(Command { action: "move_to_collection".into(), target: Some(o.name.clone()), collection: Some(n), ..Default::default() });
+                                ui.close();
+                            }
+                        });
                     });
+                }
+                if let Some(c) = cmd {
+                    let log = self.ed.execute(&[c]);
+                    if let Some(l) = log.first() {
+                        self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                    }
                 }
                 if let Some((id, add)) = select {
                     if self.ed.edit.as_ref().is_some_and(|s| s.obj != id) {
@@ -3260,6 +3738,46 @@ impl App {
     // Popups: add menu, command palette, help, toasts
     // ------------------------------------------------------------------------------------------
     fn popups(&mut self, ctx: &egui::Context) {
+        if self.collection_menu {
+            let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
+            let at = ctx.pointer_latest_pos().unwrap_or(self.vp.rect().center());
+            let mut pick: Option<String> = None;
+            let area = egui::Area::new(egui::Id::unique("collection_menu"))
+                .fixed_pos(at - vec2(20.0, 12.0))
+                .constrain(true)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(180.0);
+                        ui.label(RichText::new("Move to Collection").strong());
+                        ui.separator();
+                        let mut names = vec!["Scene Collection".to_string()];
+                        names.extend(self.ed.scene.collections.iter().map(|c| c.name.clone()));
+                        for n in names {
+                            if ui.button(&n).clicked() {
+                                pick = Some(n);
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("＋ New Collection").clicked() {
+                            pick = Some((1..).map(|i| format!("Collection {i}")).find(|n| !self.ed.scene.collections.iter().any(|c| &c.name == n)).unwrap());
+                        }
+                    });
+                });
+            if area.response.clicked_elsewhere() && pick.is_none() {
+                close = true;
+            }
+            if let Some(n) = pick {
+                let log = self.ed.execute(&[Command { action: "move_to_collection".into(), collection: Some(n), ..Default::default() }]);
+                if let Some(l) = log.first() {
+                    self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), theme::OK);
+                }
+                close = true;
+            }
+            if close {
+                self.collection_menu = false;
+            }
+        }
         if let Some(at) = self.vp.add_menu_at {
             let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
             let area = egui::Area::new(egui::Id::unique("add_menu"))
@@ -3822,6 +4340,10 @@ const HELP: &[(&str, &str)] = &[
     ("← → / Shift+← →", "Step frame / jump to start-end"),
     ("F3 / Ctrl+K", "Command search (falls back to AI)"),
     ("F12 / F11", "Render image through the camera / show the last render"),
+    ("Alt+1/2/3 (Alt+0)", "Subdivision Surface level on the selection (remove)"),
+    ("Ctrl+P / Alt+P", "Parent selection to the active object / clear parent"),
+    ("Ctrl+Tab", "Sculpt mode on the active mesh (X draw, I inflate, S smooth, G grab, C crease, T flatten; [ ] radius)"),
+    ("M", "Move selection to a collection"),
     ("Ctrl+Space or `", "Voice: start / stop listening"),
     ("/ or Ctrl+L", "Focus the AI prompt"),
     ("N", "Toggle the AI Copilot panel"),
@@ -3988,9 +4510,18 @@ fn object_props(ui: &mut Ui, o: &mut crate::scene::Object) {
                 ui.add(egui::Slider::new(&mut o.detail, 1..=6).text("Resolution"));
             }
             let mut smooth = o.smooth();
-            if ui.checkbox(&mut smooth, "Shade smooth").changed() {
-                o.smooth_override = Some(smooth);
-            }
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut smooth, "Shade smooth").changed() {
+                    o.smooth_override = Some(smooth);
+                }
+                let mut auto = o.auto_smooth > 0.0;
+                if ui.add_enabled(smooth, egui::Checkbox::new(&mut auto, "Auto")).on_hover_text("Shade Auto Smooth: keep edges sharper than the angle hard").changed() {
+                    o.auto_smooth = if auto { 30.0 } else { 0.0 };
+                }
+                if smooth && o.auto_smooth > 0.0 {
+                    ui.add(egui::DragValue::new(&mut o.auto_smooth).range(1.0..=179.0).suffix("°").speed(0.5));
+                }
+            });
             ui.checkbox(&mut o.visible, "Visible in viewport");
         });
     }
@@ -4036,6 +4567,11 @@ fn modifier_props(ui: &mut Ui, o: &mut crate::scene::Object) {
             });
             ui.close();
         }
+        if ui.button("Subdivision Surface").clicked() {
+            o.modifiers.push(Modifier::Subsurf { levels: 2 });
+            o.smooth_override = Some(true);
+            ui.close();
+        }
     });
     let mut remove = None;
     let mut up = None;
@@ -4066,6 +4602,10 @@ fn modifier_props(ui: &mut Ui, o: &mut crate::scene::Object) {
                             Modifier::Radial { count, radius } => {
                                 ui.add(egui::Slider::new(count, 1..=100).text("Count"));
                                 ui.add(egui::Slider::new(radius, 0.0..=30.0).text("Radius"));
+                            }
+                            Modifier::Subsurf { levels } => {
+                                ui.add(egui::Slider::new(levels, 0..=4).text("Levels"));
+                                ui.label(RichText::new("Catmull–Clark. Edit mode shows the cage; Alt+1/2/3 sets levels.").small().color(theme::TEXT_DIM));
                             }
                         }
                         ui.horizontal(|ui| {
@@ -4211,6 +4751,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_events();
+        self.ed.propagate_parents();
         self.poll_mcp();
         self.voice_tick(&ctx);
         self.shortcuts(&ctx);
@@ -4223,9 +4764,23 @@ impl eframe::App for App {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             self.vp.ui(ui, &mut self.ed);
         });
+        // children follow whatever the viewport just moved
+        self.ed.propagate_parents();
         self.popups(&ctx);
+        self.poll_path_trace();
+        self.autosave_tick(&ctx);
+        let drop_at = ctx.input(|i| i.pointer.hover_pos()).or(ctx.pointer_latest_pos());
         for f in ctx.input(|i| i.raw.dropped_files.clone()) {
             let p = f.path().to_path_buf();
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let over_chat = drop_at.is_some_and(|q| self.assistant_rect.contains(q));
+            if over_chat && matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
+                if let Ok(b) = std::fs::read(&p) {
+                    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    self.attach_image(&ctx, &name, &b);
+                }
+                continue;
+            }
             self.import_path(&p);
         }
         if std::mem::take(&mut self.ed.render_request) {
@@ -4251,6 +4806,13 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.settings.gpu_renderer = self.vp.use_gpu;
         self.settings.save();
+        // clean exit: no recovery needed next time
+        let _ = std::fs::remove_file(autosave_dir().join("session.lock"));
+        let _ = std::fs::remove_file(autosave_dir().join("autosave.rblend"));
     }
 }
 
+
+fn autosave_dir() -> std::path::PathBuf {
+    dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("rust_blender")
+}

@@ -8,20 +8,26 @@ A Blender-style 3D editor written in Rust. You can drive it with the mouse and k
 
 ![Imported Khronos sample models](docs/import.png)
 
+![Path traced: gold, glass and bevelled bricks](docs/pathtraced.png)
+
 ## Features
 
 | Area | What you get |
 |---|---|
 | **Viewport** | A **GPU renderer** (wgpu) with 4× MSAA, a real depth buffer and selection outlines drawn in a shader. Picking is pixel-exact from an ID buffer that is read back asynchronously. A multithreaded **software renderer** takes over automatically if the GPU path isn't available, and you can toggle it under *Overlays*. Shading modes are Wireframe, Solid (studio light) and Material Preview (scene lights, Fresnel, metallic and roughness). Also X-ray, a fading grid, a 3D cursor and a clickable navigation gizmo. |
-| **Object mode** | Cube, plane, UV/ico sphere, cylinder, cone, torus and a "blob" head. Modal **G / R / S** transforms like Blender, with X/Y/Z axis locks, typed numbers and Ctrl to snap. Move, Rotate and Scale gizmos, box select, duplicate, hide/reveal, unlimited undo, and Array, Mirror and Radial-Array modifiers. |
+| **Object mode** | Cube, plane, UV/ico sphere, cylinder, cone, torus and a "blob" head. Modal **G / R / S** transforms like Blender, with X/Y/Z axis locks, typed numbers and Ctrl to snap. Move, Rotate and Scale gizmos, box select, duplicate, hide/reveal, unlimited undo, and Array, Mirror, Radial-Array and **Subdivision Surface** (Catmull–Clark, **Alt+1/2/3**) modifiers. **Shade Smooth / Auto Smooth** (by angle) keeps hard edges crisp on smooth-shaded, beveled and imported models. |
+| **Hierarchy** | **Parenting** (Ctrl+P / Alt+P, or `parent` in AI commands): children follow their parent when it moves, rotates or scales, whether you grab it, the AI moves it or animation plays. **Collections** (M) appear as folders in the outliner, with a tree view and a show/hide toggle per collection. Imported glTF files keep their node hierarchy and land in a collection named after the file. Export writes the hierarchy back to glTF. |
 | **Edit mode** (Tab) | Polygon (n-gon) meshes with **vertex / edge / face** selection (1 / 2 / 3), box select and G/R/S on components. **Extrude** (E, constrained to the face normal), **Inset** (I), **Bevel** (Ctrl+B: mouse sets the width, wheel the segments, with round profiles and spherical corners), **Loop Cut** (Ctrl+R, wheel or +/- sets the cut count) with a live preview, **Subdivide**, **Merge** (M), **Delete** (X) and **Flip Normals** (Alt+N). **Proportional editing** (O): G/R/S pulls nearby vertices along with a smooth falloff, and the wheel changes the radius. The AI can bevel too ("round the edges of the cube"). |
+| **Sculpt mode** (Ctrl+Tab) | **Draw, Inflate, Smooth, Grab, Crease and Flatten** brushes with X-mirror symmetry and a radius/strength cursor. Hold Shift to smooth and Ctrl to invert; [ ] changes the radius and Shift+[ ] the strength. Coarse meshes are refined automatically when you enter sculpt mode (Catmull–Clark for smooth shapes). Each stroke is one undo step. |
 | **Lights & cameras** | Point, Sun and Spot lights that light the Material Preview, and camera objects. **Numpad 0** looks through the camera, with a passepartout around the frame; **Ctrl+Alt+0** aligns the camera to the view. A "look at" command aims lights and cameras. The default scene is Blender's: a cube, a light and a camera. |
 | **Animation** | Keyframes with eased interpolation, a timeline, auto-keying and playback. |
 | **AI Copilot** | **Streams** replies from Ollama: the text appears live, and each command is applied the moment it finishes generating. There's a Stop button, and the whole answer is a single undo step. Simple commands run instantly without the LLM. The app auto-picks the best installed model and can download models from inside the app. The AI can also edit meshes (select faces, extrude, inset, loop cut and so on). |
+| **Picture to scene** | Attach a photo or sketch (📎, or drop it on the Copilot panel) and say what you want, or just press Enter. A local **vision model** (`qwen2.5vl:7b` recommended; gemma3 and llama3.2-vision also work) describes the objects, sizes, colours and layout, and the builder model recreates it. MCP agents can pass `image_path` to `ask_copilot`. |
 | **Voice** | Local Whisper (tiny, base, small or distil) with hands-free auto-stop and a level meter. Spoken requests go through tev1 for sub-second edits, and the app **says what it did** ("Added a red cube"). **Conversation mode** reopens the mic after each reply, an optional **wake word** ("Blender, …") listens in the background, and you can say "no, undo that", "stop", "repeat that" or "that's all" at any time. |
 | **Render (F12)** | Renders a final image through the scene camera: shadows from every light are ray-traced against the real geometry, plus ambient occlusion, ACES filmic tone mapping and 2×2 supersampled anti-aliasing. Choose 720p, 1080p, 4K or square, optionally with a transparent background, then save as PNG. You can trigger it by voice or the AI ("render it") or over MCP. |
+| **Path tracing** | A second F12 engine (*Path traced*, in the Render window) gives bounced light, soft shadows, glossy GGX reflections, glass (any material with alpha < 1 refracts), emissive surfaces and textures. It refines progressively on every CPU core, with a progress bar, a time-left estimate and Stop. Choose the sample count, say "render it path traced", or call MCP `render_image` with `engine: "path"`. |
 | **Textures & UVs** | Image textures (PNG/JPEG) and 10 tileable **procedural** ones (checker, bricks, wood, marble, tiles, grid, noise, stripes, concrete, grass). They show in Material Preview (GPU texture atlas or the software renderer, perspective-correct) and in F12 renders. Meshes keep per-corner UVs from imported files; anything else gets automatic box-projection UVs, with a Repeats slider. Textures are saved inside the `.rblend` file. Ask the AI "make the floor wood", or say "give it a brick texture". |
-| **Files** | Save and open `.rblend`. **Import glTF 2.0** (`.glb`, or `.gltf` with embedded or external buffers and images): meshes with UVs, PBR materials, base-colour textures, lights and cameras, with triangles merged back into quads. You can also drag files onto the window: `.glb`/`.gltf` import, images become a texture on the selection, `.rblend` opens. **Export glTF 2.0 (.glb)** with meshes (modifiers applied), UVs and textures, PBR materials, emissive strength, lights (`KHR_lights_punctual`), cameras and baked animation; the output passes the Khronos glTF-Validator with 0 errors and 0 warnings. Also exports Wavefront `.obj`. |
+| **Files** | Save and open `.rblend`. **Autosave** runs every 2 minutes, and after a crash the app offers to recover your work. **Import glTF 2.0** (`.glb`, or `.gltf` with embedded or external buffers and images): meshes with UVs, PBR materials, base-colour textures, lights and cameras, with triangles merged back into quads. You can also drag files onto the window: `.glb`/`.gltf` import, images become a texture on the selection, `.rblend` opens. **Export glTF 2.0 (.glb)** with meshes (modifiers applied), UVs and textures, PBR materials, emissive strength, lights (`KHR_lights_punctual`), cameras and baked animation; the output passes the Khronos glTF-Validator with 0 errors and 0 warnings. Also exports Wavefront `.obj`. |
 
 ## Recommended Ollama model
 
@@ -138,10 +144,13 @@ Follow-ups work because the AI sees the current scene and the conversation histo
 | / or Ctrl+L, N | focus the AI prompt, toggle the Copilot panel |
 | Ctrl+Z / Ctrl+Shift+Z, Ctrl+S / O / N | undo / redo, save / open / new |
 | Tab | edit mode on the active mesh |
+| Ctrl+P / Alt+P, M | parent to active / clear parent, move to collection |
+| Alt+1/2/3, Alt+0 | Subdivision Surface level, remove it |
 | 1 / 2 / 3 (edit) | vertex / edge / face select |
 | E, I, Ctrl+B, Ctrl+R (edit) | extrude, inset, bevel, loop cut |
 | O (edit) | proportional editing (wheel = radius) |
 | M, X, Alt+N (edit) | merge, delete, flip normals |
+| Ctrl+Tab | sculpt mode (X/I/S/G/C/T brushes, [ ] radius) |
 | Numpad 0, Ctrl+Alt+0 | look through the camera, align the camera to the view |
 | F12 / F11 | render image / show the last render |
 
@@ -153,9 +162,11 @@ src/
   app.rs       layout, menus, Copilot chat, voice UX, outliner, properties, timeline, palette
   viewport.rs  camera, scene → primitives, navigation, modal transforms, gizmos, HUD
   viewport/edit.rs  edit-mode drawing, component picking, extrude / inset / loop-cut tools
-  raytrace.rs  triangle BVH for F12 shadows and ambient occlusion
+  raytrace.rs  triangle BVH (closest hit + shadow rays)
+  pathtrace.rs progressive path tracer (GI, GGX, glass, NEE, textures)
   gpu.rs       wgpu renderer: MSAA colour pass, ID/depth pass + async readback, outline composite
   render.rs    multithreaded software z-buffer rasterizer (fallback), ID buffer, selection outline
+  sculpt.rs    sculpt brushes (draw, inflate, smooth, grab, crease, flatten)
   editmesh.rs  mesh operators (extrude, inset, loop cut, subdivide, merge, delete …)
   gltf.rs      glTF 2.0 / .glb exporter
   gltf_import.rs  glTF 2.0 importer (.glb / .gltf, data URIs, external files), quad merging

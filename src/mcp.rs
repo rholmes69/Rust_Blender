@@ -76,12 +76,12 @@ pub fn tools() -> Value {
         {
             "name": "ask_copilot",
             "description": "Send a natural-language request to Rust Blender's own local AI Copilot (Ollama: decision model + builder). Returns immediately; the build appears live in the app.",
-            "inputSchema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}
+            "inputSchema": {"type": "object", "properties": {"prompt": {"type": "string"}, "image_path": {"type": "string", "description": "optional picture (PNG/JPEG) for the app's vision model to recreate"}}, "required": ["prompt"]}
         },
         {
             "name": "render_image",
             "description": "Render the scene through its camera (Material Preview shading with the scene lights, anti-aliased, no overlays) and return the image so you can see the result. Optional: width/height in pixels (default 960 wide at the scene's aspect), transparent background, and an absolute path to also save a PNG.",
-            "inputSchema": {"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}, "transparent": {"type": "boolean"}, "path": {"type": "string"}}}
+            "inputSchema": {"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}, "transparent": {"type": "boolean"}, "path": {"type": "string"}, "engine": {"type": "string", "enum": ["fast", "path"], "description": "fast (default, ~1 s) or path (path traced: bounced light, reflections, glass; slower)"}, "samples": {"type": "integer", "description": "path tracer samples per pixel (default 16)"}}}
         },
         {
             "name": "import_gltf",

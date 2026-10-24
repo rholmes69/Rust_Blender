@@ -147,6 +147,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     // space. After the axis conversion that axis becomes -Y, so add a -90° X rotation.
     let fix = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
 
+    let mut node_of: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     for o in scene.objects.iter().filter(|o| o.visible) {
         let t = &o.transform;
         let mut node = json!({"name": o.name});
@@ -173,8 +174,8 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                     let nm = Mat3::from_mat4(inst).inverse().transpose();
                     let flip = inst.determinant() < 0.0;
                     let base = pos.len() as u32;
-                    if tex.is_some() {
-                        // per-corner vertices so UV seams survive
+                    if tex.is_some() || mesh.split_normals {
+                        // per-corner vertices so UV seams and auto-smooth hard edges survive
                         let s = o.material.tex_scale;
                         for (ti, tri) in mesh.tris.iter().enumerate() {
                             let order: [usize; 3] = if flip { [0, 2, 1] } else { [0, 1, 2] };
@@ -184,7 +185,8 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                             for &q in &order {
                                 let vi = tri[q] as usize;
                                 pos.push(cv(inst.transform_point3(mesh.positions[vi])));
-                                let n = if mesh.smooth { (nm * mesh.normals[vi]).normalize_or_zero() } else { fnrm };
+                                let cn = mesh.corner_normals.get(ti).map(|c| c[q]).unwrap_or(mesh.normals[vi]);
+                                let n = if mesh.smooth { (nm * cn).normalize_or_zero() * if flip { -1.0 } else { 1.0 } } else { fnrm };
                                 nrm.push(cv(n));
                                 let uv = mesh.tri_uv.get(ti).map(|t| t[q]).unwrap_or([0.0; 2]);
                                 uvs.push([uv[0] * s, uv[1] * s]);
@@ -292,6 +294,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         }
         nodes.push(node);
         let ni = nodes.len() - 1;
+        node_of.insert(o.id, ni);
 
         // baked animation (one sample per frame, preserving the eased interpolation)
         if o.keyframes.len() >= 2 {
@@ -324,6 +327,40 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         }
     }
 
+    // hierarchy: turn world transforms into parent-relative ones (animated children stay at the root)
+    let trs = |n: &Value| -> glam::Mat4 {
+        let v = |k: &str, d: [f32; 4]| -> Vec<f32> { n[k].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or(d.to_vec()) };
+        let t = v("translation", [0.0; 4]);
+        let r = v("rotation", [0.0, 0.0, 0.0, 1.0]);
+        let s = v("scale", [1.0; 4]);
+        glam::Mat4::from_scale_rotation_translation(Vec3::new(s[0], s[1], s[2]), Quat::from_xyzw(r[0], r[1], r[2], r[3]), Vec3::new(t[0], t[1], t[2]))
+    };
+    let world: Vec<glam::Mat4> = nodes.iter().map(trs).collect();
+    let mut is_child = vec![false; nodes.len()];
+    for o in scene.objects.iter().filter(|o| o.visible) {
+        let (Some(&ci), Some(&pi)) = (node_of.get(&o.id), o.parent.and_then(|p| node_of.get(&p))) else { continue };
+        let animated = o.keyframes.len() >= 2;
+        if animated {
+            continue;
+        }
+        let local = world[pi].inverse() * world[ci];
+        let (s, r, t) = local.to_scale_rotation_translation();
+        // TRS can't hold shear (non-uniformly scaled, rotated parent): keep such children at the root
+        let back = world[pi] * glam::Mat4::from_scale_rotation_translation(s, r, t);
+        if !back.abs_diff_eq(world[ci], 1e-4 * (1.0 + world[ci].w_axis.length())) {
+            continue;
+        }
+        nodes[ci]["translation"] = json!([t.x, t.y, t.z]);
+        nodes[ci]["rotation"] = json!([r.x, r.y, r.z, r.w]);
+        if nodes[ci].get("scale").is_some() || (s - Vec3::ONE).length() > 1e-4 {
+            nodes[ci]["scale"] = json!([s.x, s.y, s.z]);
+        }
+        let mut kids = nodes[pi]["children"].as_array().cloned().unwrap_or_default();
+        kids.push(json!(ci));
+        nodes[pi]["children"] = json!(kids);
+        is_child[ci] = true;
+    }
+    let roots: Vec<usize> = (0..nodes.len()).filter(|i| !is_child[*i]).collect();
     let n_anim = usize::from(!channels.is_empty());
     let mut ext_used = vec![];
     if !lights.is_empty() {
@@ -336,7 +373,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     let mut root = json!({
         "asset": {"version": "2.0", "generator": "Rust Blender"},
         "scene": 0,
-        "scenes": [{"name": "Scene", "nodes": (0..nodes.len()).collect::<Vec<_>>()}],
+        "scenes": [{"name": "Scene", "nodes": roots}],
         "nodes": nodes,
         "buffers": [{"byteLength": bin.data.len()}],
         "bufferViews": bin.views,

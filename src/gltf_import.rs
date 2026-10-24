@@ -209,7 +209,17 @@ fn local_matrix(n: &Value) -> Mat4 {
 /// Import a .glb / .gltf file into `scene`. Returns stats and the ids of the new objects.
 pub fn import_file(scene: &mut Scene, path: &Path) -> Result<(ImportStats, Vec<u64>), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
-    import_bytes(scene, &bytes, path.parent())
+    let (st, ids) = import_bytes(scene, &bytes, path.parent())?;
+    // put everything from the file into a collection named after it
+    if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
+        let cid = scene.collection_by_name(&stem);
+        for id in &ids {
+            if let Some(o) = scene.get_mut(*id) {
+                o.collection = cid;
+            }
+        }
+    }
+    Ok((st, ids))
 }
 
 pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Result<(ImportStats, Vec<u64>), String> {
@@ -325,21 +335,19 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
             }
         }
     };
-    let mut stack: Vec<(usize, Mat4, usize)> = roots.into_iter().map(|r| (r, Mat4::IDENTITY, 0)).collect();
+    // (node, parent world matrix, depth, nearest ancestor object)
+    let mut stack: Vec<(usize, Mat4, usize, Option<u64>)> = roots.into_iter().map(|r| (r, Mat4::IDENTITY, 0, None)).collect();
     let fix_inv = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2).inverse();
     let mut seen = 0usize;
-    while let Some((ni, parent, depth)) = stack.pop() {
+    while let Some((ni, parent, depth, parent_obj)) = stack.pop() {
+        let mut node_obj: Option<u64> = None;
+        let first_new = new_ids.len();
         seen += 1;
         if depth > 64 || seen > 100_000 {
             return Err("node hierarchy is cyclic or too deep".into());
         }
         let Some(n) = nodes.get(ni) else { continue };
         let world = parent * local_matrix(n);
-        for c in n["children"].as_array().into_iter().flatten().rev() {
-            if let Some(c) = c.as_u64() {
-                stack.push((c as usize, world, depth + 1));
-            }
-        }
         let (s, r, t) = world.to_scale_rotation_translation();
         let node_name = n["name"].as_str().filter(|s| !s.is_empty());
         // mesh
@@ -400,6 +408,10 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
                 let o = scene.get_mut(id).unwrap();
                 o.mesh = Some(pm);
                 o.smooth_override = Some(smooth);
+                if smooth {
+                    // keep the model's hard edges (glTF splits vertices there; welding merged them)
+                    o.auto_smooth = 40.0;
+                }
                 o.material = p["material"].as_u64().and_then(|m| materials.get(m as usize).copied()).unwrap_or_default();
                 o.transform.location = icv(t);
                 o.transform.set_quat(icq(r));
@@ -448,6 +460,23 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
             o.transform.set_quat(icq(r * fix_inv));
             stats.lights += 1;
             new_ids.push(id);
+        }
+        // hierarchy: this node's objects become children of the nearest ancestor object; extra
+        // primitives of the same mesh are parented to the first one
+        for (k, id) in new_ids[first_new..].iter().enumerate() {
+            let p = if k == 0 { parent_obj } else { node_obj };
+            if k == 0 {
+                node_obj = Some(*id);
+            }
+            if let Some(o) = scene.get_mut(*id) {
+                o.parent = p;
+            }
+        }
+        let carry = node_obj.or(parent_obj);
+        for c in n["children"].as_array().into_iter().flatten().rev() {
+            if let Some(c) = c.as_u64() {
+                stack.push((c as usize, world, depth + 1, carry));
+            }
         }
     }
     if j["animations"].as_array().is_some_and(|a| !a.is_empty()) {
@@ -555,7 +584,8 @@ mod tests {
         let cmds: Vec<crate::editor::Command> = serde_json::from_value(serde_json::json!([
             {"action": "set_transform", "target": "Cube", "location": [1, 2, 3], "rotation": [10, 20, 30], "scale": [1, 2, 0.5]},
             {"action": "set_texture", "target": "Cube", "name": "bricks", "number": 2},
-            {"action": "add", "primitive": "uv_sphere", "name": "Ball", "location": [-2, 0, 1], "color": "red"},
+            {"action": "add", "primitive": "cube", "name": "Holder", "location": [-2, 0, 0], "rotation": [0, 0, 30], "scale": 0.5},
+            {"action": "add", "primitive": "uv_sphere", "name": "Ball", "location": [-2, 0, 1], "color": "red", "parent": "Holder"},
             {"action": "add", "primitive": "spot_light", "name": "Spot", "location": [0, -4, 4], "look_at": [0, 0, 0], "power": 800}
         ]))
         .unwrap();
@@ -566,8 +596,8 @@ mod tests {
         let mut scene = Scene::default();
         scene.objects.clear();
         let (st, ids) = import_bytes(&mut scene, &glb, None).unwrap();
-        assert_eq!((st.meshes, st.lights, st.cameras, st.textures), (2, 2, 1, 1), "{st:?}");
-        assert_eq!(ids.len(), 5);
+        assert_eq!((st.meshes, st.lights, st.cameras, st.textures), (3, 2, 1, 1), "{st:?}");
+        assert_eq!(ids.len(), 6);
         let orig = ed.scene.objects.iter().find(|o| o.name == "Cube").unwrap();
         let cube = scene.objects.iter().find(|o| o.name == "Cube").unwrap();
         assert!((cube.transform.location - orig.transform.location).length() < 1e-4);
@@ -594,6 +624,12 @@ mod tests {
         }
         assert!((ball.material.roughness - ball_o.material.roughness).abs() < 1e-4);
         assert_eq!(ball.smooth_override, Some(true));
+        // Ball was parented to Holder before export: the hierarchy survives
+        let holder = scene.objects.iter().find(|o| o.name == "Holder").unwrap();
+        assert_eq!(ball.parent, Some(holder.id));
+        let wb = crate::agent::world_bounds(ball_o, &mut cache);
+        let wb2 = crate::agent::world_bounds(ball, &mut cache);
+        assert!((wb.lo - wb2.lo).length() < 1e-3);
         // .rblend round trip keeps textures and UVs
         let js = serde_json::to_string(&scene).unwrap();
         let back: Scene = serde_json::from_str(&js).unwrap();

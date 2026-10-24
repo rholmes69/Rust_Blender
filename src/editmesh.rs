@@ -766,6 +766,105 @@ pub fn falloff(dist: f32, radius: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// One level of Catmull–Clark subdivision (all faces become quads; boundaries are kept
+/// crease-like). Per-corner UVs are interpolated linearly.
+pub fn catmull_clark(pm: &PolyMesh) -> PolyMesh {
+    let key = |a: u32, b: u32| (a.min(b), a.max(b));
+    let nv = pm.verts.len();
+    let ef = pm.edge_faces();
+    let face_pts: Vec<Vec3> = (0..pm.faces.len()).map(|f| pm.face_center(f)).collect();
+    let mut verts: Vec<Vec3> = Vec::with_capacity(nv + ef.len() + pm.faces.len());
+    verts.resize(nv, Vec3::ZERO);
+    // edge points
+    let mut edge_pt: HashMap<(u32, u32), u32> = HashMap::with_capacity(ef.len());
+    let mut edges: Vec<(u32, u32)> = ef.keys().copied().collect();
+    edges.sort_unstable();
+    for &(a, b) in &edges {
+        let fs = &ef[&(a, b)];
+        let mid = (pm.verts[a as usize] + pm.verts[b as usize]) * 0.5;
+        let p = if fs.len() == 2 { (mid * 2.0 + face_pts[fs[0]] + face_pts[fs[1]]) * 0.25 } else { mid };
+        edge_pt.insert((a, b), verts.len() as u32);
+        verts.push(p);
+    }
+    // face points
+    let fbase = verts.len() as u32;
+    verts.extend(face_pts.iter().copied());
+    // moved original vertices
+    let mut q = vec![Vec3::ZERO; nv]; // sum of adjacent face points
+    let mut nf = vec![0u32; nv];
+    let mut r = vec![Vec3::ZERO; nv]; // sum of incident edge midpoints
+    let mut ne = vec![0u32; nv];
+    let mut bsum = vec![Vec3::ZERO; nv]; // boundary neighbours
+    let mut nb = vec![0u32; nv];
+    for (fi, f) in pm.faces.iter().enumerate() {
+        for &v in f {
+            q[v as usize] += face_pts[fi];
+            nf[v as usize] += 1;
+        }
+    }
+    for &(a, b) in &edges {
+        let mid = (pm.verts[a as usize] + pm.verts[b as usize]) * 0.5;
+        for v in [a, b] {
+            r[v as usize] += mid;
+            ne[v as usize] += 1;
+        }
+        if ef[&(a, b)].len() != 2 {
+            bsum[a as usize] += pm.verts[b as usize];
+            bsum[b as usize] += pm.verts[a as usize];
+            nb[a as usize] += 1;
+            nb[b as usize] += 1;
+        }
+    }
+    for v in 0..nv {
+        let p = pm.verts[v];
+        verts[v] = if nb[v] >= 2 {
+            p * 0.75 + bsum[v] * (0.25 / nb[v] as f32)
+        } else if nf[v] > 0 && ne[v] >= 3 {
+            let n = ne[v] as f32;
+            let qa = q[v] / nf[v] as f32;
+            let ra = r[v] / ne[v] as f32;
+            (qa + ra * 2.0 + p * (n - 3.0)) / n
+        } else {
+            p
+        };
+    }
+    let has_uv = pm.has_uvs();
+    let mut faces = Vec::with_capacity(pm.faces.len() * 4);
+    let mut uvs = vec![];
+    for (fi, f) in pm.faces.iter().enumerate() {
+        let n = f.len();
+        let fp = fbase + fi as u32;
+        let fuv = if has_uv { Some(&pm.uvs[fi]) } else { None };
+        let center_uv = fuv.map(|u| {
+            let s = u.iter().fold([0.0, 0.0], |a, b| [a[0] + b[0], a[1] + b[1]]);
+            [s[0] / n as f32, s[1] / n as f32]
+        });
+        for i in 0..n {
+            let (prev, cur, next) = (f[(i + n - 1) % n], f[i], f[(i + 1) % n]);
+            faces.push(vec![cur, edge_pt[&key(cur, next)], fp, edge_pt[&key(prev, cur)]]);
+            if let (Some(u), Some(c)) = (fuv, center_uv) {
+                let (up, uc, un) = (u[(i + n - 1) % n], u[i], u[(i + 1) % n]);
+                let m = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+                uvs.push(vec![uc, m(uc, un), c, m(up, uc)]);
+            }
+        }
+    }
+    PolyMesh { verts, faces, uvs }
+}
+
+/// `levels` rounds of Catmull–Clark, stopping early above ~1.5M faces.
+pub fn subdivide_surface(pm: &PolyMesh, levels: u32) -> PolyMesh {
+    let mut m = pm.clone();
+    for _ in 0..levels.min(6) {
+        let next_faces: usize = m.faces.iter().map(|f| f.len()).sum();
+        if next_faces > 1_500_000 {
+            break;
+        }
+        m = catmull_clark(&m);
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,5 +1004,23 @@ mod tests {
         assert_eq!(falloff(0.0, 1.0), 1.0);
         assert_eq!(falloff(1.0, 1.0), 0.0);
         assert!((falloff(0.5, 1.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn subdivision_surface() {
+        let pm = cube();
+        let s1 = catmull_clark(&pm);
+        assert_eq!((s1.verts.len(), s1.faces.len()), (26, 24));
+        assert!(closed(&s1) && outward(&s1));
+        let s2 = subdivide_surface(&pm, 2);
+        assert_eq!(s2.faces.len(), 96);
+        // the cage shrinks towards a sphere-like shape inside the original cube
+        let r: Vec<f32> = s2.verts.iter().map(|v| v.length()).collect();
+        assert!(r.iter().all(|x| *x < 1.74 && *x > 0.8));
+        // a plane (all boundary): edges stay on the outline, corners round off like Blender
+        let p = subdivide_surface(&crate::mesh::plane(), 1);
+        assert_eq!(p.faces.len(), 4);
+        assert!(p.verts.iter().any(|v| (v.x - 1.0).abs() < 1e-5 && v.y.abs() < 1e-5));
+        assert!(p.verts.iter().all(|v| v.x.abs() <= 1.0 + 1e-5 && v.y.abs() <= 1.0 + 1e-5 && v.z.abs() < 1e-5));
     }
 }

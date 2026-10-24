@@ -181,6 +181,8 @@ pub enum ObjectKind {
     Camera(CameraData),
     /// Bones live in `Object::armature`.
     Armature,
+    /// A point with axes (IK targets, pivots); never rendered.
+    Empty,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -220,7 +222,22 @@ pub struct Object {
     /// Skin weights: the mesh is deformed by an armature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skin: Option<crate::armature::Skin>,
-    /// Deformed mesh for the current pose (derived, see `Scene::update_skins`).
+    /// Shape keys (morph targets) of `mesh`, blended by their values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shape_keys: Vec<crate::shapekeys::ShapeKey>,
+    /// Being edited: the shape keys don't apply (the mesh shows the key being edited).
+    #[serde(skip)]
+    pub shape_editing: bool,
+    /// Cloth simulation (its baked frames drive the mesh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloth: Option<crate::physics::Cloth>,
+    /// Current frame, for baked simulations.
+    #[serde(skip)]
+    pub sim_frame: i32,
+    /// Copies of another object spread over a surface (the mesh is derived into `posed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scatter: Option<crate::scatter::Scatter>,
+    /// Derived mesh: the armature pose (`Scene::update_skins`) or a scatter result.
     #[serde(skip)]
     pub posed: Option<std::sync::Arc<crate::mesh::PolyMesh>>,
     #[serde(skip)]
@@ -290,6 +307,7 @@ impl Object {
             ObjectKind::Mesh => self.primitive.label().to_string(),
             ObjectKind::Light(l) => format!("{} Light", l.light_type.label()),
             ObjectKind::Camera(_) => "Camera".into(),
+            ObjectKind::Empty => "Empty".into(),
             ObjectKind::Armature => format!("Armature, {} bones", self.armature.as_ref().map(|a| a.bones.len()).unwrap_or(0)),
         }
     }
@@ -345,11 +363,28 @@ impl Object {
         if let Some(a) = self.armature.as_mut() {
             a.evaluate(frame as f32);
         }
+        for k in &mut self.shape_keys {
+            if let Some(v) = k.sample(frame as f32) {
+                k.value = v;
+            }
+        }
+        self.sim_frame = frame;
+    }
+
+    /// The mesh with its shape keys blended in (the basis when none are active).
+    pub fn shaped(&self) -> Option<crate::mesh::PolyMesh> {
+        if self.shape_editing || self.shape_keys.is_empty() {
+            return None;
+        }
+        crate::shapekeys::apply(self.mesh.as_ref()?, &self.shape_keys)
     }
 
     pub fn insert_keyframe(&mut self, frame: i32) {
         if let Some(a) = self.armature.as_mut() {
             a.insert_keys(frame);
+        }
+        for k in &mut self.shape_keys {
+            k.insert_key(frame);
         }
         self.keyframes.retain(|k| k.frame != frame);
         self.keyframes.push(Keyframe {
@@ -603,9 +638,20 @@ impl Scene {
             collection: 0,
             armature: None,
             skin: None,
+            shape_keys: vec![],
+            shape_editing: false,
+            cloth: None,
+            sim_frame: 0,
+            scatter: None,
             posed: None,
             posed_key: 0,
         });
+        id
+    }
+
+    pub fn add_empty(&mut self, name: Option<&str>) -> u64 {
+        let id = self.add(Primitive::Cube, Some(name.unwrap_or("Empty")));
+        self.get_mut(id).unwrap().kind = ObjectKind::Empty;
         id
     }
 
@@ -615,6 +661,162 @@ impl Scene {
         o.kind = ObjectKind::Armature;
         o.armature = Some(arm);
         id
+    }
+
+    /// Recompute every derived mesh (skins, then scatters that may sit on them).
+    pub fn update_derived(&mut self) {
+        self.update_ik();
+        self.update_shapes();
+        self.update_cloth();
+        self.update_skins();
+        self.update_scatter();
+    }
+
+    /// Solve IK constraints (bones reaching for target objects) when targets or poses moved.
+    pub fn update_ik(&mut self) {
+        use std::hash::{Hash, Hasher};
+        for i in 0..self.objects.len() {
+            let Some(arm) = self.objects[i].armature.as_ref() else { continue };
+            if arm.rest_position || !arm.bones.iter().any(|b| b.ik.is_some()) {
+                continue;
+            }
+            let inv = self.objects[i].transform.matrix().inverse();
+            let goals: Vec<(usize, Vec3, u32)> = arm
+                .bones
+                .iter()
+                .enumerate()
+                .filter_map(|(bi, b)| {
+                    let ik = b.ik?;
+                    let t = self.get(ik.target)?;
+                    Some((bi, inv.transform_point3(t.transform.location), ik.chain))
+                })
+                .collect();
+            let digest = |a: &crate::armature::Armature| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                for (bi, g, c) in &goals {
+                    (bi, g.x.to_bits(), g.y.to_bits(), g.z.to_bits(), c).hash(&mut h);
+                }
+                for f in inv.to_cols_array() {
+                    f.to_bits().hash(&mut h);
+                }
+                for b in &a.bones {
+                    for f in b.pose.rot.to_array().iter().chain(b.pose.loc.to_array().iter()) {
+                        f.to_bits().hash(&mut h);
+                    }
+                }
+                h.finish()
+            };
+            if digest(arm) == arm.ik_key {
+                continue;
+            }
+            let a = self.objects[i].armature.as_mut().unwrap();
+            for (bi, g, c) in &goals {
+                a.solve_ik(*bi, *g, *c);
+            }
+            let k = digest(a);
+            a.ik_key = k;
+        }
+    }
+
+    /// Blend shape keys of meshes that aren't skinned (skinned ones blend inside `update_skins`).
+    pub fn update_shapes(&mut self) {
+        use std::hash::{Hash, Hasher};
+        for o in self.objects.iter_mut().filter(|o| !o.shape_keys.is_empty() && o.skin.is_none() && o.scatter.is_none()) {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for k in &o.shape_keys {
+                k.value.to_bits().hash(&mut h);
+                k.verts.len().hash(&mut h);
+            }
+            o.shape_editing.hash(&mut h);
+            if let Some(m) = &o.mesh {
+                (m.verts.len(), m.faces.len()).hash(&mut h);
+                for v in m.verts.iter().step_by((m.verts.len() / 64).max(1)) {
+                    (v.x.to_bits(), v.y.to_bits(), v.z.to_bits()).hash(&mut h);
+                }
+            }
+            let key = h.finish() | 1;
+            if o.posed_key == key {
+                continue;
+            }
+            o.posed = o.shaped().map(std::sync::Arc::new);
+            o.posed_key = key;
+        }
+    }
+
+    /// Show the baked cloth frame.
+    pub fn update_cloth(&mut self) {
+        for o in self.objects.iter_mut() {
+            let Some(c) = o.cloth.as_ref() else { continue };
+            let Some(pm) = o.mesh.as_ref() else { continue };
+            if c.cache.is_empty() || c.cache[0].len() != pm.verts.len() {
+                if o.posed.is_some() && o.skin.is_none() && o.shape_keys.is_empty() && o.scatter.is_none() {
+                    o.posed = None;
+                }
+                continue;
+            }
+            let i = (o.sim_frame - c.start).clamp(0, c.cache.len() as i32 - 1) as usize;
+            let key = 0x5100_0000_0000_0001 ^ ((i as u64) << 1) ^ ((c.cache.len() as u64) << 32);
+            if o.posed.is_some() && o.posed_key == key {
+                continue;
+            }
+            let mut m = pm.clone();
+            m.verts = c.cache[i].clone();
+            o.posed = Some(std::sync::Arc::new(m));
+            o.posed_key = key;
+        }
+    }
+
+    /// Regenerate scatter results whose inputs changed.
+    pub fn update_scatter(&mut self) {
+        use std::hash::{Hash, Hasher};
+        if !self.objects.iter().any(|o| o.scatter.is_some()) {
+            return;
+        }
+        let digest = |o: &Object, h: &mut std::collections::hash_map::DefaultHasher| {
+            for f in o.transform.matrix().to_cols_array() {
+                f.to_bits().hash(h);
+            }
+            (o.primitive as u8, o.detail, o.posed_key).hash(h);
+            if let Some(m) = &o.mesh {
+                (m.verts.len(), m.faces.len()).hash(h);
+                for v in m.verts.iter().step_by((m.verts.len() / 97).max(1)) {
+                    (v.x.to_bits(), v.y.to_bits(), v.z.to_bits()).hash(h);
+                }
+            }
+        };
+        for i in 0..self.objects.len() {
+            let Some(sc) = self.objects[i].scatter.clone() else { continue };
+            let (Some(src), Some(tgt)) = (self.get(sc.source), self.get(sc.target)) else {
+                self.objects[i].posed = None;
+                continue;
+            };
+            if sc.source == self.objects[i].id || sc.target == self.objects[i].id {
+                continue;
+            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            digest(src, &mut h);
+            digest(tgt, &mut h);
+            for f in self.objects[i].transform.matrix().to_cols_array() {
+                f.to_bits().hash(&mut h);
+            }
+            format!("{sc:?}").hash(&mut h);
+            let key = h.finish() | 1;
+            if self.objects[i].posed.is_some() && self.objects[i].posed_key == key {
+                continue;
+            }
+            let tpm = match &tgt.posed {
+                Some(p) if tgt.skin.is_some() || !tgt.shape_keys.is_empty() => (**p).clone(),
+                _ => tgt.poly(),
+            };
+            let (s, r, _) = src.transform.matrix().to_scale_rotation_translation();
+            let rs = Mat4::from_scale_rotation_translation(s, r, Vec3::ZERO);
+            let mats = crate::scatter::instances(&sc, &tpm, tgt.transform.matrix(), rs);
+            let to_local = self.objects[i].transform.matrix().inverse();
+            let pm = crate::scatter::build(&src.poly(), &mats, to_local);
+            let o = &mut self.objects[i];
+            o.posed = Some(std::sync::Arc::new(pm));
+            o.posed_key = key;
+        }
     }
 
     /// Recompute the deformed meshes of skinned objects whose armature pose (or transforms)
@@ -643,6 +845,10 @@ impl Scene {
             }
             let om = o.transform.matrix();
             let mut h = std::collections::hash_map::DefaultHasher::new();
+            for k in &o.shape_keys {
+                k.value.to_bits().hash(&mut h);
+            }
+            o.shape_editing.hash(&mut h);
             for m in arm.pose_globals().iter().chain([aw, &om]) {
                 for f in m.to_cols_array() {
                     f.to_bits().hash(&mut h);
@@ -656,7 +862,8 @@ impl Scene {
             if o.posed.is_some() && o.posed_key == key {
                 continue;
             }
-            o.posed = Some(std::sync::Arc::new(crate::armature::deform(pm, skin, arm, *aw, om)));
+            let base = o.shaped();
+            o.posed = Some(std::sync::Arc::new(crate::armature::deform(base.as_ref().unwrap_or(pm), skin, arm, *aw, om)));
             o.posed_key = key;
         }
     }

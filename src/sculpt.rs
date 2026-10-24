@@ -204,6 +204,85 @@ pub fn densify(pm: &mut PolyMesh, target: usize, smooth: bool) -> bool {
     changed
 }
 
+/// Dynamic topology: turn the mesh into triangles (UVs are dropped).
+pub fn to_triangles(pm: &mut PolyMesh) {
+    let mut faces = Vec::with_capacity(pm.faces.len() * 2);
+    for f in &pm.faces {
+        if f.len() == 3 {
+            faces.push(f.clone());
+        } else {
+            faces.extend(crate::mesh::triangulate(&pm.verts, f).into_iter().map(|t| t.to_vec()));
+        }
+    }
+    pm.faces = faces;
+    pm.uvs.clear();
+}
+
+/// Dynamic topology refinement around `c`: split triangle edges longer than `max_len` that touch
+/// the brush (radius `r`), so detail appears where you sculpt. Returns whether anything changed.
+pub fn refine(pm: &mut PolyMesh, c: Vec3, r: f32, max_len: f32) -> bool {
+    if max_len <= 0.0 {
+        return false;
+    }
+    let r2 = r * r;
+    let reach = (r + max_len * 2.0).powi(2);
+    let mut changed = false;
+    for _pass in 0..8 {
+        // triangles near the brush
+        let cand: Vec<usize> = (0..pm.faces.len())
+            .filter(|&fi| pm.faces[fi].len() == 3 && pm.faces[fi].iter().any(|&v| pm.verts[v as usize].distance_squared(c) < reach))
+            .collect();
+        let key = |a: u32, b: u32| (a.min(b), a.max(b));
+        let mut edge_faces: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+        for &fi in &cand {
+            let f = &pm.faces[fi];
+            for i in 0..3 {
+                edge_faces.entry(key(f[i], f[(i + 1) % 3])).or_default().push(fi);
+            }
+        }
+        let ml2 = max_len * max_len;
+        let mut edges: Vec<((u32, u32), f32)> = edge_faces
+            .keys()
+            .filter_map(|&(a, b)| {
+                let (pa, pb) = (pm.verts[a as usize], pm.verts[b as usize]);
+                let l2 = pa.distance_squared(pb);
+                (l2 > ml2 && (pa.distance_squared(c) < r2 || pb.distance_squared(c) < r2 || ((pa + pb) * 0.5).distance_squared(c) < r2)).then_some(((a, b), l2))
+            })
+            .collect();
+        if edges.is_empty() {
+            break;
+        }
+        edges.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut touched = vec![false; pm.faces.len()];
+        let mut split_any = false;
+        for ((a, b), _) in edges {
+            let fs = &edge_faces[&(a, b)];
+            // an edge is split only if none of its faces changed in this pass (keeps it conforming)
+            if fs.iter().any(|&fi| touched[fi]) {
+                continue;
+            }
+            let m = (pm.verts[a as usize] + pm.verts[b as usize]) * 0.5;
+            pm.verts.push(m);
+            let mv = (pm.verts.len() - 1) as u32;
+            for &fi in fs.clone().iter() {
+                let f = pm.faces[fi].clone();
+                let i = (0..3).find(|&i| key(f[i], f[(i + 1) % 3]) == (a, b)).unwrap();
+                let (p, q, x) = (f[i], f[(i + 1) % 3], f[(i + 2) % 3]);
+                pm.faces[fi] = vec![p, mv, x];
+                pm.faces.push(vec![mv, q, x]);
+                touched[fi] = true;
+                touched.push(true);
+            }
+            split_any = true;
+        }
+        if !split_any {
+            break;
+        }
+        changed = true;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +326,18 @@ mod densify_tests {
         assert!(pm.verts.len() > n0 && pm.verts.len() >= 4000);
         assert_eq!((bad, open), (0, 0), "closed and outward");
         assert!(m.tris.len() > 1000 && pm.verts.iter().all(|v| v.is_finite()));
+    }
+    #[test]
+    fn dyntopo_refines_locally() {
+        let mut pm = crate::mesh::Primitive::IcoSphere.poly(1);
+        super::to_triangles(&mut pm);
+        let (v0, f0) = (pm.verts.len(), pm.faces.len());
+        let c = pm.verts[0];
+        assert!(super::refine(&mut pm, c, 0.4, 0.1));
+        assert!(pm.verts.len() > v0 + 10 && pm.faces.len() > f0, "{} -> {}", v0, pm.verts.len());
+        // still closed, and far away nothing changed
+        assert!(pm.edge_faces().values().all(|f| f.len() == 2), "watertight");
+        let far = pm.verts.iter().filter(|v| v.distance(-c) < 0.3).count();
+        assert!(far < 10);
     }
 }

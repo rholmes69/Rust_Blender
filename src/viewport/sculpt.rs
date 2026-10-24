@@ -10,6 +10,10 @@ pub struct SculptUi {
     pub strength: f32,
     /// Mirror strokes across the object's local X axis.
     pub symmetry: bool,
+    /// Dynamic topology: add triangles where the brush works.
+    pub dyntopo: bool,
+    /// Dyntopo edge length as a fraction of the brush radius.
+    pub detail: f32,
     stroke: Option<StrokeState>,
     /// (faces, verts) the adjacency was built for
     adj: Option<((usize, usize), Vec<Vec<u32>>)>,
@@ -19,7 +23,7 @@ pub struct SculptUi {
 
 impl Default for SculptUi {
     fn default() -> Self {
-        Self { brush: Brush::Draw, radius_px: 60.0, strength: 0.5, symmetry: true, stroke: None, adj: None, hover: None }
+        Self { brush: Brush::Draw, radius_px: 60.0, strength: 0.5, symmetry: true, dyntopo: false, detail: 0.15, stroke: None, adj: None, hover: None }
     }
 }
 
@@ -75,6 +79,11 @@ impl Viewport {
             self.sculpt_ui.brush.label()
         );
         let Some(o) = ed.scene.get(id) else { return false };
+        // dynamic topology would break skin weights and shape keys
+        let dyn_ok = o.skin.is_none() && o.shape_keys.is_empty();
+        if self.sculpt_ui.dyntopo && !dyn_ok {
+            self.status_hint = "Dyntopo is off for rigged meshes and meshes with shape keys".into();
+        }
         let mat = o.transform.matrix();
         let inv = mat.inverse();
         let scale = (glam::Mat3::from_mat4(mat) * Vec3::ONE.normalize()).length().max(1e-6);
@@ -112,6 +121,13 @@ impl Viewport {
                 }
             }
             ed.snapshot();
+            if self.sculpt_ui.dyntopo && dyn_ok {
+                if let Some(pm) = ed.scene.get_mut(id).and_then(|o| o.mesh.as_mut()) {
+                    if pm.faces.iter().any(|f| f.len() != 3) {
+                        sc::to_triangles(pm);
+                    }
+                }
+            }
             self.sculpt_ui.stroke = Some(StrokeState { last: mouse - vec2(1000.0, 0.0), last_time: Instant::now(), start_mouse: mouse, grab, grab_at: mat.transform_point3(p) });
         }
         let Some((grab_at, start_mouse, last, last_time, has_grab)) = self.sculpt_ui.stroke.as_ref().map(|st| (st.grab_at, st.start_mouse, st.last, st.last_time, !st.grab.is_empty())) else { return true };
@@ -147,6 +163,18 @@ impl Viewport {
         let r_local = self.sculpt_ui.radius_px * self.world_per_pixel(mat.transform_point3(p)) / scale;
         let strength = self.sculpt_ui.strength * if held && moved < spacing { 0.35 } else { 1.0 };
         let sym = self.sculpt_ui.symmetry;
+        if self.sculpt_ui.dyntopo && dyn_ok {
+            if let Some(pm) = ed.scene.get_mut(id).and_then(|o| o.mesh.as_mut()) {
+                let l = r_local * self.sculpt_ui.detail;
+                let mut ch = sc::refine(pm, p, r_local, l);
+                if sym && p.x.abs() > r_local * 0.05 {
+                    ch |= sc::refine(pm, Vec3::new(-p.x, p.y, p.z), r_local, l);
+                }
+                if ch {
+                    self.sculpt_ui.adj = Some(((pm.faces.len(), pm.verts.len()), sc::adjacency(pm)));
+                }
+            }
+        }
         let adj = &self.sculpt_ui.adj.as_ref().unwrap().1;
         if let Some(pm) = ed.scene.get_mut(id).and_then(|o| o.mesh.as_mut()) {
             sc::dab(pm, adj, p, r_local, brush, strength, invert, fnrm);
@@ -186,5 +214,9 @@ impl Viewport {
         ui.add(egui::DragValue::new(&mut self.sculpt_ui.radius_px).range(4.0..=600.0).speed(1.0).prefix("r ").suffix(" px")).on_hover_text("Radius ([ and ])");
         ui.add(egui::DragValue::new(&mut self.sculpt_ui.strength).range(0.05..=1.0).speed(0.01).prefix("s ")).on_hover_text("Strength (Shift+[ and ])");
         ui.toggle_value(&mut self.sculpt_ui.symmetry, "X").on_hover_text("Mirror strokes across X");
+        ui.toggle_value(&mut self.sculpt_ui.dyntopo, "Dyntopo").on_hover_text("Dynamic topology: add detail where you sculpt (turns the mesh into triangles)");
+        if self.sculpt_ui.dyntopo {
+            ui.add(egui::DragValue::new(&mut self.sculpt_ui.detail).range(0.03..=0.5).speed(0.005).prefix("detail ")).on_hover_text("Edge length relative to the brush (smaller = finer)");
+        }
     }
 }

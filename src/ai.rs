@@ -424,10 +424,18 @@ pub const ACTIONS: &[&str] = &[
     "set_texture",
     "bump",
     "roughness_map",
+    "scatter",
+    "realize",
     "rig",
     "pose_mode",
     "pose_bone",
     "reset_pose",
+    "add_ik",
+    "cloth",
+    "remove_cloth",
+    "add_shape_key",
+    "set_shape_key",
+    "remove_shape_key",
     "weight_paint",
     "play_action",
     "set_action",
@@ -507,13 +515,28 @@ Each command is an object with "action" plus only the fields it needs:
 - bump: target, name = "auto" (bumps from the object's texture), a pattern / image / normal-map path, or
   "none"; number = strength (1 normal, 2-3 deep). Add "invert" to the name when light parts should be low.
   Use for "make the bricks bumpy", "rough stone surface", "add a normal map".
+- scatter: target = surface mesh (ground, terrain, planet), name = rock|tree|grass|bush|flower or an
+  existing object's name (it becomes the hidden template), number = count, scale = [min,max], seed, slope = max
+  steepness in degrees (30 keeps things on flat ground), align = true to stand along the surface (planets),
+  rotation = [tilt,tilt,spin]. Repeating it with the same target and name updates the scatter. realize: target
+  = scatter object (bake to a real mesh). "a forest" = tree scatter; "a rocky field" = rock scatter.
+- cloth: target = a plane / sheet above other objects (tablecloth, blanket, flag), name = pins: none | top |
+  corners | left | right (a flag pinned on the left), number = stiffness 0.1-1. It is simulated over the
+  timeline right away (the other meshes are colliders); then play. remove_cloth: target.
+- SHAPE KEYS: add_shape_key: target, name, plus a generated shape: scale = [x,y,z] around the centre
+  (squash [1.3,1.3,0.6], stretch [0.8,0.8,1.4]), vector = lean (offset at the top), power = inflate along
+  normals; it starts at value 1. set_shape_key: target, name, number = 0..1. Animate with set_frame,
+  set_shape_key, keyframe (target = the mesh). remove_shape_key: target, name.
 - ARMATURES: rig: target = mesh, number = bones (2-8; adds an armature fitted along the mesh and binds it
   with automatic weights, e.g. a snake 6, a tail 3, a tree trunk 4). add primitive "armature" (number = bones)
   adds a bone chain; parent a mesh to an armature to bind it. pose_bone: target = armature (or the rigged
   mesh), name = bone ("Bone.001", or "bone 2"), rotation = [x,y,z] degrees in the bone's axes (x bends
-  forward/back). reset_pose. weight_paint: target = rigged mesh, name = bone (opens Weight Paint so the user
+  forward/back). reset_pose. add_ik: target = armature, name = bone (the hand/foot end), number = chain length
+  (2 for arm or leg, 0 = to the root), object = existing target (otherwise an Empty "IK <bone>" is made at the
+  tip); then move / keyframe that target object to pose the limb. add primitive "empty" adds a target point. weight_paint: target = rigged mesh, name = bone (opens Weight Paint so the user
   can paint which parts a bone moves). play_action / set_action: target = armature or character, name =
-  action ("walk", "run": imported characters often have several); new_action: name. Animate a pose: set_frame, pose_bone…, keyframe (target = armature), repeat.
+  action ("walk", "run": imported characters often have several), number = cross-fade frames (default 6
+  while playing); new_action: name. Animate a pose: set_frame, pose_bone…, keyframe (target = armature), repeat.
 - roughness_map: target, name = "auto" (from its texture) | pattern | image path | "none"; number = base
   roughness. Makes the grooves matte and the tops shinier in renders.
 - MESH EDITING (Blender edit mode, works on the vertices/faces of one mesh object):
@@ -976,6 +999,9 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         "rig it" | "rig this" | "add a rig" | "add an armature" | "add armature" | "auto rig" => {
             return Some(vec![Command { action: "rig".into(), number: Some(4.0), ..Default::default() }]);
         }
+        "add trees" | "add a forest" | "scatter trees" | "plant trees" => return Some(vec![Command { action: "scatter".into(), name: Some("tree".into()), ..Default::default() }]),
+        "add rocks" | "scatter rocks" | "add some rocks" => return Some(vec![Command { action: "scatter".into(), name: Some("rock".into()), ..Default::default() }]),
+        "add grass" | "scatter grass" | "grow grass" => return Some(vec![Command { action: "scatter".into(), name: Some("grass".into()), ..Default::default() }]),
         "make it bumpy" | "add bumps" | "bumpy" | "add a normal map" | "add normal map" | "add bump" | "add bump map" | "make the texture bumpy" => {
             return Some(vec![Command { action: "bump".into(), name: Some("auto".into()), number: Some(1.0), ..Default::default() }]);
         }
@@ -1384,6 +1410,7 @@ mod tests {
         assert_eq!(parse_simple("add a brick texture").unwrap()[0].action, "set_texture");
         assert_eq!(parse_simple("make it bumpy").unwrap()[0].action, "bump");
         assert_eq!(parse_simple("rig it").unwrap()[0].action, "rig");
+        assert_eq!(parse_simple("add grass").unwrap()[0].action, "scatter");
         assert_eq!(parse_simple("add a cube").unwrap()[0].action, "add");
     }
     #[test]

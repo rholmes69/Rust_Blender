@@ -5,6 +5,9 @@
 
 mod agent;
 mod armature;
+mod scatter;
+mod shapekeys;
+mod physics;
 mod ai;
 mod app;
 mod editmesh;

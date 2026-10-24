@@ -428,6 +428,24 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
                 let eps = ((hi - lo).max_element() * 1e-5).max(1e-7);
                 // skin weights per position (welding keeps the first vertex at each position)
                 let skin_of_node = n["skin"].as_u64().map(|x| x as usize);
+                // morph targets: per original vertex deltas, mapped through the weld by position
+                let mut morph: Vec<(String, Vec<Vec3>)> = vec![];
+                let mut first_at: HashMap<(i64, i64, i64), usize> = HashMap::new();
+                if let Some(ts) = p["targets"].as_array().filter(|t| !t.is_empty()) {
+                    let q = |f: f32| (f / eps).round() as i64;
+                    for (i, v) in pm.verts.iter().enumerate() {
+                        first_at.entry((q(v.x), q(v.y), q(v.z))).or_insert(i);
+                    }
+                    for (ti, t) in ts.iter().enumerate() {
+                        let name = mesh["extras"]["targetNames"][ti].as_str().map(String::from).unwrap_or_else(|| format!("Key {}", ti + 1));
+                        let d = match t["POSITION"].as_u64() {
+                            Some(a) => doc.floats(a as usize)?.0,
+                            None => vec![],
+                        };
+                        let deltas: Vec<Vec3> = (0..nverts).map(|i| if d.len() >= i * 3 + 3 { icv(Vec3::new(d[i * 3], d[i * 3 + 1], d[i * 3 + 2])) } else { Vec3::ZERO }).collect();
+                        morph.push((name, deltas));
+                    }
+                }
                 let mut vweights: Option<HashMap<(i64, i64, i64), ([u16; 4], [f32; 4])>> = None;
                 if skin_of_node.is_some() {
                     if let (Some(ja), Some(wa)) = (p["attributes"]["JOINTS_0"].as_u64(), p["attributes"]["WEIGHTS_0"].as_u64()) {
@@ -461,6 +479,16 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
                 o.transform.location = icv(t);
                 o.transform.set_quat(icq(r));
                 o.transform.scale = ics(s);
+                if !morph.is_empty() {
+                    let q = |f: f32| (f / eps).round() as i64;
+                    let verts = pm_verts_of(o);
+                    let idx: Vec<Option<usize>> = verts.iter().map(|v| first_at.get(&(q(v.x), q(v.y), q(v.z))).copied()).collect();
+                    let weights: Vec<f32> = mesh["weights"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()).unwrap_or_default();
+                    for (k, (name, deltas)) in morph.iter().enumerate() {
+                        let kv: Vec<Vec3> = verts.iter().zip(&idx).map(|(v, i)| *v + i.map(|i| deltas[i]).unwrap_or(Vec3::ZERO)).collect();
+                        o.shape_keys.push(crate::shapekeys::ShapeKey { name: name.clone(), verts: kv, value: weights.get(k).copied().unwrap_or(0.0), keys: vec![] });
+                    }
+                }
                 if let (Some(si), Some(map)) = (skin_of_node, vweights) {
                     // skinned meshes are placed by their joints, not by their node
                     o.transform = crate::scene::Transform::default();
@@ -553,7 +581,7 @@ fn node_trs(n: &Value) -> (Vec3, Quat, Vec3) {
 }
 
 /// Sample an animation sampler at time `t` (LINEAR / STEP / CUBICSPLINE).
-fn sample_channel(times: &[f32], vals: &[f32], ncomp: usize, interp: &str, t: f32) -> Vec<f32> {
+fn sample_channel(times: &[f32], vals: &[f32], ncomp: usize, interp: &str, t: f32, quat: bool) -> Vec<f32> {
     let cubic = interp == "CUBICSPLINE";
     let stride = if cubic { ncomp * 3 } else { ncomp };
     let at = |k: usize| -> Vec<f32> {
@@ -587,7 +615,7 @@ fn sample_channel(times: &[f32], vals: &[f32], ncomp: usize, interp: &str, t: f3
                 .collect()
         }
         _ => {
-            if ncomp == 4 {
+            if quat && ncomp == 4 {
                 let qa = Quat::from_xyzw(a[0], a[1], a[2], a[3]).normalize();
                 let qb = Quat::from_xyzw(b[0], b[1], b[2], b[3]).normalize();
                 let q = qa.slerp(qb, u);
@@ -705,6 +733,7 @@ fn skins_and_animation(
                 rest: BonePose::from_matrix(local),
                 length: 0.0,
                 tail: None,
+                ik: None,
                 pose: BonePose::default(),
                 keys: vec![],
             });
@@ -782,10 +811,7 @@ fn skins_and_animation(
         let mut chans = vec![];
         for c in anim["channels"].as_array().into_iter().flatten() {
             let (Some(node), Some(path)) = (c["target"]["node"].as_u64().map(|x| x as usize), c["target"]["path"].as_str()) else { continue };
-            if node >= nn || !matches!(path, "translation" | "rotation" | "scale") {
-                if path == "weights" && !stats.notes.iter().any(|n| n == "morph targets") {
-                    stats.notes.push("morph targets".into());
-                }
+            if node >= nn || !matches!(path, "translation" | "rotation" | "scale" | "weights") {
                 continue;
             }
             let smp = &anim["samplers"][c["sampler"].as_u64().unwrap_or(0) as usize];
@@ -815,13 +841,35 @@ fn skins_and_animation(
         };
         let keyed_nodes: Vec<usize> = if ai == 0 { node_ids.keys().copied().filter(|n| moved(*n)).collect() } else { vec![] };
         let mut obj_keys: HashMap<u64, Vec<crate::scene::Keyframe>> = HashMap::new();
+        let mut any_weights = false;
+        // shape-key animation comes from the first animation that has some
+        let weights_done = scene.objects.iter().any(|o| o.shape_keys.iter().any(|k| !k.keys.is_empty()));
+        let chans: Vec<&Ch> = chans.iter().filter(|c| c.path != "weights" || !weights_done).collect();
         let mut bone_keys: HashMap<u64, Vec<Vec<BoneKey>>> = HashMap::new();
         for f in 0..nframes {
             let t = tmin + f as f32 / fps;
+            let frame = 1 + f as i32;
             let mut trs = base_trs.clone();
-            for c in &chans {
+            for c in chans.iter().filter(|c| c.path == "weights") {
+                let nt = node_ids.get(&c.node).and_then(|ids| ids.iter().filter_map(|id| scene.get(*id)).map(|o| o.shape_keys.len()).max()).unwrap_or(0);
+                if nt == 0 {
+                    continue;
+                }
+                let v = sample_channel(&c.times, &c.vals, nt, &c.interp, t, false);
+                for id in &node_ids[&c.node] {
+                    if let Some(o) = scene.get_mut(*id) {
+                        for (k, sk) in o.shape_keys.iter_mut().enumerate() {
+                            if let Some(w) = v.get(k) {
+                                sk.keys.push((frame, *w));
+                            }
+                        }
+                        any_weights = true;
+                    }
+                }
+            }
+            for c in chans.iter().filter(|c| c.path != "weights") {
                 let nc = if c.path == "rotation" { 4 } else { 3 };
-                let v = sample_channel(&c.times, &c.vals, nc, &c.interp, t);
+                let v = sample_channel(&c.times, &c.vals, nc, &c.interp, t, c.path == "rotation");
                 match c.path.as_str() {
                     "translation" => trs[c.node].0 = Vec3::new(v[0], v[1], v[2]),
                     "rotation" => trs[c.node].1 = Quat::from_xyzw(v[0], v[1], v[2], v[3]).normalize(),
@@ -829,7 +877,6 @@ fn skins_and_animation(
                 }
             }
             let locals: Vec<Mat4> = trs.iter().map(|(t, r, s)| Mat4::from_scale_rotation_translation(*s, *r, *t)).collect();
-            let frame = 1 + f as i32;
             for (aid, bone_nodes, _) in arms.iter().flatten() {
                 let gw: Vec<Mat4> = bone_nodes.iter().map(|n| cv(world(&locals, *n))).collect();
                 let Some(arm) = scene.get(*aid).and_then(|o| o.armature.as_ref()) else { continue };
@@ -880,6 +927,17 @@ fn skins_and_animation(
             }
             if any {
                 actions.entry(aid).or_default().push(crate::armature::Action { name: aname.clone(), keys });
+            }
+        }
+        if any_weights {
+            keyed += 1;
+            for o in scene.objects.iter_mut() {
+                for k in &mut o.shape_keys {
+                    if k.keys.windows(2).all(|w| w[0].1 == w[1].1) {
+                        k.keys.clear();
+                    }
+                }
+                o.evaluate(1);
             }
         }
         if first_summary.is_none() && keyed + bones_keyed > 0 {
@@ -1086,7 +1144,7 @@ mod anim_tests {
     #[test]
     fn skins_and_animations() {
         let Ok(dir) = std::env::var("RB_MODELS") else { return };
-        for (name, want_arm) in [("RiggedSimple", true), ("CesiumMan", true), ("Fox", true), ("RiggedFigure", true), ("BoxAnimated", false)] {
+        for (name, want_arm) in [("RiggedSimple", true), ("CesiumMan", true), ("Fox", true), ("RiggedFigure", true), ("BoxAnimated", false), ("AnimatedMorphCube", false)] {
             let mut sc = crate::scene::Scene::default();
             sc.objects.clear();
             let (st, _) = super::import_file(&mut sc, &std::path::Path::new(&dir).join(format!("{name}.glb"))).unwrap();
@@ -1103,6 +1161,11 @@ mod anim_tests {
                 assert_eq!(sc2.objects.iter().find_map(|o| o.armature.as_ref()).unwrap().actions.len(), 3);
             }
             assert!(st.animation.is_some(), "{name} has an animation");
+            if name == "AnimatedMorphCube" {
+                let o = sc.objects.iter().find(|o| !o.shape_keys.is_empty()).expect("shape keys");
+                assert_eq!(o.shape_keys.len(), 2);
+                assert!(o.shape_keys.iter().any(|k| k.keys.len() > 2), "animated weights");
+            }
             let arms = sc.objects.iter().filter(|o| o.armature.is_some()).count();
             assert_eq!(arms > 0, want_arm, "{name}");
             // bind pose consistency: rest position reproduces the mesh
@@ -1124,7 +1187,7 @@ mod anim_tests {
             // animation moves things
             let snap = |sc: &mut crate::scene::Scene, f: i32| -> Vec<glam::Vec3> {
                 sc.evaluate(f);
-                sc.update_skins();
+                sc.update_derived();
                 sc.objects.iter().flat_map(|o| o.posed.as_ref().map(|p| p.verts.clone()).unwrap_or_else(|| vec![o.transform.location])).collect()
             };
             let a = snap(&mut sc, 1);

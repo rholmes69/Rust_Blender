@@ -60,6 +60,9 @@ pub struct Bone {
     /// Tail in the bone's own space when it doesn't point along +Y (imported skeletons).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail: Option<Vec3>,
+    /// Inverse kinematics: this bone's tail reaches for an object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ik: Option<Ik>,
     #[serde(default)]
     pub pose: BonePose,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -83,6 +86,22 @@ pub struct Armature {
     pub actions: Vec<Action>,
     #[serde(default)]
     pub active_action: usize,
+    /// Hash of the last IK solve's inputs+result (skip re-solving when nothing moved).
+    #[serde(skip)]
+    pub ik_key: u64,
+    /// Cross-fade after switching actions: the pose we came from, start frame, length.
+    #[serde(skip)]
+    pub blend: Option<(Vec<BonePose>, f32, f32)>,
+    #[serde(skip)]
+    pub blend_last: f32,
+}
+
+/// IK constraint: rotate this bone and `chain - 1` parents (0 = up to the root) so the bone's
+/// tail touches the `target` object.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Ik {
+    pub target: u64,
+    pub chain: u32,
 }
 
 /// A named set of bone keys (Blender's Action).
@@ -114,6 +133,7 @@ impl Armature {
                 rest: if i == 0 { BonePose { rot: Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), ..Default::default() } } else { BonePose { loc: Vec3::new(0.0, len, 0.0), ..Default::default() } },
                 length: len,
                 tail: None,
+                ik: None,
                 pose: BonePose::default(),
                 keys: vec![],
             })
@@ -164,6 +184,51 @@ impl Armature {
                 (head, g.transform_point3(b.tail_local()))
             })
             .collect()
+    }
+
+    // ---- inverse kinematics ----
+
+    /// Bones of an IK chain from the tip up.
+    pub fn ik_chain(&self, tip: usize, chain: u32) -> Vec<usize> {
+        let mut ids = vec![tip];
+        let mut b = tip;
+        while let Some(p) = self.bones[b].parent {
+            if chain > 0 && ids.len() >= chain as usize {
+                break;
+            }
+            ids.push(p);
+            b = p;
+        }
+        ids
+    }
+
+    /// Cyclic coordinate descent: turn the chain so the tail of `tip` reaches `goal`
+    /// (armature space). Returns the remaining distance.
+    pub fn solve_ik(&mut self, tip: usize, goal: Vec3, chain: u32) -> f32 {
+        let ids = self.ik_chain(tip, chain);
+        let tip_pos = |a: &Armature| a.pose_globals()[tip].transform_point3(a.bones[tip].tail_local());
+        for _ in 0..32 {
+            for &j in &ids {
+                let g = self.pose_globals();
+                let t = g[tip].transform_point3(self.bones[tip].tail_local());
+                if t.distance(goal) < 1e-5 {
+                    return 0.0;
+                }
+                let head = g[j].w_axis.truncate();
+                let (a, b) = (t - head, goal - head);
+                if a.length() < 1e-6 || b.length() < 1e-6 {
+                    continue;
+                }
+                let q = Quat::from_rotation_arc(a.normalize(), b.normalize());
+                let pre = match self.bones[j].parent {
+                    Some(p) => g[p] * self.bones[j].rest.matrix(),
+                    None => self.bones[j].rest.matrix(),
+                };
+                let br = pre.to_scale_rotation_translation().1;
+                self.bones[j].pose.rot = (br.inverse() * q * br * self.bones[j].pose.rot).normalize();
+            }
+        }
+        tip_pos(self).distance(goal)
     }
 
     // ---- actions ----
@@ -307,7 +372,7 @@ impl Armature {
             k += 1;
             name = format!("Bone.{k:03}");
         }
-        self.bones.push(Bone { name, parent, rest: BonePose::default(), length: head.distance(tail).max(1e-4), tail: None, pose: BonePose::default(), keys: vec![] });
+        self.bones.push(Bone { name, parent, rest: BonePose::default(), length: head.distance(tail).max(1e-4), tail: None, ik: None, pose: BonePose::default(), keys: vec![] });
         for a in &mut self.actions {
             a.keys.resize(self.bones.len(), vec![]);
         }
@@ -376,6 +441,31 @@ impl Armature {
                 b.pose = p;
             }
         }
+        let back = frame < self.blend_last;
+        self.blend_last = frame;
+        if let Some((from, start, len)) = &self.blend {
+            let t = (frame - start) / len.max(1.0);
+            if !back && (0.0..1.0).contains(&t) && from.len() == self.bones.len() {
+                let t = t * t * (3.0 - 2.0 * t);
+                for (b, f) in self.bones.iter_mut().zip(from) {
+                    b.pose = f.lerp(&b.pose, t);
+                }
+            } else {
+                self.blend = None;
+            }
+        }
+    }
+
+    /// Switch action with a cross-fade of `frames` from the current pose (starting at `start`).
+    pub fn set_action_blended(&mut self, i: usize, start: f32, frames: f32) -> Option<(i32, i32)> {
+        let from: Vec<BonePose> = self.bones.iter().map(|b| b.pose).collect();
+        let r = self.set_action(i);
+        if frames >= 1.0 {
+            self.blend = Some((from, start, frames));
+            self.blend_last = start;
+            self.evaluate(start);
+        }
+        r
     }
 
     pub fn reset_pose(&mut self) {
@@ -689,6 +779,14 @@ mod tests {
         assert_eq!(a.set_action(0), Some((1, 1)));
         assert!(a.bones[1].pose.rot.angle_between(Quat::from_rotation_x(0.5)) < 1e-4);
         assert_eq!(a.set_action(a.find_action("walk").unwrap()), Some((5, 5)));
+        // cross-fade: halfway through the blend the pose is between the two actions
+        a.set_action(0);
+        a.set_action_blended(1, 1.0, 8.0);
+        a.evaluate(5.0);
+        let mid = a.bones[1].pose.rot.angle_between(Quat::IDENTITY);
+        assert!(mid < 0.3, "blending passes through the middle: {mid}");
+        a.evaluate(20.0);
+        assert!(a.blend.is_none());
         assert!(a.bones[1].pose.rot.angle_between(Quat::from_rotation_x(-0.5)) < 1e-4);
         assert_eq!(weight_color(1.0), [1.0, 0.0, 0.0]);
         assert_eq!(arm.find("Bone.000"), Some(0));

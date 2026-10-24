@@ -2157,6 +2157,32 @@ impl App {
                                 self.ed.execute(&[Command { action: "unwrap".into(), name: Some("smart".into()), ..Default::default() }]);
                             }
                             ui.separator();
+                            ui.menu_button("Scatter", |ui| {
+                                for (label, what) in [("Rocks", "rock"), ("Trees", "tree"), ("Grass", "grass"), ("Bushes", "bush"), ("Flowers", "flower")] {
+                                    if ui.button(format!("{label} on the active object")).clicked() {
+                                        let log = self.ed.execute(&[Command { action: "scatter".into(), name: Some(what.into()), ..Default::default() }]);
+                                        if let Some(l) = log.first() {
+                                            self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                if ui.button("Selected on Active").on_hover_text("Copies of the other selected object spread over the active one").clicked() {
+                                    let other = self.ed.selection.iter().copied().find(|id| Some(*id) != self.ed.active).and_then(|id| self.ed.scene.get(id)).map(|o| o.name.clone());
+                                    let log = match other {
+                                        Some(n) => self.ed.execute(&[Command { action: "scatter".into(), object: Some(n), ..Default::default() }]),
+                                        None => vec!["✖ select the object to scatter, then (Shift) the surface last".into()],
+                                    };
+                                    if let Some(l) = log.first() {
+                                        self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                                    }
+                                    ui.close();
+                                }
+                                if ui.button("Make Real").on_hover_text("Turn the active scatter into an ordinary mesh").clicked() {
+                                    self.ed.execute(&[Command::new("realize")]);
+                                    ui.close();
+                                }
+                            });
                             ui.menu_button("Rig", |ui| {
                                 for n in [2usize, 3, 4, 6, 8] {
                                     if ui.button(format!("Auto Rig · {n} bones")).on_hover_text("Add an armature fitted to the active mesh and bind it with automatic weights").clicked() {
@@ -3455,6 +3481,7 @@ impl App {
                             ("🎥", Color32::from_rgb(140, 200, 255))
                         }
                         crate::scene::ObjectKind::Armature => ("🏃", Color32::from_rgb(170, 220, 170)),
+                        crate::scene::ObjectKind::Empty => ("✛", Color32::from_rgb(200, 200, 200)),
                     };
                     p.text(
                         rect.left_center() + vec2(14.0, 0.0),
@@ -3680,6 +3707,67 @@ impl App {
                         PropsTab::Modifiers => modifier_props(ui, &mut o),
                         PropsTab::Material => tex_action = material_props(ui, &mut o, &self.ed.scene.textures),
                         _ => {}
+                    }
+                    if let Some(a) = ui.ctx().data_mut(|d| d.remove_temp::<String>(egui::Id::unique("cloth_action"))) {
+                        // keep slider edits, then run the bake
+                        if o != orig {
+                            self.ed.snapshot();
+                            *self.ed.scene.get_mut(id).unwrap() = o.clone();
+                        }
+                        let cmd = match a.as_str() {
+                            "<remove>" => Command { action: "remove_cloth".into(), target: Some(o.name.clone()), ..Default::default() },
+                            "<bake>" => Command { action: "bake_cloth".into(), target: Some(o.name.clone()), ..Default::default() },
+                            pins => Command { action: "cloth".into(), target: Some(o.name.clone()), name: Some(pins.into()), ..Default::default() },
+                        };
+                        let log = self.ed.execute(&[cmd]);
+                        if let Some(l) = log.first() {
+                            self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                        }
+                        return;
+                    }
+                    if let Some((a, i)) = ui.ctx().data_mut(|d| d.remove_temp::<(String, usize)>(egui::Id::unique("shape_action"))) {
+                        let r = match a.as_str() {
+                            "add" => {
+                                self.ed.snapshot();
+                                self.ed.add_shape_key(id, "Key").and_then(|k| {
+                                    self.ed.begin_shape_edit(id, k)?;
+                                    self.ed.enter_edit(id)
+                                }).map(|_| "New shape key: edit or sculpt it, Tab to store".to_string())
+                            }
+                            "edit" => {
+                                self.ed.snapshot();
+                                self.ed.begin_shape_edit(id, i).and_then(|m| self.ed.enter_edit(id).map(|_| m))
+                            }
+                            "finish" => {
+                                self.ed.exit_edit();
+                                self.ed.sculpt = None;
+                                Ok("Stored the shape".into())
+                            }
+                            "key" => {
+                                self.ed.snapshot();
+                                let f = self.ed.frame;
+                                if let Some(k) = self.ed.scene.get_mut(id).and_then(|o| o.shape_keys.get_mut(i)) {
+                                    k.insert_key(f);
+                                }
+                                Ok(format!("Keyed the shape at frame {f}"))
+                            }
+                            _ => {
+                                self.ed.snapshot();
+                                self.ed.finish_shape_edit();
+                                if let Some(o) = self.ed.scene.get_mut(id) {
+                                    if i < o.shape_keys.len() {
+                                        o.shape_keys.remove(i);
+                                    }
+                                    o.posed_key = 0;
+                                }
+                                Ok("Removed the shape key".into())
+                            }
+                        };
+                        match r {
+                            Ok(m) => self.toast(m, theme::OK),
+                            Err(e) => self.toast(e, theme::WARN),
+                        }
+                        return;
                     }
                     if let Some(spec) = tex_action {
                         let pick = || match rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file() {
@@ -4725,8 +4813,13 @@ fn object_props(ui: &mut Ui, o: &mut crate::scene::Object) {
                 );
             });
         }
-        crate::scene::ObjectKind::Mesh => {}
+        crate::scene::ObjectKind::Mesh => {
+            scatter_props(ui, o);
+            shape_key_props(ui, o);
+            cloth_props(ui, o);
+        }
         crate::scene::ObjectKind::Armature => armature_props(ui, o),
+        crate::scene::ObjectKind::Empty => {}
     }
     if o.is_mesh() {
         section(ui, "Mesh", |ui| {
@@ -5006,6 +5099,112 @@ fn material_props(ui: &mut Ui, o: &mut crate::scene::Object, textures: &[crate::
     action
 }
 
+fn shape_key_props(ui: &mut Ui, o: &mut crate::scene::Object) {
+    if !o.is_mesh() || o.scatter.is_some() {
+        return;
+    }
+    let editing = o.shape_editing;
+    section(ui, "Shape Keys", |ui| {
+        let mut act: Option<(&str, usize)> = None;
+        for (i, k) in o.shape_keys.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&k.name).small());
+                ui.add_enabled(!editing, egui::Slider::new(&mut k.value, 0.0..=1.0).show_value(true));
+                if ui.small_button("✎").on_hover_text("Edit or sculpt this shape").clicked() {
+                    act = Some(("edit", i));
+                }
+                if ui.small_button("◆").on_hover_text("Keyframe the value at the current frame").clicked() {
+                    act = Some(("key", i));
+                }
+                if ui.small_button("✖").on_hover_text("Remove").clicked() {
+                    act = Some(("remove", i));
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            if ui.button("+ Add Shape Key").clicked() {
+                act = Some(("add", 0));
+            }
+            if editing && ui.button("Finish editing").clicked() {
+                act = Some(("finish", 0));
+            }
+        });
+        if let Some(a) = act {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("shape_action"), (a.0.to_string(), a.1)));
+        }
+        if o.shape_keys.is_empty() {
+            ui.label(RichText::new("Shapes to blend (expressions, squash & stretch); animate their values with ◆.").small().color(theme::TEXT_DIM));
+        }
+    });
+}
+
+fn cloth_props(ui: &mut Ui, o: &mut crate::scene::Object) {
+    if o.scatter.is_some() || o.skin.is_some() {
+        return;
+    }
+    section(ui, "Physics", |ui| {
+        let mut act: Option<String> = None;
+        match o.cloth.as_mut() {
+            None => {
+                ui.horizontal_wrapped(|ui| {
+                    for (l, pins) in [("Cloth", "none"), ("Cloth · pin top", "top"), ("Cloth · pin corners", "corners"), ("Flag (pin left)", "left")] {
+                        if ui.button(l).clicked() {
+                            act = Some(pins.into());
+                        }
+                    }
+                });
+                ui.label(RichText::new("Drapes over the other meshes (spheres stay round, everything else is a box) and is baked for the timeline's frames.").small().color(theme::TEXT_DIM));
+            }
+            Some(c) => {
+                ui.add(egui::Slider::new(&mut c.stiffness, 0.05..=1.0).text("Stiffness"));
+                ui.add(egui::Slider::new(&mut c.bending, 0.0..=1.0).text("Bending"));
+                ui.add(egui::Slider::new(&mut c.damping, 0.9..=1.0).text("Air (keep)"));
+                ui.add(egui::Slider::new(&mut c.gravity, 0.0..=30.0).text("Gravity"));
+                ui.label(RichText::new(format!("{} pinned · {} baked frames", c.pins.len(), c.cache.len())).small().color(theme::TEXT_DIM));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Bake").clicked() {
+                        act = Some("<bake>".into());
+                    }
+                    egui::ComboBox::from_id_salt("pins").selected_text("Pin…").show_ui(ui, |ui| {
+                        for p in ["none", "top", "corners", "left", "right", "front", "back", "selected"] {
+                            if ui.selectable_label(false, p).clicked() {
+                                act = Some(p.into());
+                            }
+                        }
+                    });
+                    if ui.button("Remove").clicked() {
+                        act = Some("<remove>".into());
+                    }
+                });
+            }
+        }
+        if let Some(a) = act {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("cloth_action"), a));
+        }
+    });
+}
+
+fn scatter_props(ui: &mut Ui, o: &mut crate::scene::Object) {
+    let Some(sc) = o.scatter.as_mut() else { return };
+    section(ui, "Scatter", |ui| {
+        ui.add(egui::Slider::new(&mut sc.count, 1..=5000).logarithmic(true).text("Count"));
+        ui.add(egui::DragValue::new(&mut sc.seed).prefix("Seed "));
+        ui.horizontal(|ui| {
+            ui.label("Scale");
+            ui.add(egui::DragValue::new(&mut sc.scale_min).range(0.01..=100.0).speed(0.01).prefix("min "));
+            ui.add(egui::DragValue::new(&mut sc.scale_max).range(0.01..=100.0).speed(0.01).prefix("max "));
+        });
+        if sc.scale_max < sc.scale_min {
+            sc.scale_max = sc.scale_min;
+        }
+        ui.add(egui::Slider::new(&mut sc.spin, 0.0..=360.0).text("Random spin °"));
+        ui.add(egui::Slider::new(&mut sc.tilt, 0.0..=90.0).text("Random tilt °"));
+        ui.add(egui::Slider::new(&mut sc.max_slope, 0.0..=180.0).text("Max slope °"));
+        ui.checkbox(&mut sc.align, "Align to surface normal");
+        ui.label(RichText::new("Edit the hidden source object (outliner) to change every copy. Object ▸ Scatter ▸ Make Real bakes it.").small().color(theme::TEXT_DIM));
+    });
+}
+
 fn armature_props(ui: &mut Ui, o: &mut crate::scene::Object) {
     let Some(arm) = o.armature.as_mut() else { return };
     section(ui, "Armature", |ui| {
@@ -5026,7 +5225,9 @@ fn armature_props(ui: &mut Ui, o: &mut crate::scene::Object) {
                 }
             }
             if let Some(i) = pick {
-                arm.set_action(i);
+                // cross-fade into the new action
+                let start = arm.actions.get(i).and_then(|a| a.range()).map(|r| r.0 as f32).unwrap_or(1.0);
+                arm.set_action_blended(i, start, 6.0);
             }
             if ui.small_button("New Action").clicked() {
                 arm.new_action("Action");

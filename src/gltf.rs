@@ -199,6 +199,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     // animations: index 0 holds object keys (and the first action); more actions follow
     let mut anim_names: Vec<Option<String>> = vec![None];
     let mut extra: Vec<(Vec<Value>, Vec<Value>)> = vec![];
+    let mut pending_weights: Vec<(usize, usize)> = vec![];
     // skinned meshes are exported in their rest shape when their armature is exported too
     let exports_skin = |o: &crate::scene::Object| -> bool {
         o.skin.as_ref().is_some_and(|sk| {
@@ -214,6 +215,9 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         };
         let special = matches!(o.kind, ObjectKind::Light(_) | ObjectKind::Camera(_));
         let skin_rest = o.is_mesh() && exports_skin(o);
+        // shape keys export as morph targets of the basis mesh
+        let morphs = o.is_mesh() && o.mesh.as_ref().is_some_and(|m| o.shape_keys.iter().any(|k| k.verts.len() == m.verts.len()));
+        let base_shape = skin_rest || morphs;
         let r = rot(t.quat(), special);
         let tr = cv(t.location);
         node["translation"] = json!([tr.x, tr.y, tr.z]);
@@ -225,7 +229,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         match &o.kind {
             ObjectKind::Mesh => {
                 // rigged meshes: the rest shape (the viewer skins it); others: as displayed
-                let mesh = if skin_rest { o.mesh.as_ref().unwrap().to_mesh_opts(o.smooth(), o.auto_smooth) } else { cache.for_object(o) };
+                let mesh = if base_shape { o.mesh.as_ref().unwrap().to_mesh_opts(o.smooth(), o.auto_smooth) } else { cache.for_object(o) };
                 let (mut pos, mut nrm, mut idx) = (vec![], vec![], vec![]);
                 let mut src: Vec<u32> = vec![];
                 let mut uvs: Vec<[f32; 2]> = vec![];
@@ -233,7 +237,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 let ntex = scene.texture(o.material.normal_tex);
                 let rtex = scene.texture(o.material.rough_tex);
                 let textured = tex.is_some() || ntex.is_some() || rtex.is_some();
-                let insts = if skin_rest { vec![glam::Mat4::IDENTITY] } else { o.instance_matrices() };
+                let insts = if base_shape { vec![glam::Mat4::IDENTITY] } else { o.instance_matrices() };
                 for inst in insts {
                     let nm = Mat3::from_mat4(inst).inverse().transpose();
                     let flip = inst.determinant() < 0.0;
@@ -358,7 +362,42 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                         node.as_object_mut().unwrap().remove(k);
                     }
                 }
-                meshes.push(json!({"name": o.name, "primitives": [{"attributes": attrs, "indices": ia, "material": materials.len() - 1, "mode": 4}]}));
+                let mut prim = json!({"attributes": attrs, "indices": ia, "material": materials.len() - 1, "mode": 4});
+                let mut mj = json!({"name": o.name});
+                if morphs {
+                    let basis = &o.mesh.as_ref().unwrap().verts;
+                    let keys: Vec<&crate::shapekeys::ShapeKey> = o.shape_keys.iter().filter(|k| k.verts.len() == basis.len()).collect();
+                    let targets: Vec<Value> = keys
+                        .iter()
+                        .map(|k| {
+                            let d: Vec<Vec3> = src.iter().map(|i| cv(k.verts[*i as usize] - basis[*i as usize])).collect();
+                            json!({"POSITION": bin.vec3s(&d, Some(34962))})
+                        })
+                        .collect();
+                    prim["targets"] = json!(targets);
+                    mj["weights"] = json!(keys.iter().map(|k| k.value).collect::<Vec<_>>());
+                    mj["extras"] = json!({"targetNames": keys.iter().map(|k| k.name.clone()).collect::<Vec<_>>()});
+                    // animated values
+                    let keyed: Vec<&&crate::shapekeys::ShapeKey> = keys.iter().filter(|k| k.keys.len() >= 2).collect();
+                    if !keyed.is_empty() {
+                        let f0 = keyed.iter().map(|k| k.keys[0].0).min().unwrap();
+                        let f1 = keyed.iter().map(|k| k.keys.last().unwrap().0).max().unwrap();
+                        let fps = scene.fps.max(1) as f32;
+                        let mut times = vec![];
+                        let mut vals = vec![];
+                        for f in f0..=f1 {
+                            times.push((f - f0) as f32 / fps);
+                            for k in &keys {
+                                vals.push(k.sample(f as f32).unwrap_or(k.value));
+                            }
+                        }
+                        let input = bin.scalars(&times);
+                        let out = bin.scalars(&vals);
+                        pending_weights.push((input, out));
+                    }
+                }
+                mj["primitives"] = json!([prim]);
+                meshes.push(mj);
                 node["mesh"] = json!(meshes.len() - 1);
             }
             ObjectKind::Light(l) => {
@@ -380,6 +419,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 lights.push(lj);
                 node["extensions"] = json!({"KHR_lights_punctual": {"light": lights.len() - 1}});
             }
+            ObjectKind::Empty => {}
             ObjectKind::Armature => {
                 if let Some(arm) = &o.armature {
                     let mut ids = vec![];
@@ -411,6 +451,10 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         nodes.push(node);
         let ni = nodes.len() - 1;
         node_of.insert(o.id, ni);
+        for (input, out) in pending_weights.drain(..) {
+            samplers.push(json!({"input": input, "output": out, "interpolation": "LINEAR"}));
+            channels.push(json!({"sampler": samplers.len() - 1, "target": {"node": ni, "path": "weights"}}));
+        }
         if skin_rest && nodes[ni].get("mesh").is_some() {
             skinned.push((ni, o.id));
         }

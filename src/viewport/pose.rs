@@ -7,6 +7,8 @@ use glam::Quat;
 #[derive(Default)]
 pub struct PoseUi {
     modal: Option<PoseModal>,
+    /// moving an IK target: (object, original location, start mouse)
+    target: Option<(u64, Vec3, Pos2)>,
 }
 
 struct PoseModal {
@@ -107,6 +109,29 @@ impl Viewport {
         use egui::Modifiers as M;
         let c = |m: M, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
 
+        // ---- moving an IK target ----
+        if let Some((t, orig, start)) = self.pose_ui.target {
+            if ctx.input(|i| i.key_pressed(Key::Escape) || i.pointer.secondary_pressed()) {
+                if let Some(o) = ed.scene.get_mut(t) {
+                    o.transform.location = orig;
+                }
+                self.pose_ui.target = None;
+                return true;
+            }
+            let wpp = self.world_per_pixel(orig);
+            let d = mouse - start;
+            if let Some(o) = ed.scene.get_mut(t) {
+                o.transform.location = orig + (self.cam.right() * d.x - self.cam.up() * d.y) * wpp;
+            }
+            ed.dirty = true;
+            ctx.request_repaint();
+            self.status_hint = "Move IK target · LMB/Enter confirm · RMB/Esc cancel".into();
+            if ctx.input(|i| i.pointer.primary_pressed() || i.key_pressed(Key::Enter)) {
+                self.pose_ui.target = None;
+            }
+            return true;
+        }
+
         // ---- modal rotate / grab ----
         if let Some(m) = &self.pose_ui.modal {
             let (bone, orig) = (m.bone, m.orig);
@@ -154,7 +179,7 @@ impl Viewport {
 
         let bone = ed.active_bone;
         let bname = arm.bones[bone].name.clone();
-        self.status_hint = format!("Pose Mode · bone \"{bname}\" · click a bone to select · R rotate · G move · Alt+R / Alt+G clear · I keyframe · Ctrl+Tab exit");
+        self.status_hint = format!("Pose Mode · bone \"{bname}\" · click a bone to select · R rotate · G move · Alt+R / Alt+G clear · Shift+I add IK · Alt+I remove · I keyframe · Ctrl+Tab exit");
         if !typing && resp.hovered() {
             let start = |rotate: bool, this: &mut Self, ed: &mut Editor| {
                 let o = ed.scene.get(id).unwrap();
@@ -177,6 +202,28 @@ impl Viewport {
                     }
                 }
                 ed.dirty = true;
+                return true;
+            }
+            if c(M::SHIFT, Key::I) {
+                ed.snapshot();
+                let r = ed.add_ik(id, bone, 2, None).map(|t| format!("IK on the bone: move \"{t}\" (or G here) to pose the chain"));
+                self.report(r);
+                return true;
+            }
+            if c(M::ALT, Key::I) {
+                ed.snapshot();
+                if let Some(b) = ed.scene.get_mut(id).and_then(|o| o.armature.as_mut()).and_then(|a| a.bones.get_mut(bone)) {
+                    b.ik = None;
+                }
+                return true;
+            }
+            // G on an IK bone moves its target
+            let ik_target = arm.bones[bone].ik.map(|k| k.target).filter(|t| ed.scene.get(*t).is_some());
+            if let Some(t) = ik_target.filter(|_| ctx.input(|i| i.key_pressed(Key::G) && i.modifiers.is_none())) {
+                ctx.input_mut(|i| i.consume_key(M::NONE, Key::G));
+                ed.snapshot();
+                let at = ed.scene.get(t).unwrap().transform.location;
+                self.pose_ui.target = Some((t, at, mouse));
                 return true;
             }
             if c(M::NONE, Key::R) {
@@ -219,6 +266,11 @@ impl Viewport {
         }
         if let Some(a) = ed.scene.get_mut(id).and_then(|o| o.armature.as_mut()) {
             ui.toggle_value(&mut a.rest_position, "Rest").on_hover_text("Show the rest position");
+            if let Some(ik) = a.bones.get_mut(sel).and_then(|b| b.ik.as_mut()) {
+                ui.separator();
+                ui.label(egui::RichText::new("IK").size(12.0));
+                ui.add(egui::DragValue::new(&mut ik.chain).range(0..=32).prefix("chain ")).on_hover_text("Bones the IK turns (0 = up to the root)");
+            }
         }
     }
 }

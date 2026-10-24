@@ -67,6 +67,8 @@ pub struct Editor {
     /// Armature in Edit Mode (rest bones) and the selected part of `active_bone`.
     pub bone_edit: Option<u64>,
     pub bone_part: crate::armature::BonePart,
+    /// Shape key being edited: (object, key index, basis positions to restore).
+    pub shape_edit: Option<(u64, usize, Vec<Vec3>)>,
     /// Last known world matrix per object, used to make children follow their parents.
     parent_cache: std::collections::HashMap<u64, glam::Mat4>,
     /// True while a command batch runs (the batch owns the undo step).
@@ -99,6 +101,7 @@ impl Default for Editor {
             weight_paint: None,
             bone_edit: None,
             bone_part: Default::default(),
+            shape_edit: None,
             in_batch: false,
         }
     }
@@ -228,6 +231,135 @@ impl Editor {
     /// Skins bound to an armature (for edits that must keep meshes in place).
     pub fn skins_of(&self, arm_id: u64) -> Vec<(u64, crate::armature::Skin)> {
         self.scene.objects.iter().filter_map(|o| o.skin.as_ref().filter(|s| s.armature == arm_id).map(|s| (o.id, s.clone()))).collect()
+    }
+
+    /// A ready-made object to scatter ("rock", "tree", "grass", "bush" or any primitive),
+    /// created hidden at the origin with its base at z = 0.
+    fn scatter_preset(&mut self, spec: &str) -> Result<(u64, ScatterPreset), String> {
+        use crate::mesh::Primitive;
+        let low = spec.to_lowercase();
+        let (prim, detail, scale, color, rough, base, preset) = if low.contains("rock") || low.contains("stone") || low.contains("boulder") || low.contains("pebble") {
+            (Primitive::IcoSphere, 1, Vec3::new(0.35, 0.3, 0.22), [0.42, 0.4, 0.37], 0.9, 0.3, ScatterPreset { count: 60, scale: (0.4, 1.6), tilt: 30.0 })
+        } else if low.contains("tree") || low.contains("pine") || low.contains("forest") {
+            (Primitive::Cone, 2, Vec3::new(0.35, 0.35, 0.95), [0.13, 0.36, 0.14], 0.8, 1.0, ScatterPreset { count: 30, scale: (0.7, 1.4), tilt: 4.0 })
+        } else if low.contains("grass") || low.contains("blade") {
+            (Primitive::Cone, 1, Vec3::new(0.025, 0.025, 0.22), [0.25, 0.55, 0.15], 0.7, 1.0, ScatterPreset { count: 1500, scale: (0.6, 1.4), tilt: 25.0 })
+        } else if low.contains("bush") || low.contains("shrub") {
+            (Primitive::IcoSphere, 2, Vec3::new(0.45, 0.45, 0.35), [0.18, 0.42, 0.16], 0.9, 0.6, ScatterPreset { count: 40, scale: (0.6, 1.4), tilt: 10.0 })
+        } else if low.contains("flower") {
+            (Primitive::UvSphere, 1, Vec3::splat(0.06), [0.95, 0.4, 0.6], 0.6, 2.0, ScatterPreset { count: 300, scale: (0.7, 1.3), tilt: 10.0 })
+        } else if let Some(p) = Primitive::parse(&low) {
+            (p, 2, Vec3::splat(0.25), [0.8, 0.8, 0.8], 0.5, 1.0, ScatterPreset { count: 50, scale: (0.8, 1.2), tilt: 0.0 })
+        } else {
+            return Err(format!("no object or preset {spec:?} to scatter (rock, tree, grass, bush, flower, or an object name)"));
+        };
+        let t = spec.trim();
+        let label = if t.ends_with("es") && (t.ends_with("shes") || t.ends_with("ches")) { &t[..t.len() - 2] } else if t.ends_with('s') && !t.ends_with("ss") { &t[..t.len() - 1] } else { t };
+        let name = if label.is_empty() { "Rock".to_string() } else { format!("{}{}", label[..1].to_uppercase(), &label[1..]) };
+        let id = self.scene.add(prim, Some(&name));
+        let o = self.scene.get_mut(id).unwrap();
+        o.detail = detail;
+        // bake the size into the mesh, with the base at the origin (sunk a little: `base`)
+        let mut pm = prim.poly(detail);
+        let zmin = pm.verts.iter().map(|v| v.z).fold(f32::MAX, f32::min);
+        for v in &mut pm.verts {
+            *v = Vec3::new(v.x * scale.x, v.y * scale.y, (v.z - zmin) * scale.z - scale.z * (1.0f32 - base).max(0.0) * 0.3);
+        }
+        if prim == Primitive::IcoSphere {
+            // lumpy rocks
+            for (i, v) in pm.verts.iter_mut().enumerate() {
+                let h = ((i as f32 * 12.9898).sin() * 43758.545).fract().abs();
+                *v *= 0.85 + 0.3 * h;
+            }
+        }
+        o.mesh = Some(pm);
+        o.material.color = color;
+        o.material.roughness = rough;
+        o.smooth_override = Some(prim != Primitive::IcoSphere || low.contains("bush"));
+        o.visible = false;
+        Ok((id, preset))
+    }
+
+    /// IK on bone `bi`: reach for `target` (an object name) or a new Empty at the bone's tail.
+    pub fn add_ik(&mut self, aid: u64, bi: usize, chain: u32, target: Option<&str>) -> Result<String, String> {
+        let a = self.scene.get(aid).ok_or("no armature")?;
+        let arm = a.armature.as_ref().ok_or("not an armature")?;
+        let tail = a.transform.matrix().transform_point3(arm.segments(&arm.pose_globals())[bi].1);
+        let bname = arm.bones[bi].name.clone();
+        let coll = a.collection;
+        let tid = match target.and_then(|t| self.scene.find_by_name(t)).filter(|t| *t != aid) {
+            Some(t) => t,
+            None => {
+                let t = self.scene.add_empty(Some(&format!("IK {bname}")));
+                let o = self.scene.get_mut(t).unwrap();
+                o.transform.location = tail;
+                o.transform.scale = Vec3::splat(0.4);
+                o.collection = coll;
+                t
+            }
+        };
+        let b = &mut self.scene.get_mut(aid).unwrap().armature.as_mut().unwrap().bones[bi];
+        b.ik = Some(crate::armature::Ik { target: tid, chain });
+        self.reset_parent_cache();
+        Ok(self.scene.get(tid).unwrap().name.clone())
+    }
+
+    /// Add a shape key to a mesh (a copy of its current shape). Returns its index.
+    pub fn add_shape_key(&mut self, id: u64, name: &str) -> Result<usize, String> {
+        self.finish_shape_edit();
+        let o = self.scene.get_mut(id).filter(|o| o.is_mesh()).ok_or("shape keys need a mesh object")?;
+        if o.mesh.is_none() {
+            o.mesh = Some(o.poly());
+        }
+        // new keys start from the basis (not from the current mix)
+        let verts = o.mesh.as_ref().unwrap().verts.clone();
+        let mut nm = name.to_string();
+        let mut k = 1;
+        while o.shape_keys.iter().any(|s| s.name == nm) {
+            nm = format!("{name}.{k:03}");
+            k += 1;
+        }
+        o.shape_keys.push(crate::shapekeys::ShapeKey { name: nm, verts, value: 0.0, keys: vec![] });
+        o.posed_key = 0;
+        Ok(o.shape_keys.len() - 1)
+    }
+
+    /// Show shape key `k` in the mesh for editing / sculpting (the basis is restored after).
+    pub fn begin_shape_edit(&mut self, id: u64, k: usize) -> Result<String, String> {
+        self.finish_shape_edit();
+        let o = self.scene.get_mut(id).ok_or("no object")?;
+        let key = o.shape_keys.get(k).ok_or("no such shape key")?;
+        let pm = o.mesh.as_mut().ok_or("no mesh")?;
+        if key.verts.len() != pm.verts.len() {
+            return Err("this shape key doesn't match the mesh any more".into());
+        }
+        let basis = std::mem::replace(&mut pm.verts, key.verts.clone());
+        let name = key.name.clone();
+        o.shape_editing = true;
+        o.posed = None;
+        self.shape_edit = Some((id, k, basis));
+        Ok(format!("Editing shape key \"{name}\" (edit or sculpt it; leave the mode to store it)"))
+    }
+
+    /// Store the edited shape into its key and bring back the basis.
+    pub fn finish_shape_edit(&mut self) -> Option<String> {
+        let (id, k, basis) = self.shape_edit.take()?;
+        let o = self.scene.get_mut(id)?;
+        o.shape_editing = false;
+        o.posed_key = 0;
+        let pm = o.mesh.as_mut()?;
+        if pm.verts.len() != basis.len() {
+            // the topology changed: the edited mesh becomes the basis and the keys are dropped
+            o.shape_keys.clear();
+            return Some("Topology changed: shape keys removed".into());
+        }
+        let shape = std::mem::replace(&mut pm.verts, basis);
+        let key = o.shape_keys.get_mut(k)?;
+        key.verts = shape;
+        if key.value == 0.0 {
+            key.value = 1.0;
+        }
+        Some(format!("Stored shape key \"{}\"", key.name))
     }
 
     /// A texture by spec: an image path, an existing texture's name or a procedural pattern
@@ -509,7 +641,7 @@ impl Editor {
         self.frame = f;
         self.scene.evaluate(f);
         self.propagate_parents();
-        self.scene.update_skins();
+        self.scene.update_derived();
     }
 
     pub fn insert_keyframes(&mut self) -> usize {
@@ -659,7 +791,7 @@ impl Editor {
         let log = self.execute_batch(cmds);
         self.in_batch = false;
         self.validate_edit();
-        self.scene.update_skins();
+        self.scene.update_derived();
         log
     }
 
@@ -700,6 +832,7 @@ impl Editor {
                     None => self.scene.add(p, c.name.as_deref()),
                     Some(Special::Light(t)) => self.scene.add_light(t, c.name.as_deref()),
                     Some(Special::Camera) => self.scene.add_camera(c.name.as_deref()),
+                    Some(Special::Empty) => self.scene.add_empty(c.name.as_deref()),
                     Some(Special::Armature) => {
                         let n = c.number.map(|n| n as usize).unwrap_or(1);
                         self.scene.add_armature(crate::armature::Armature::chain(n, 2.0), c.name.as_deref())
@@ -1098,7 +1231,12 @@ impl Editor {
                 let list: Vec<String> = arm.actions.iter().map(|a| a.name.clone()).collect();
                 let name = c.name.clone().ok_or(format!("which action? ({})", if list.is_empty() { "none stored".into() } else { list.join(", ") }))?;
                 let i = arm.find_action(&name).ok_or(format!("no action {name:?} (actions: {})", list.join(", ")))?;
-                let range = arm.set_action(i);
+                let playing = self.playing || c.action == "play_action";
+                let blend = c.number.map(|n| n as f32).unwrap_or(if playing { 6.0 } else { 0.0 });
+                let range = match arm.actions.get(i).and_then(|a| a.range()) {
+                    Some((lo, _)) if blend > 0.0 => arm.set_action_blended(i, lo as f32, blend),
+                    _ => arm.set_action(i),
+                };
                 let an = arm.actions[i].name.clone();
                 if let Some((lo, hi)) = range {
                     self.scene.frame_start = lo;
@@ -1109,6 +1247,153 @@ impl Editor {
                     self.playing = true;
                 }
                 Ok(format!("Action \"{an}\"{}", range.map(|(a, b)| format!(" (frames {a}–{b})")).unwrap_or_default()))
+            }
+            "add_ik" | "ik" | "remove_ik" => {
+                let aid = c
+                    .target
+                    .as_deref()
+                    .and_then(|t| self.scene.find_by_name(t))
+                    .and_then(|t| if self.scene.get(t)?.armature.is_some() { Some(t) } else { self.scene.get(t)?.skin.as_ref().map(|s| s.armature) })
+                    .or(self.pose)
+                    .or_else(|| self.active.filter(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some())))
+                    .or_else(|| self.scene.objects.iter().find(|o| o.armature.is_some()).map(|o| o.id))
+                    .ok_or("no armature in the scene")?;
+                let arm = self.scene.get(aid).unwrap().armature.as_ref().unwrap();
+                let bi = match c.name.as_deref() {
+                    Some(n) => arm.find(n).ok_or(format!("no bone {n:?}"))?,
+                    None => self.active_bone.min(arm.bones.len().saturating_sub(1)),
+                };
+                let bname = arm.bones[bi].name.clone();
+                if c.action == "remove_ik" || c.primitive.as_deref() == Some("none") {
+                    self.scene.get_mut(aid).unwrap().armature.as_mut().unwrap().bones[bi].ik = None;
+                    return Ok(format!("Removed IK from \"{bname}\""));
+                }
+                let chain = c.number.map(|n| n.max(0.0) as u32).unwrap_or(2);
+                self.add_ik(aid, bi, chain, c.object.as_deref()).map(|t| format!("IK on \"{bname}\" (chain {chain}) → move \"{t}\" to pose the limb"))
+            }
+            "add_shape_key" | "shape_key" | "set_shape_key" | "edit_shape_key" | "remove_shape_key" => {
+                let id = targets().into_iter().find(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).ok_or("shape keys need a mesh object")?;
+                let name = c.name.clone().unwrap_or_else(|| "Key".into());
+                let find = |o: &crate::scene::Object| o.shape_keys.iter().position(|k| k.name.eq_ignore_ascii_case(&name)).or_else(|| o.shape_keys.iter().position(|k| k.name.to_lowercase().contains(&name.to_lowercase())));
+                match c.action.as_str() {
+                    "remove_shape_key" => {
+                        self.finish_shape_edit();
+                        let o = self.scene.get_mut(id).unwrap();
+                        let k = find(o).ok_or(format!("no shape key {name:?}"))?;
+                        o.shape_keys.remove(k);
+                        o.posed_key = 0;
+                        Ok(format!("Removed shape key \"{name}\""))
+                    }
+                    "edit_shape_key" => {
+                        let k = find(self.scene.get(id).unwrap()).ok_or(format!("no shape key {name:?}"))?;
+                        let msg = self.begin_shape_edit(id, k)?;
+                        if self.edit.is_none() {
+                            let _ = self.enter_edit(id);
+                        }
+                        Ok(msg)
+                    }
+                    _ => {
+                        let existing = find(self.scene.get(id).unwrap());
+                        let k = match existing {
+                            Some(k) if c.action != "add_shape_key" || (c.scale.is_none() && c.vector.is_none()) => k,
+                            _ => {
+                                let k = self.add_shape_key(id, &name)?;
+                                // generated shapes: scale around the centre (squash / stretch) or puff along normals
+                                let o = self.scene.get_mut(id).unwrap();
+                                let pm = o.mesh.clone().unwrap();
+                                let c0 = pm.verts.iter().sum::<Vec3>() / pm.verts.len().max(1) as f32;
+                                let normals = crate::sculpt::vertex_normals(&pm);
+                                let key = &mut o.shape_keys[k];
+                                if let Some(sv) = vec3_or_scalar(&c.scale) {
+                                    for v in &mut key.verts {
+                                        *v = c0 + (*v - c0) * sv;
+                                    }
+                                }
+                                if let Some(d) = vec3(&c.vector) {
+                                    let lo = pm.verts.iter().map(|v| v.z).fold(f32::MAX, f32::min);
+                                    let hi = pm.verts.iter().map(|v| v.z).fold(f32::MIN, f32::max);
+                                    for (v, _) in key.verts.iter_mut().zip(&normals) {
+                                        // shear: more at the top (a lean / wobble)
+                                        let t = ((v.z - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0);
+                                        *v += d * t;
+                                    }
+                                }
+                                if let Some(p) = c.power {
+                                    for (v, n) in key.verts.iter_mut().zip(&normals) {
+                                        *v += *n * p as f32;
+                                    }
+                                }
+                                k
+                            }
+                        };
+                        let o = self.scene.get_mut(id).unwrap();
+                        if let Some(v) = c.number {
+                            o.shape_keys[k].value = (v as f32).clamp(-1.0, 2.0);
+                        } else if existing.is_none() && (c.scale.is_some() || c.vector.is_some() || c.power.is_some()) {
+                            o.shape_keys[k].value = 1.0;
+                        }
+                        o.posed_key = 0;
+                        let (kn, kv) = (o.shape_keys[k].name.clone(), o.shape_keys[k].value);
+                        Ok(format!("Shape key \"{kn}\" = {kv:.2}"))
+                    }
+                }
+            }
+            "cloth" | "add_cloth" | "simulate_cloth" | "bake_cloth" | "remove_cloth" => {
+                let id = targets().into_iter().find(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).ok_or("cloth needs a mesh object (a plane works well)")?;
+                if c.action == "remove_cloth" || c.name.as_deref() == Some("none") && c.action != "cloth" {
+                    let o = self.scene.get_mut(id).unwrap();
+                    o.cloth = None;
+                    o.posed = None;
+                    return Ok("Removed the cloth simulation".into());
+                }
+                let o = self.scene.get(id).unwrap();
+                if o.skin.is_some() || !o.shape_keys.is_empty() {
+                    return Err("cloth can't run on rigged meshes or meshes with shape keys".into());
+                }
+                let mut cloth = o.cloth.clone().unwrap_or_default();
+                // enough vertices to fold
+                if o.mesh.as_ref().is_none_or(|m| m.verts.len() < 300) && c.action != "bake_cloth" {
+                    let mut pm = o.poly();
+                    crate::sculpt::densify(&mut pm, 900, false);
+                    pm.uvs.clear();
+                    self.scene.get_mut(id).unwrap().mesh = Some(pm);
+                }
+                let o = self.scene.get(id).unwrap();
+                let pm = o.mesh.clone().unwrap();
+                let om = o.transform.matrix();
+                if let Some(how) = c.name.as_deref() {
+                    cloth.pins = if how.contains("select") {
+                        self.edit.as_ref().filter(|s| s.obj == id).map(|s| s.sel.iter().enumerate().filter(|(_, x)| **x).map(|(i, _)| i as u32).collect()).unwrap_or_default()
+                    } else {
+                        crate::physics::pick_pins(&pm, om, how)
+                    };
+                }
+                if let Some(k) = c.number {
+                    cloth.stiffness = (k as f32).clamp(0.05, 1.0);
+                }
+                let colliders: Vec<crate::physics::Collider> = self
+                    .scene
+                    .objects
+                    .iter()
+                    .filter(|x| x.id != id && x.visible && x.is_mesh() && x.scatter.is_none())
+                    .map(|x| {
+                        let p = x.posed.as_ref().map(|p| (**p).clone()).unwrap_or_else(|| x.poly());
+                        let lo = p.verts.iter().fold(Vec3::splat(f32::MAX), |a, b| a.min(*b));
+                        let hi = p.verts.iter().fold(Vec3::splat(f32::MIN), |a, b| a.max(*b));
+                        crate::physics::collider_for(x, (lo, hi))
+                    })
+                    .collect();
+                let (f0, f1) = (self.scene.frame_start, self.scene.frame_end.max(self.scene.frame_start + 1));
+                let frames = ((f1 - f0 + 1) as usize).min(1000);
+                cloth.start = f0;
+                cloth.cache = std::sync::Arc::new(crate::physics::bake(&pm, om, &cloth, &colliders, frames, self.scene.fps.max(1) as f32));
+                let npins = cloth.pins.len();
+                let o = self.scene.get_mut(id).unwrap();
+                o.cloth = Some(cloth);
+                o.posed_key = 0;
+                let n = o.name.clone();
+                self.set_frame(self.frame);
+                Ok(format!("Baked cloth on \"{n}\": {frames} frames, {} colliders, {npins} pinned vertices — press play", colliders.len()))
             }
             "pose_mode" | "pose" => {
                 if let Some(t) = c.target.as_deref().and_then(|t| self.scene.find_by_name(t)) {
@@ -1261,6 +1546,103 @@ impl Editor {
                     }
                 }
                 Ok(if rid == 0 { format!("Removed the roughness map from {}", self.names(&ids)) } else { format!("Roughness map on {}", self.names(&ids)) })
+            }
+            "scatter" | "scatter_on" | "distribute" => {
+                // surface: target (or the active mesh)
+                let surf = c
+                    .target
+                    .as_deref()
+                    .and_then(|t| self.scene.find_by_name(t))
+                    .or(self.active)
+                    .filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh()))
+                    .ok_or("scatter needs target = the surface mesh")?;
+                let spec = c.object.clone().or(c.name.clone()).or(c.primitive.clone()).unwrap_or_else(|| "rock".into());
+                let (src, preset) = match self.scene.find_by_name(&spec).filter(|id| *id != surf && self.scene.get(*id).is_some_and(|o| o.is_mesh() && o.scatter.is_none())) {
+                    Some(id) => (id, None),
+                    None => {
+                        let (id, p) = self.scatter_preset(&spec)?;
+                        (id, Some(p))
+                    }
+                };
+                // reuse an existing scatter of the same object on the same surface
+                let existing = self.scene.objects.iter().find(|o| o.scatter.as_ref().is_some_and(|sc| sc.source == src && sc.target == surf)).map(|o| o.id);
+                let mut sc = existing
+                    .and_then(|id| self.scene.get(id)?.scatter.clone())
+                    .unwrap_or_else(|| {
+                        let mut s = crate::scatter::Scatter::new(src, surf, preset.map(|p| p.count).unwrap_or(50));
+                        if let Some(p) = preset {
+                            (s.scale_min, s.scale_max, s.tilt) = (p.scale.0, p.scale.1, p.tilt);
+                        }
+                        s
+                    });
+                if let Some(n) = c.number {
+                    sc.count = (n as u32).clamp(1, 20_000);
+                }
+                if let Some(v) = c.seed.or(c.segments) {
+                    sc.seed = v as u32;
+                }
+                if let Some(v) = c.slope {
+                    sc.max_slope = v as f32;
+                }
+                if let Some(a) = c.align {
+                    sc.align = a;
+                }
+                match &c.scale {
+                    Some(Value::Array(a)) if a.len() == 2 => {
+                        let g = |i: usize| a[i].as_f64().unwrap_or(1.0) as f32;
+                        (sc.scale_min, sc.scale_max) = (g(0).min(g(1)), g(0).max(g(1)));
+                    }
+                    Some(Value::Number(n)) => {
+                        let k = n.as_f64().unwrap_or(1.0) as f32;
+                        (sc.scale_min, sc.scale_max) = (k * 0.8, k * 1.2);
+                    }
+                    _ => {}
+                }
+                if let Some(r) = vec3(&c.rotation) {
+                    sc.tilt = r.x.abs().max(r.y.abs());
+                    if r.z != 0.0 {
+                        sc.spin = r.z.abs();
+                    }
+                }
+                let id = match existing {
+                    Some(id) => id,
+                    None => {
+                        let sname = format!("{} Scatter", self.scene.get(src).unwrap().name);
+                        let id = self.scene.add(crate::mesh::Primitive::Cube, Some(&sname));
+                        let (mat, smooth, auto, coll) = {
+                            let so = self.scene.get(src).unwrap();
+                            (so.material, so.smooth_override.or(Some(so.smooth())), so.auto_smooth, self.scene.get(surf).unwrap().collection)
+                        };
+                        let o = self.scene.get_mut(id).unwrap();
+                        o.material = mat;
+                        o.smooth_override = smooth;
+                        o.auto_smooth = auto;
+                        o.collection = coll;
+                        // the original stays as the editable template, hidden
+                        self.scene.get_mut(src).unwrap().visible = false;
+                        id
+                    }
+                };
+                let n = sc.count;
+                self.scene.get_mut(id).unwrap().scatter = Some(sc);
+                self.scene.get_mut(id).unwrap().posed = None;
+                self.scene.update_scatter();
+                let names = (self.scene.get(src).unwrap().name.clone(), self.scene.get(surf).unwrap().name.clone());
+                Ok(format!("Scattered {n} × \"{}\" on \"{}\"{}", names.0, names.1, if existing.is_some() { " (updated)" } else { "" }))
+            }
+            "realize" | "apply_scatter" | "make_real" => {
+                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.scatter.is_some())).collect();
+                if ids.is_empty() {
+                    return Err("select a scatter object".into());
+                }
+                for id in &ids {
+                    let o = self.scene.get_mut(*id).unwrap();
+                    if let Some(p) = o.posed.take() {
+                        o.mesh = Some((*p).clone());
+                    }
+                    o.scatter = None;
+                }
+                Ok(format!("Made {} a real mesh", self.names(&ids)))
             }
             "set_texture" | "texture" => {
                 let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
@@ -1671,6 +2053,7 @@ impl Editor {
 
     pub fn exit_edit(&mut self) {
         self.edit = None;
+        self.finish_shape_edit();
         self.bone_edit = None;
         self.sculpt = None;
         self.pose = None;
@@ -1758,11 +2141,15 @@ impl Editor {
         }
         if self.sculpt.is_some() {
             self.sculpt = None;
-            return Ok("Object mode".into());
+            let m = self.finish_shape_edit();
+            return Ok(m.unwrap_or_else(|| "Object mode".into()));
         }
         if self.edit.is_some() {
+            let m = self.shape_edit.is_some();
+            self.edit = None;
+            let msg = self.finish_shape_edit();
             self.exit_edit();
-            return Ok("Object mode".into());
+            return Ok(if m { msg.unwrap_or_default() } else { "Object mode".into() });
         }
         let id = self
             .active
@@ -2023,10 +2410,18 @@ impl Editor {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScatterPreset {
+    count: u32,
+    scale: (f32, f32),
+    tilt: f32,
+}
+
 enum Special {
     Light(crate::scene::LightType),
     Camera,
     Armature,
+    Empty,
 }
 
 fn parse_special(s: &str) -> Option<Special> {
@@ -2040,6 +2435,7 @@ fn parse_special(s: &str) -> Option<Special> {
         "spot" | "spotlight" | "spotlamp" => Special::Light(LightType::Spot),
         "camera" | "cam" => Special::Camera,
         "armature" | "bone" | "bones" | "skeleton" | "rig" => Special::Armature,
+        "empty" | "target" | "null" | "locator" | "iktarget" => Special::Empty,
         _ => return None,
     })
 }
@@ -2210,6 +2606,13 @@ pub struct Command {
     /// Point [x,y,z] or object name to aim a camera/light at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub look_at: Option<Value>,
+    /// Scatter: random seed, steepest slope in degrees, stand along the surface normal.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_f64")]
+    pub seed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_f64")]
+    pub slope: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<bool>,
 }
 
 fn lenient_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
@@ -2620,7 +3023,7 @@ mod tests {
         let rig = ed.scene.find_by_name("Tube Rig").unwrap();
         assert!(ed.toggle_edit().unwrap().contains("bones") && ed.bone_edit == Some(rig));
         let posed = |ed: &mut Editor| {
-            ed.scene.update_skins();
+            ed.scene.update_derived();
             ed.scene.get(tube).unwrap().posed.as_ref().unwrap().verts.clone()
         };
         let before = posed(&mut ed);
@@ -2642,5 +3045,116 @@ mod tests {
         assert!(before.iter().zip(&after2).all(|(p, q)| p.distance(*q) < 1e-4));
         assert_eq!(ed.scene.get(rig).unwrap().armature.as_ref().unwrap().bones.len(), n);
         assert!(ed.scene.get(tube).unwrap().skin.as_ref().unwrap().joints.iter().flatten().all(|j| (*j as usize) < n));
+    }
+    #[test]
+    fn ik_reaches_target() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"add","primitive":"armature","name":"Arm","number":3}"#),
+            cmd(r#"{"action":"add_ik","target":"Arm","name":"Bone.002","number":0}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let t = ed.scene.find_by_name("IK Bone.002").unwrap();
+        ed.execute(&[cmd(r#"{"action":"set_location","target":"IK Bone.002","location":[1.0,0.5,1.2]}"#)]);
+        let arm = ed.scene.get(ed.scene.find_by_name("Arm").unwrap()).unwrap().armature.as_ref().unwrap();
+        let tip = arm.segments(&arm.pose_globals())[2].1;
+        let goal = ed.scene.get(t).unwrap().transform.location;
+        assert!(tip.distance(goal) < 1e-3, "tip {tip} goal {goal}");
+        // out of reach: the chain points straight at it
+        ed.execute(&[cmd(r#"{"action":"set_location","target":"IK Bone.002","location":[10,0,0]}"#)]);
+        let arm = ed.scene.get(ed.scene.find_by_name("Arm").unwrap()).unwrap().armature.as_ref().unwrap();
+        let tip = arm.segments(&arm.pose_globals())[2].1;
+        assert!((tip - Vec3::new(2.0, 0.0, 0.0)).length() < 0.05, "{tip}");
+    }
+
+    #[test]
+    fn scatter_command() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"add","primitive":"plane","name":"Ground","scale":5}"#),
+            cmd(r#"{"action":"scatter","target":"Ground","name":"rocks","number":25,"seed":3}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let sid = ed.scene.find_by_name("Rock Scatter").unwrap();
+        let o = ed.scene.get(sid).unwrap();
+        let rock = ed.scene.find_by_name("Rock").unwrap();
+        assert!(!ed.scene.get(rock).unwrap().visible);
+        let n = ed.scene.get(rock).unwrap().mesh.as_ref().unwrap().verts.len();
+        assert_eq!(o.posed.as_ref().unwrap().verts.len(), n * 25);
+        // the same command updates it; moving the ground carries the rocks
+        ed.execute(&[cmd(r#"{"action":"scatter","target":"Ground","name":"Rock","number":40}"#)]);
+        assert_eq!(ed.scene.objects.iter().filter(|o| o.scatter.is_some()).count(), 1);
+        ed.execute(&[cmd(r#"{"action":"move","target":"Ground","vector":[0,0,2]}"#)]);
+        let o = ed.scene.get(sid).unwrap();
+        let zmin = o.posed.as_ref().unwrap().verts.iter().map(|v| v.z).fold(f32::MAX, f32::min);
+        assert_eq!(o.posed.as_ref().unwrap().verts.len(), n * 40);
+        assert!(zmin > 1.5, "rocks follow the ground: {zmin}");
+        ed.execute(&[cmd(r#"{"action":"realize","target":"Rock Scatter"}"#)]);
+        assert!(ed.scene.get(sid).unwrap().mesh.is_some() && ed.scene.get(sid).unwrap().scatter.is_none());
+    }
+    #[test]
+    fn shape_keys_edit_animate_export() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"add","primitive":"cube","name":"Blob","location":[0,0,1]}"#),
+            cmd(r#"{"action":"add_shape_key","target":"Blob","name":"Squash","scale":[1.4,1.4,0.5]}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let id = ed.scene.find_by_name("Blob").unwrap();
+        let top = |ed: &mut Editor| {
+            ed.scene.update_derived();
+            let o = ed.scene.get(id).unwrap();
+            o.posed.as_ref().map(|p| p.verts.clone()).unwrap_or_else(|| o.mesh.clone().unwrap().verts).iter().map(|v| v.z).fold(f32::MIN, f32::max)
+        };
+        assert!((top(&mut ed) - 0.5).abs() < 1e-4, "fully squashed");
+        ed.execute(&[cmd(r#"{"action":"set_shape_key","target":"Blob","name":"squash","number":0}"#)]);
+        assert!((top(&mut ed) - 1.0).abs() < 1e-4);
+        // edit a key: the mesh shows it, leaving restores the basis
+        let k = ed.add_shape_key(id, "Tall").unwrap();
+        ed.begin_shape_edit(id, k).unwrap();
+        for v in &mut ed.scene.get_mut(id).unwrap().mesh.as_mut().unwrap().verts {
+            v.z *= 3.0;
+        }
+        ed.finish_shape_edit().unwrap();
+        assert!((ed.scene.get(id).unwrap().mesh.as_ref().unwrap().verts.iter().map(|v| v.z).fold(f32::MIN, f32::max) - 1.0).abs() < 1e-5, "basis back");
+        assert!((top(&mut ed) - 3.0).abs() < 1e-4, "the new key is on (value 1)");
+        // animate and round-trip through glTF
+        ed.execute(&[cmd(r#"{"action":"set_shape_key","target":"Blob","name":"Tall","number":0}"#)]);
+        ed.set_frame(1);
+        ed.execute(&[cmd(r#"{"action":"keyframe","target":"Blob"}"#)]);
+        ed.set_frame(10);
+        ed.execute(&[cmd(r#"{"action":"set_shape_key","target":"Blob","name":"Tall","number":1}"#), cmd(r#"{"action":"keyframe","target":"Blob"}"#)]);
+        let (glb, _) = crate::gltf::export_glb(&ed.scene, &mut crate::scene::MeshCache::default());
+        let mut sc = crate::scene::Scene::default();
+        sc.objects.clear();
+        crate::gltf_import::import_bytes(&mut sc, &glb, None).unwrap();
+        let o = sc.objects.iter().find(|o| o.name == "Blob").unwrap();
+        assert_eq!(o.shape_keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(), ["Squash", "Tall"]);
+        sc.evaluate(10);
+        sc.update_derived();
+        let o = sc.objects.iter().find(|o| o.name == "Blob").unwrap();
+        let m = o.transform.matrix();
+        let zt = o.posed.as_ref().unwrap().verts.iter().map(|v| m.transform_point3(*v).z).fold(f32::MIN, f32::max);
+        assert!((zt - 4.0).abs() < 1e-3, "frame 10 is tall: {zt}");
+    }
+    #[test]
+    fn cloth_command_bakes() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"delete","target":"Cube"}"#),
+            cmd(r#"{"action":"add","primitive":"uv_sphere","name":"Ball","location":[0,0,0]}"#),
+            cmd(r#"{"action":"add","primitive":"plane","name":"Sheet","location":[0,0,1.5],"scale":1.5}"#),
+            cmd(r#"{"action":"cloth","target":"Sheet"}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let id = ed.scene.find_by_name("Sheet").unwrap();
+        let low = |ed: &mut Editor, f: i32| {
+            ed.set_frame(f);
+            let o = ed.scene.get(id).unwrap();
+            let m = o.transform.matrix();
+            o.posed.as_ref().map(|p| p.verts.iter().map(|v| m.transform_point3(*v).z).fold(f32::MAX, f32::min)).unwrap_or(9.0)
+        };
+        let (a, b) = (low(&mut ed, 1), low(&mut ed, 60));
+        assert!((a - 1.5).abs() < 1e-3 && b < 0.5, "falls and drapes: {a} → {b}");
     }
 }

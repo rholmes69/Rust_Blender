@@ -355,7 +355,7 @@ pub fn box_uv(verts: &[Vec3], f: &[u32]) -> Vec<[f32; 2]> {
 }
 
 /// Triangulate a polygon (ear clipping in the polygon's plane; fan for convex quads/tris).
-fn triangulate(verts: &[Vec3], f: &[u32]) -> Vec<[u32; 3]> {
+pub fn triangulate(verts: &[Vec3], f: &[u32]) -> Vec<[u32; 3]> {
     if f.len() == 3 {
         return vec![[f[0], f[1], f[2]]];
     }

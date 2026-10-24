@@ -702,7 +702,12 @@ impl Viewport {
     pub fn ui(&mut self, ui: &mut Ui, ed: &mut Editor) {
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         self.rect = rect;
-        ed.scene.update_skins();
+        if ed.shape_edit.is_some() && ed.edit.is_none() && ed.sculpt.is_none() {
+            if let Some(m) = ed.finish_shape_edit() {
+                self.flash = Some((m, Instant::now()));
+            }
+        }
+        ed.scene.update_derived();
         self.handle_view_requests(ed);
         self.animate_camera(ui);
         if let Some(cid) = self.camera_view {
@@ -1056,6 +1061,16 @@ impl Viewport {
                 }
             }
             ObjectKind::Armature => self.draw_bones(o, pid, col, view),
+            ObjectKind::Empty => {
+                let s = 0.35 * o.transform.scale.max_element().max(0.05);
+                let m = o.transform.matrix();
+                let ax = |v: Vec3| m.transform_vector3(v).normalize_or_zero() * s;
+                for d in [Vec3::X, Vec3::Y, Vec3::Z] {
+                    self.push_line(p - ax(d), p + ax(d), 1.6 * lw, col, 0.0, view, true);
+                }
+                let wpp = self.world_per_pixel(p);
+                circle(self, p, r, u, 6.0 * wpp, 1.2 * lw);
+            }
             ObjectKind::Camera(cd) => {
                 let s = o.transform.scale.x.abs().max(0.01);
                 let d = 1.0 * s;

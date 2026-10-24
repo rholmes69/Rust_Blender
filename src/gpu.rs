@@ -11,6 +11,9 @@ const MSAA: u32 = 4;
 const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const FLAGS_W: u32 = 4096;
+/// Texture atlas for image/procedural textures (Material Preview).
+const ATLAS: u32 = 2048;
+const MAX_TEX: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -18,6 +21,9 @@ pub struct GpuVertex {
     pos: [f32; 3],
     col: [f32; 4],
     id: u32,
+    uv: [f32; 2],
+    iw: f32,
+    tex: u32,
 }
 
 fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
@@ -37,6 +43,9 @@ pub struct FrameData {
     pub outline_width: u32,
     pub selected: [f32; 4],
     pub active: [f32; 4],
+    /// Textures referenced by `RPrim::tex` and a key that changes when they do.
+    pub textures: Vec<Arc<crate::textures::TexImage>>,
+    pub tex_key: u64,
 }
 
 impl FrameData {
@@ -51,6 +60,8 @@ impl FrameData {
         outline_width: u32,
         selected: egui::Color32,
         active: egui::Color32,
+        textures: Vec<Arc<crate::textures::TexImage>>,
+        tex_key: u64,
     ) -> Self {
         let mut verts = Vec::with_capacity(prims.len() * 6 + 6);
         let (fw, fh) = (w as f32, h as f32);
@@ -70,6 +81,9 @@ impl FrameData {
                 pos: [p[0], p[1], 1.0],
                 col: c,
                 id: 0,
+                uv: [0.0; 2],
+                iw: 1.0,
+                tex: 0,
             });
         }
         let mut n_opaque = 6;
@@ -86,6 +100,9 @@ impl FrameData {
                         pos: [p.p[i][0], p.p[i][1], z],
                         col: p.c[i],
                         id: p.id,
+                        uv: p.uv[i],
+                        iw: p.iw[i],
+                        tex: if (p.tex as usize) <= MAX_TEX { p.tex } else { 0 },
                     });
                 }
             }
@@ -111,6 +128,8 @@ impl FrameData {
             outline_width,
             selected: c(selected),
             active: c(active),
+            textures,
+            tex_key,
         }
     }
 }
@@ -195,21 +214,38 @@ struct GpuResources {
     readback: Arc<Mutex<Readback>>,
     pending_version: u64,
     srgb_target: bool,
+    atlas: wgpu::Texture,
+    rects_buf: wgpu::Buffer,
+    atlas_key: u64,
 }
 
 const SCENE_WGSL: &str = r#"
 struct U { size: vec4<f32> };
 @group(0) @binding(0) var<uniform> u: U;
-struct VIn { @location(0) pos: vec3<f32>, @location(1) col: vec4<f32>, @location(2) id: u32 };
-struct VOut { @builtin(position) p: vec4<f32>, @location(0) col: vec4<f32>, @location(1) @interpolate(flat) id: u32 };
+struct Rects { r: array<vec4<f32>, 64> };
+@group(0) @binding(1) var<uniform> rects: Rects;
+@group(0) @binding(2) var atlas: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+struct VIn { @location(0) pos: vec3<f32>, @location(1) col: vec4<f32>, @location(2) id: u32, @location(3) uv: vec2<f32>, @location(4) iw: f32, @location(5) tex: u32 };
+struct VOut { @builtin(position) p: vec4<f32>, @location(0) col: vec4<f32>, @location(1) @interpolate(flat) id: u32, @location(2) uv: vec2<f32>, @location(3) @interpolate(flat) tex: u32 };
 @vertex fn vs(v: VIn) -> VOut {
     var o: VOut;
-    o.p = vec4<f32>(v.pos.x / u.size.x * 2.0 - 1.0, 1.0 - v.pos.y / u.size.y * 2.0, v.pos.z, 1.0);
+    // w = 1 / iw gives perspective-correct interpolation of colour and UVs
+    let w = 1.0 / max(v.iw, 1e-6);
+    o.p = vec4<f32>((v.pos.x / u.size.x * 2.0 - 1.0) * w, (1.0 - v.pos.y / u.size.y * 2.0) * w, v.pos.z * w, w);
     o.col = v.col;
     o.id = v.id;
+    o.uv = v.uv;
+    o.tex = v.tex;
     return o;
 }
-@fragment fn fs_color(i: VOut) -> @location(0) vec4<f32> { return i.col; }
+@fragment fn fs_color(i: VOut) -> @location(0) vec4<f32> {
+    if (i.tex == 0u) { return i.col; }
+    let r = rects.r[i.tex - 1u];
+    let half = vec2<f32>(0.5 / 2048.0);
+    let t = r.xy + half + fract(i.uv) * (r.zw - r.xy - 2.0 * half);
+    return i.col * textureSampleLevel(atlas, samp, t, 0.0);
+}
 struct IdOut { @location(0) id: u32, @location(1) z: u32 };
 @fragment fn fs_id_opaque(i: VOut) -> IdOut { var o: IdOut; o.id = i.id; o.z = bitcast<u32>(i.p.z); return o; }
 @fragment fn fs_id_blend(i: VOut) -> IdOut {
@@ -277,18 +313,38 @@ impl GpuResources {
             label: Some("rb composite"),
             source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
         });
+        let ubuf_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let scene_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rb scene bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                ubuf_entry(0, wgpu::ShaderStages::VERTEX),
+                ubuf_entry(1, wgpu::ShaderStages::FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let tex_entry =
             |binding: u32, sample_type: wgpu::TextureSampleType| wgpu::BindGroupLayoutEntry {
@@ -344,6 +400,21 @@ impl GpuResources {
                 format: wgpu::VertexFormat::Uint32,
                 offset: 28,
                 shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 32,
+                shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 40,
+                shader_location: 4,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: 44,
+                shader_location: 5,
             },
         ];
         let vlayout = wgpu::VertexBufferLayout {
@@ -491,13 +562,50 @@ impl GpuResources {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rb atlas"),
+            size: wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let atlas_view = atlas.create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("rb atlas sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let rects_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rb rects"),
+            size: (MAX_TEX * 16) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rb scene bg"),
             layout: &scene_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: scene_ubuf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: scene_ubuf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: rects_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
         });
         Self {
             color_opaque,
@@ -521,7 +629,47 @@ impl GpuResources {
             readback,
             pending_version: 0,
             srgb_target: target_format.is_srgb(),
+            atlas,
+            rects_buf,
+            atlas_key: u64::MAX,
         }
+    }
+
+    /// Pack the frame's textures into the atlas (grid of equal slots) when they change.
+    fn ensure_atlas(&mut self, queue: &wgpu::Queue, textures: &[Arc<crate::textures::TexImage>], key: u64) {
+        if key == self.atlas_key {
+            return;
+        }
+        self.atlas_key = key;
+        let n = textures.len().min(MAX_TEX);
+        let mut rects = vec![0f32; MAX_TEX * 4];
+        if n == 0 {
+            queue.write_buffer(&self.rects_buf, 0, as_bytes(&rects));
+            return;
+        }
+        let cols = (n as f32).sqrt().ceil() as u32;
+        let slot = ATLAS / cols;
+        for (i, t) in textures.iter().take(n).enumerate() {
+            let (cx, cy) = (i as u32 % cols, i as u32 / cols);
+            let (w, h) = (t.w.min(slot as usize).max(1), t.h.min(slot as usize).max(1));
+            let img = if w == t.w && h == t.h { None } else { Some(t.resized(w, h)) };
+            let src = img.as_ref().unwrap_or(t);
+            let data: Vec<u8> = src.rgba.iter().flatten().copied().collect();
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: cx * slot, y: cy * slot, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w as u32 * 4), rows_per_image: Some(h as u32) },
+                wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+            );
+            let a = ATLAS as f32;
+            rects[i * 4..i * 4 + 4].copy_from_slice(&[(cx * slot) as f32 / a, (cy * slot) as f32 / a, (cx * slot + w as u32) as f32 / a, (cy * slot + h as u32) as f32 / a]);
+        }
+        queue.write_buffer(&self.rects_buf, 0, as_bytes(&rects));
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, w: u32, h: u32) {
@@ -714,6 +862,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         let need_render = size_changed || r.last_version != f.version;
         r.ensure_targets(device, f.w, f.h);
         let flags_recreated = r.ensure_flags(device, queue, &f.flags);
+        r.ensure_atlas(queue, &f.textures, f.tex_key);
         // composite uniforms (cheap, every frame)
         let mut cu = [0u8; 64];
         let put_f = |b: &mut [u8], o: usize, v: f32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());

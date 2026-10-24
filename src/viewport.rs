@@ -137,6 +137,8 @@ pub enum ModalKind {
     Scale,
     /// Edit mode: interactive inset of the selected faces.
     Inset,
+    /// Edit mode: interactive bevel of the selected edges (Ctrl+B).
+    Bevel,
 }
 
 #[derive(Clone, Debug)]
@@ -149,8 +151,11 @@ pub struct Modal {
     pub originals: Vec<(u64, Transform)>,
     /// Edit mode: original local positions of the transformed vertices.
     pub verts: Vec<(u32, Vec3)>,
-    /// Edit mode: mesh + selection before a topology tool (inset).
+    /// Edit mode: mesh + selection before a topology tool (inset, bevel).
     pub edit_base: Option<(crate::mesh::PolyMesh, Vec<bool>)>,
+    /// Proportional editing: unselected vertices (index, original local position, world distance
+    /// to the nearest selected vertex).
+    pub prop: Vec<(u32, Vec3, f32)>,
     pub pivot: Vec3,
     pub typed: String,
     /// Started from a gizmo drag: releasing the mouse confirms.
@@ -191,6 +196,7 @@ struct RenderKey {
     edit: Option<crate::editmesh::EditState>,
     loopcut: Option<(usize, Option<(u32, u32)>)>,
     gpu: bool,
+    textures: Vec<(u32, u64)>,
 }
 
 pub struct Viewport {
@@ -203,6 +209,13 @@ pub struct Viewport {
     /// Transient error message shown in the HUD.
     pub flash: Option<(String, Instant)>,
     inset_amount: f32,
+    /// Proportional editing (O) and its radius in world units (mouse wheel during G/R/S).
+    pub proportional: bool,
+    pub prop_radius: f32,
+    /// Bevel tool state (Ctrl+B): width and segments (mouse wheel).
+    bevel_width: f32,
+    bevel_segments: usize,
+    bevel_scroll: f32,
     /// Object currently drawn in edit mode + world-space data for component picking.
     edit_obj: Option<u64>,
     edit_draw: Option<edit::EditDraw>,
@@ -220,6 +233,9 @@ pub struct Viewport {
     pub cursor: Vec3,
     pub overlays: Overlays,
     pub mesh_cache: MeshCache,
+    pub tex_cache: crate::textures::TextureCache,
+    /// Scene texture ids in `raster.textures` order for the current frame.
+    frame_tex: Vec<u32>,
     prims: Vec<RPrim>,
     raster: Raster,
     id_map: Vec<u64>,
@@ -265,6 +281,11 @@ impl Default for Viewport {
             gpu_frame: None,
             flash: None,
             inset_amount: 0.0,
+            proportional: false,
+            prop_radius: 1.0,
+            bevel_width: 0.0,
+            bevel_segments: 1,
+            bevel_scroll: 0.0,
             edit_obj: None,
             edit_draw: None,
             loopcut: None,
@@ -295,6 +316,8 @@ impl Default for Viewport {
             gizmo_hover: None,
             last_frame_time: 0.0,
             render_mode: false,
+            tex_cache: Default::default(),
+            frame_tex: vec![],
         }
     }
 }
@@ -706,6 +729,7 @@ impl Viewport {
             edit: ed.edit.clone(),
             loopcut: self.loopcut.map(|n| (n, self.loopcut_edge)),
             gpu: self.gpu_active(),
+            textures: ed.scene.textures.iter().map(|t| (t.id, crate::textures::signature(&t.source))).collect(),
         };
         let have_image = if self.gpu_active() {
             self.gpu_frame
@@ -856,6 +880,9 @@ impl Viewport {
             id: self.line_id,
             blend: true,
             no_depth,
+            uv: RPrim::NO_UV,
+            tex: 0,
+            iw: [1.0; 4],
         });
     }
 
@@ -1067,6 +1094,8 @@ impl Viewport {
     fn build_scene(&mut self, ed: &Editor) {
         self.prims.clear();
         self.id_map.clear();
+        self.raster.textures.clear();
+        self.frame_tex.clear();
         self.edit_obj = if self.render_mode { None } else { ed.edit.as_ref().map(|s| s.obj) };
         self.edit_draw = None;
         let view = self.cam.view();
@@ -1192,6 +1221,10 @@ impl Viewport {
             let smooth = mesh.smooth;
             let base = lin(o.material.color);
             let mat = o.material;
+            // image / procedural texture (Material Preview and F12 renders)
+            let tex = if mat.texture != 0 && (shading == Shading::Material) { self.texture_slot(ed, mat.texture) } else { 0 };
+            let tsc = mat.tex_scale.max(1e-3);
+            let tri_uv = |fi: usize| -> [[f32; 2]; 3] { mesh.tri_uv.get(fi).map(|t| t.map(|u| [u[0] * tsc, u[1] * tsc])).unwrap_or([[0.0; 2]; 3]) };
             let alpha = if self.overlays.xray { 0.4 } else { mat.alpha };
             let blend = alpha < 0.999;
             let shade = |p: Vec3, n: Vec3| -> Vec3 {
@@ -1331,7 +1364,7 @@ impl Viewport {
                         } else {
                             400.0
                         };
-                        let k = ((edge_px / 14.0).ceil() as usize).clamp(1, 64);
+                        let k = ((edge_px / 14.0).ceil() as usize).clamp(1, 256);
                         let (a, b, c) = (wp[ix[0]], wp[ix[1]], wp[ix[2]]);
                         let (na, nb, nc) = if smooth {
                             (wn[ix[0]] * sign, wn[ix[1]] * sign, wn[ix[2]] * sign)
@@ -1339,15 +1372,17 @@ impl Viewport {
                             let f = face_n[fi] * sign;
                             (f, f, f)
                         };
+                        let tuv = tri_uv(fi);
                         // grid of points (i, j), i + j <= k
-                        let mut pts: Vec<(Vec3, Vec3, [f32; 4])> = Vec::with_capacity((k + 1) * (k + 2) / 2);
+                        let mut pts: Vec<(Vec3, Vec3, [f32; 4], [f32; 2])> = Vec::with_capacity((k + 1) * (k + 2) / 2);
                         for j in 0..=k {
                             for i in 0..=(k - j) {
                                 let (u, v) = (i as f32 / k as f32, j as f32 / k as f32);
                                 let w = 1.0 - u - v;
                                 let p = a * w + b * u + c * v;
                                 let n = (na * w + nb * u + nc * v).normalize_or_zero();
-                                pts.push((p, n, tone(shade(p, n), alpha)));
+                                let t = [tuv[0][0] * w + tuv[1][0] * u + tuv[2][0] * v, tuv[0][1] * w + tuv[1][1] * u + tuv[2][1] * v];
+                                pts.push((p, n, tone(shade(p, n), alpha), t));
                             }
                         }
                         let start = |j: usize| -> usize { (0..j).map(|r| k + 1 - r).sum() };
@@ -1360,7 +1395,7 @@ impl Viewport {
                                     quads.push([p10, r1 + i + 1, p01]);
                                 }
                                 // refine where the shading changes sharply (shadow edges, highlights)
-                                let mut stack: Vec<([(Vec3, Vec3, [f32; 4]); 3], u8)> =
+                                let mut stack: Vec<([(Vec3, Vec3, [f32; 4], [f32; 2]); 3], u8)> =
                                     quads.iter().map(|q| (q.map(|x| pts[x]), 0)).collect();
                                 while let Some((tv, depth)) = stack.pop() {
                                     let diff = (0..3)
@@ -1369,11 +1404,11 @@ impl Viewport {
                                             (c0[0] - c1[0]).abs().max((c0[1] - c1[1]).abs()).max((c0[2] - c1[2]).abs())
                                         })
                                         .fold(0.0f32, f32::max);
-                                    if depth < 3 && diff > 0.05 {
-                                        let mid = |a: &(Vec3, Vec3, [f32; 4]), b: &(Vec3, Vec3, [f32; 4])| {
+                                    if depth < 5 && diff > 0.05 {
+                                        let mid = |a: &(Vec3, Vec3, [f32; 4], [f32; 2]), b: &(Vec3, Vec3, [f32; 4], [f32; 2])| {
                                             let p = (a.0 + b.0) * 0.5;
                                             let n = (a.1 + b.1).normalize_or_zero();
-                                            (p, n, tone(shade(p, n), alpha))
+                                            (p, n, tone(shade(p, n), alpha), [(a.3[0] + b.3[0]) * 0.5, (a.3[1] + b.3[1]) * 0.5])
                                         };
                                         let (m01, m12, m20) = (mid(&tv[0], &tv[1]), mid(&tv[1], &tv[2]), mid(&tv[2], &tv[0]));
                                         let d = depth + 1;
@@ -1382,7 +1417,7 @@ impl Viewport {
                                         stack.push(([m20, m12, tv[2]], d));
                                         stack.push(([m01, m12, m20], d));
                                     } else {
-                                        self.push_tri(tv.map(|v| view.transform_point3(v.0)), tv.map(|v| v.2), pid, blend);
+                                        self.push_tri_tex(tv.map(|v| view.transform_point3(v.0)), tv.map(|v| v.2), tv.map(|v| v.3), tex, pid, blend);
                                     }
                                 }
                             }
@@ -1428,13 +1463,15 @@ impl Viewport {
                         } else {
                             (pid, cols)
                         };
-                        self.push_tri(
+                        self.push_tri_tex(
                             [
                                 vpos[t[0] as usize],
                                 vpos[t[1] as usize],
                                 vpos[t[2] as usize],
                             ],
                             cols,
+                            tri_uv(fi),
+                            tex,
                             tid,
                             blend,
                         );
@@ -1501,17 +1538,28 @@ impl Viewport {
     }
 
     fn push_tri(&mut self, v: [Vec3; 3], c: [[f32; 4]; 3], id: u32, blend: bool) {
-        let near = if self.cam.ortho { -1e9 } else { -0.05 };
+        self.push_tri_tex(v, c, [[0.0; 2]; 3], 0, id, blend);
+    }
+
+    /// Triangle in view space (clipped at the near plane) with per-corner colours and UVs.
+    fn push_tri_tex(&mut self, v: [Vec3; 3], c: [[f32; 4]; 3], uv: [[f32; 2]; 3], tex: u32, id: u32, blend: bool) {
+        let ortho = self.cam.ortho;
+        let near = if ortho { -1e9 } else { -0.05 };
         let inside = |p: &Vec3| p.z <= near;
         let proj = self.proj;
-        let emit = |this: &mut Self, pts: [Vec3; 3], cols: [[f32; 4]; 3]| {
+        let emit = |this: &mut Self, pts: [Vec3; 3], cols: [[f32; 4]; 3], uvs: [[f32; 2]; 3]| {
             let mut p = [[0.0f32; 3]; 4];
+            let mut iw = [1.0f32; 4];
             for i in 0..3 {
                 let (s, z) = this.vproj(&proj, pts[i]);
                 let (x, y) = this.to_px(s);
                 p[i] = [x, y, z];
+                if !ortho {
+                    iw[i] = 1.0 / (-pts[i].z).max(1e-6);
+                }
             }
             p[3] = p[2];
+            iw[3] = iw[2];
             // reject fully off-screen
             let (w, h) = (this.raster.w as f32, this.raster.h as f32);
             if p[..3].iter().all(|q| q[0] < 0.0)
@@ -1528,26 +1576,31 @@ impl Viewport {
                 id,
                 blend,
                 no_depth: false,
+                uv: [uvs[0], uvs[1], uvs[2], uvs[2]],
+                tex,
+                iw,
             });
         };
         if v.iter().all(inside) {
-            emit(self, v, c);
+            emit(self, v, c, uv);
             return;
         }
         if !v.iter().any(inside) {
             return;
         }
-        let mut poly: Vec<(Vec3, [f32; 4])> = vec![];
+        let lerp4 = |a: [f32; 4], b: [f32; 4], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t];
+        let lerp2 = |a: [f32; 2], b: [f32; 2], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        let mut poly: Vec<(Vec3, [f32; 4], [f32; 2])> = vec![];
         for i in 0..3 {
-            let (a, ca) = (v[i], c[i]);
-            let (b, cb) = (v[(i + 1) % 3], c[(i + 1) % 3]);
+            let j = (i + 1) % 3;
+            let (a, b) = (v[i], v[j]);
             let (ia, ib) = (inside(&a), inside(&b));
             if ia {
-                poly.push((a, ca));
+                poly.push((a, c[i], uv[i]));
             }
             if ia != ib {
                 let t = (near - a.z) / (b.z - a.z);
-                poly.push((a + (b - a) * t, if t < 0.5 { ca } else { cb }));
+                poly.push((a + (b - a) * t, lerp4(c[i], c[j], t), lerp2(uv[i], uv[j], t)));
             }
         }
         for k in 1..poly.len().saturating_sub(1) {
@@ -1555,6 +1608,7 @@ impl Viewport {
                 self,
                 [poly[0].0, poly[k].0, poly[k + 1].0],
                 [poly[0].1, poly[k].1, poly[k + 1].1],
+                [poly[0].2, poly[k].2, poly[k + 1].2],
             );
         }
     }
@@ -1567,6 +1621,19 @@ impl Viewport {
             (bg[2] * 1.12).min(1.0),
         ];
         (top, [bg[0] * 0.82, bg[1] * 0.82, bg[2] * 0.82])
+    }
+
+    /// Raster slot (index + 1) for a scene texture this frame; 0 if it can't be decoded.
+    fn texture_slot(&mut self, ed: &Editor, id: u32) -> u32 {
+        if let Some(i) = self.frame_tex.iter().position(|t| *t == id) {
+            return i as u32 + 1;
+        }
+        let Some(img) = ed.scene.texture(id).and_then(|t| self.tex_cache.get(t)) else {
+            return 0;
+        };
+        self.frame_tex.push(id);
+        self.raster.textures.push(img);
+        self.frame_tex.len() as u32
     }
 
     /// Opaque first, then blended prims far-to-near.
@@ -1633,6 +1700,7 @@ impl Viewport {
             ..Default::default()
         };
         std::mem::swap(&mut r.mesh_cache, &mut self.mesh_cache);
+        std::mem::swap(&mut r.tex_cache, &mut self.tex_cache);
         r.proj = cam.proj(aspect);
         r.vp = r.proj * cam.view();
         r.raster.resize(rw, rh);
@@ -1641,6 +1709,7 @@ impl Viewport {
         let (top, bot) = Self::background(ed);
         r.raster.render(top, bot, &r.prims, None);
         std::mem::swap(&mut r.mesh_cache, &mut self.mesh_cache);
+        std::mem::swap(&mut r.tex_cache, &mut self.tex_cache);
 
         // box-filter downsample; with transparency, alpha = object coverage
         let mut rgba = vec![0u8; width * height * 4];
@@ -1715,6 +1784,18 @@ impl Viewport {
                 width as u32,
                 theme::SELECT_OUTLINE,
                 theme::ACTIVE_OUTLINE,
+                self.raster.textures.clone(),
+                {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    for id in &self.frame_tex {
+                        id.hash(&mut h);
+                        if let Some(t) = ed.scene.texture(*id) {
+                            crate::textures::signature(&t.source).hash(&mut h);
+                        }
+                    }
+                    h.finish()
+                },
             );
             self.gpu_frame = Some(std::sync::Arc::new(fd));
             self.render_ms = self.render_ms * 0.9 + t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
@@ -2110,14 +2191,18 @@ impl Viewport {
             let ax = m.axis.map(|a| ["X", "Y", "Z"][a]).unwrap_or("free");
             let s = match m.kind {
                 ModalKind::Inset => format!("Inset  {:.3}", self.inset_amount),
+                ModalKind::Bevel => format!("Bevel  width {:.3}   segments {}  (wheel)", self.bevel_width, self.bevel_segments),
                 ModalKind::Grab => {
-                    let d = ed
-                        .selection
-                        .first()
-                        .and_then(|id| ed.scene.get(*id))
-                        .zip(m.originals.first())
-                        .map(|(o, (_, t0))| o.transform.location - t0.location)
-                        .unwrap_or_default();
+                    let d = if let (Some((pm, _, mat)), Some((i, p0))) = (ed.edit_mesh(), m.verts.first()) {
+                        pm.verts.get(*i as usize).map(|p| mat.transform_point3(*p) - mat.transform_point3(*p0)).unwrap_or_default()
+                    } else {
+                        ed.selection
+                            .first()
+                            .and_then(|id| ed.scene.get(*id))
+                            .zip(m.originals.first())
+                            .map(|(o, (_, t0))| o.transform.location - t0.location)
+                            .unwrap_or_default()
+                    };
                     format!("Move  D: {:.3}  {:.3}  {:.3}  ({ax})", d.x, d.y, d.z)
                 }
                 ModalKind::Rotate => {
@@ -2145,6 +2230,15 @@ impl Viewport {
                 s
             } else {
                 format!("{s}   [{}]", m.typed)
+            };
+            let s = if self.proportional && ed.editing() && matches!(m.kind, ModalKind::Grab | ModalKind::Rotate | ModalKind::Scale) {
+                // proportional radius circle around the pivot
+                if let (Some(c), Some(e)) = (self.project(m.pivot), self.project(m.pivot + self.cam.right() * self.prop_radius)) {
+                    painter.circle_stroke(c, (e - c).length(), Stroke::new(1.5, Color32::from_white_alpha(200)));
+                }
+                format!("{s}   Proportional {:.2} (wheel)", self.prop_radius)
+            } else {
+                s
             };
             let galley_pos = r.center_top() + vec2(0.0, 40.0);
             let rr = Rect::from_center_size(
@@ -2461,6 +2555,7 @@ impl Viewport {
             originals,
             verts: vec![],
             edit_base: None,
+            prop: vec![],
             pivot,
             typed: String::new(),
             from_gizmo,
@@ -2474,6 +2569,10 @@ impl Viewport {
             self.apply_inset(ed, &m, mouse);
             return;
         }
+        if m.kind == ModalKind::Bevel {
+            self.apply_bevel(ed, &m, mouse);
+            return;
+        }
         let edit = ed.editing();
         let typed: Option<f32> = m.typed.parse().ok();
         let center = self.project(m.pivot).unwrap_or(self.rect.center());
@@ -2483,7 +2582,7 @@ impl Viewport {
             (self.cam.eye() - m.pivot).normalize()
         };
         match m.kind {
-            ModalKind::Inset => {}
+            ModalKind::Inset | ModalKind::Bevel => {}
             ModalKind::Grab => {
                 let constraint = m.axis.map(|a| AXES[a]).or(m.axis_vec);
                 let delta_w = if let Some(axis) = constraint {
@@ -2643,6 +2742,31 @@ impl Viewport {
                         m.typed.pop();
                     }
                 }
+                // wheel (one step per notch): bevel segments, or the proportional-editing radius
+                let mut steps = 0.0f32;
+                for e in &i.events {
+                    if let egui::Event::MouseWheel { unit, delta, .. } = e {
+                        match unit {
+                            egui::MouseWheelUnit::Point => {
+                                self.bevel_scroll += delta.y;
+                                let n = (self.bevel_scroll / 50.0).trunc();
+                                self.bevel_scroll -= n * 50.0;
+                                steps += n;
+                            }
+                            _ => steps += delta.y.signum(),
+                        }
+                    }
+                }
+                steps += i.key_pressed(Key::PageUp) as i32 as f32 - i.key_pressed(Key::PageDown) as i32 as f32;
+                if steps != 0.0 {
+                    if let Some(m) = &self.modal {
+                        if m.kind == ModalKind::Bevel {
+                            self.bevel_segments = (self.bevel_segments as i32 + steps as i32).clamp(1, 16) as usize;
+                        } else if self.proportional && !m.prop.is_empty() {
+                            self.prop_radius = (self.prop_radius * 1.15f32.powf(steps)).clamp(0.01, 500.0);
+                        }
+                    }
+                }
                 if i.key_pressed(Key::Minus) {
                     if let Some(m) = &mut self.modal {
                         if m.typed.starts_with('-') {
@@ -2676,7 +2800,10 @@ impl Viewport {
         }
         self.status_hint = String::new();
         if ed.editing() {
-            self.status_hint = "Edit Mode · 1/2/3 vertex/edge/face · E extrude · I inset · Ctrl+R loop cut · M merge · X delete · G/R/S · Tab exit".into();
+            self.status_hint = format!(
+                "Edit Mode · 1/2/3 vertex/edge/face · E extrude · I inset · Ctrl+B bevel · Ctrl+R loop cut · M merge · X delete · G/R/S · O proportional ({}) · Tab exit",
+                if self.proportional { "on" } else { "off" }
+            );
         }
         if self.loopcut_input(&ctx, resp, ed, mouse) {
             // still allow navigation while choosing the loop

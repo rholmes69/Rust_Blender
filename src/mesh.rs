@@ -12,6 +12,10 @@ pub struct PolyMesh {
     pub verts: Vec<Vec3>,
     /// Faces as counter-clockwise vertex loops (outward normal by right-hand rule).
     pub faces: Vec<Vec<u32>>,
+    /// Optional texture coordinates per face corner (parallel to `faces`). Empty = generated
+    /// box-projection UVs. Topology-changing edit operators drop them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uvs: Vec<Vec<[f32; 2]>>,
 }
 
 /// Render data derived from a `PolyMesh`.
@@ -23,6 +27,8 @@ pub struct Mesh {
     pub tri_face: Vec<u32>,
     /// Per-vertex smooth normals (same length as positions).
     pub normals: Vec<Vec3>,
+    /// Texture coordinates for each triangle corner.
+    pub tri_uv: Vec<[[f32; 2]; 3]>,
     /// Unique edges, each with the (up to two) triangles that share it.
     pub edges: Vec<Edge>,
     pub smooth: bool,
@@ -202,15 +208,47 @@ impl PolyMesh {
         self.cleanup();
     }
 
+    /// Are the per-corner UVs present and consistent with the faces?
+    pub fn has_uvs(&self) -> bool {
+        !self.uvs.is_empty() && self.uvs.len() == self.faces.len() && self.uvs.iter().zip(&self.faces).all(|(u, f)| u.len() == f.len())
+    }
+
     /// Remove consecutive duplicate indices, faces with < 3 verts, and unreferenced vertices.
     pub fn cleanup(&mut self) {
-        for f in &mut self.faces {
-            f.dedup();
-            while f.len() > 1 && f.first() == f.last() {
-                f.pop();
-            }
+        let keep_uvs = self.has_uvs();
+        let mut uvs = std::mem::take(&mut self.uvs);
+        if !keep_uvs {
+            uvs = vec![vec![]; self.faces.len()];
         }
-        self.faces.retain(|f| f.len() >= 3);
+        for (f, uv) in self.faces.iter_mut().zip(uvs.iter_mut()) {
+            // dedup consecutive indices, keeping the UV list aligned
+            let mut nf = Vec::with_capacity(f.len());
+            let mut nu = Vec::with_capacity(f.len());
+            for (k, &v) in f.iter().enumerate() {
+                if nf.last() != Some(&v) {
+                    nf.push(v);
+                    if keep_uvs {
+                        nu.push(uv[k]);
+                    }
+                }
+            }
+            while nf.len() > 1 && nf.first() == nf.last() {
+                nf.pop();
+                if keep_uvs {
+                    nu.pop();
+                }
+            }
+            *f = nf;
+            *uv = nu;
+        }
+        let keep: Vec<bool> = self.faces.iter().map(|f| f.len() >= 3).collect();
+        let mut k = keep.iter();
+        self.faces.retain(|_| *k.next().unwrap());
+        if keep_uvs {
+            let mut k = keep.iter();
+            uvs.retain(|_| *k.next().unwrap());
+            self.uvs = uvs;
+        }
         let mut used = vec![false; self.verts.len()];
         for f in &self.faces {
             for &i in f {
@@ -239,13 +277,17 @@ impl PolyMesh {
     pub fn to_mesh(&self, smooth: bool) -> Mesh {
         let mut tris = vec![];
         let mut tri_face = vec![];
+        let mut tri_uv = vec![];
+        let has_uvs = self.has_uvs();
         let mut poly_edges: HashSet<(u32, u32)> = HashSet::new();
         for (fi, f) in self.faces.iter().enumerate() {
             for i in 0..f.len() {
                 let (a, b) = (f[i], f[(i + 1) % f.len()]);
                 poly_edges.insert((a.min(b), a.max(b)));
             }
+            let corner_uv: Vec<[f32; 2]> = if has_uvs { self.uvs[fi].clone() } else { box_uv(&self.verts, f) };
             for t in triangulate(&self.verts, f) {
+                tri_uv.push(t.map(|v| f.iter().position(|&x| x == v).map(|k| corner_uv[k]).unwrap_or([0.0, 0.0])));
                 tris.push(t);
                 tri_face.push(fi as u32);
             }
@@ -254,12 +296,37 @@ impl PolyMesh {
             positions: self.verts.clone(),
             tris,
             tri_face,
+            tri_uv,
             smooth,
             ..Default::default()
         };
         m.compute(&poly_edges);
         m
     }
+}
+
+/// Generated UVs: project each face onto the plane of its dominant normal axis
+/// (2 units of geometry = one texture repeat, like a default cube face).
+pub fn box_uv(verts: &[Vec3], f: &[u32]) -> Vec<[f32; 2]> {
+    let mut n = Vec3::ZERO;
+    for i in 0..f.len() {
+        let (a, b) = (verts[f[i] as usize], verts[f[(i + 1) % f.len()] as usize]);
+        n += Vec3::new((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y));
+    }
+    let a = n.abs();
+    f.iter()
+        .map(|&i| {
+            let p = verts[i as usize];
+            let (u, v) = if a.z >= a.x && a.z >= a.y {
+                (p.x * n.z.signum(), p.y)
+            } else if a.x >= a.y {
+                (p.y * n.x.signum(), p.z)
+            } else {
+                (-p.x * n.y.signum(), p.z)
+            };
+            [u * 0.5 + 0.5, 1.0 - (v * 0.5 + 0.5)]
+        })
+        .collect()
 }
 
 /// Triangulate a polygon (ear clipping in the polygon's plane; fan for convex quads/tris).
@@ -353,6 +420,7 @@ impl Builder {
         let mut m = PolyMesh {
             verts: self.p,
             faces: self.faces,
+            ..Default::default()
         };
         m.weld(1e-4);
         m
@@ -527,6 +595,7 @@ pub fn ico_sphere(sub: u32) -> PolyMesh {
     PolyMesh {
         verts: p,
         faces: f.into_iter().map(|t| t.to_vec()).collect(),
+        ..Default::default()
     }
 }
 

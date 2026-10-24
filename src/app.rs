@@ -976,22 +976,27 @@ impl App {
             .add_filter("Rust Blender scene", &["rblend", "json"])
             .pick_file()
         {
-            match std::fs::read_to_string(&p)
-                .map_err(|e| e.to_string())
-                .and_then(|s| serde_json::from_str::<Scene>(&s).map_err(|e| e.to_string()))
-            {
-                Ok(s) => {
-                    self.ed.snapshot();
-                    self.ed.scene = s;
-                    self.ed.selection.clear();
-                    self.ed.active = None;
-                    self.ed.file_path = Some(p.clone());
-                    self.ed.dirty = false;
-                    self.ed.view_requests.push(ViewRequest::FrameAll);
-                    self.toast(format!("Opened {}", p.display()), theme::OK);
-                }
-                Err(e) => self.toast(format!("Open failed: {e}"), theme::ERR),
+            self.open_path(&p);
+        }
+    }
+
+    fn open_path(&mut self, p: &std::path::Path) {
+        match std::fs::read_to_string(p)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<Scene>(&s).map_err(|e| e.to_string()))
+        {
+            Ok(s) => {
+                self.ed.snapshot();
+                self.ed.exit_edit();
+                self.ed.scene = s;
+                self.ed.selection.clear();
+                self.ed.active = None;
+                self.ed.file_path = Some(p.to_path_buf());
+                self.ed.dirty = false;
+                self.ed.view_requests.push(ViewRequest::FrameAll);
+                self.toast(format!("Opened {}", p.display()), theme::OK);
             }
+            Err(e) => self.toast(format!("Open failed: {e}"), theme::ERR),
         }
     }
 
@@ -1113,13 +1118,22 @@ impl App {
                     Err(e) => ToolResult::err(format!("could not write {path}: {e}")),
                 }
             }
+            "import_gltf" => {
+                let Some(path) = args["path"].as_str().filter(|p| !p.is_empty()) else {
+                    return ToolResult::err("missing path");
+                };
+                let log = self.ed.execute(&[Command { action: "import".into(), name: Some(path.to_string()), ..Default::default() }]);
+                let line = log.first().cloned().unwrap_or_default();
+                self.chat.push(ChatEntry::new(Role::System, format!("⚙ MCP ({client_short}): {}", line.trim_start_matches(['✔', '✖', ' ']))));
+                if line.starts_with('✔') { ToolResult::ok(line) } else { ToolResult::err(line) }
+            }
             "render_image" => {
                 let out = self.ed.scene.output;
                 let w = args["width"].as_u64().map(|v| v as usize).unwrap_or(if args["path"].is_string() { out.width as usize } else { 960 });
                 let h = args["height"].as_u64().map(|v| v as usize).unwrap_or(w * out.height as usize / out.width.max(1) as usize);
                 let transparent = args["transparent"].as_bool().unwrap_or(out.transparent);
                 let r = self.vp.render_image(&self.ed, w, h, transparent);
-                let png = match encode_png(r.width, r.height, &r.rgba) {
+                let png = match crate::textures::encode_png(r.width, r.height, &r.rgba) {
                     Ok(b) => b,
                     Err(e) => return ToolResult::err(e),
                 };
@@ -1176,7 +1190,7 @@ impl App {
             .unwrap_or_else(|| "render.png".into());
         if let Some(p) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name(name).save_file() {
             let r = &rv.result;
-            match encode_png(r.width, r.height, &r.rgba).and_then(|b| std::fs::write(&p, b).map_err(|e| e.to_string())) {
+            match crate::textures::encode_png(r.width, r.height, &r.rgba).and_then(|b| std::fs::write(&p, b).map_err(|e| e.to_string())) {
                 Ok(_) => {
                     self.toast(format!("Saved {}", p.display()), theme::OK);
                     if let Some(rv) = &mut self.render {
@@ -1265,6 +1279,35 @@ impl App {
         }
         if !open {
             self.show_render = false;
+        }
+    }
+
+    fn import_gltf_dialog(&mut self) {
+        if let Some(p) = rfd::FileDialog::new().add_filter("glTF 2.0", &["glb", "gltf"]).pick_file() {
+            self.import_path(&p);
+        }
+    }
+
+    /// Import a file by extension: glTF scenes, images as a texture on the selection, or open .rblend.
+    fn import_path(&mut self, p: &std::path::Path) {
+        let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let cmd = match ext.as_str() {
+            "glb" | "gltf" => Command { action: "import".into(), name: Some(p.display().to_string()), ..Default::default() },
+            "png" | "jpg" | "jpeg" => Command { action: "set_texture".into(), name: Some(p.display().to_string()), ..Default::default() },
+            "rblend" => {
+                self.open_path(p);
+                return;
+            }
+            _ => {
+                self.toast(format!("Can't import .{ext} files (glb, gltf, png, jpg, rblend)"), theme::WARN);
+                return;
+            }
+        };
+        let log = self.ed.execute(&[cmd]);
+        if let Some(l) = log.first() {
+            let ok = l.starts_with('✔');
+            self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if ok { theme::OK } else { theme::ERR });
+            self.chat.push(ChatEntry::new(Role::System, format!("📂 {}", l.trim_start_matches(['✔', ' ']))));
         }
     }
 
@@ -1459,6 +1502,9 @@ impl App {
                                 self.save(true);
                             }
                             ui.separator();
+                            if ui.button("Import glTF 2.0 (.glb/.gltf)…").clicked() {
+                                self.import_gltf_dialog();
+                            }
                             if ui.button("Export glTF 2.0 (.glb)…").clicked() {
                                 self.export_gltf();
                             }
@@ -1522,9 +1568,18 @@ impl App {
                                 if ui.button("Inset Faces   I").clicked() {
                                     tool = Some("inset");
                                 }
+                                if ui.button("Bevel Edges   Ctrl+B").clicked() {
+                                    tool = Some("bevel");
+                                }
                                 if ui.button("Loop Cut   Ctrl+R").clicked() {
                                     tool = Some("loopcut");
                                 }
+                                ui.separator();
+                                let mut p = self.vp.proportional;
+                                if ui.checkbox(&mut p, "Proportional Editing   O").changed() {
+                                    self.vp.proportional = p;
+                                }
+                                ui.separator();
                                 if ui.button("Subdivide").clicked() {
                                     op = Some(EditOp::Subdivide);
                                 }
@@ -1572,6 +1627,10 @@ impl App {
                                         self.vp.begin_inset(&mut self.ed, c);
                                     }
                                     Some("loopcut") => self.vp.loopcut = Some(1),
+                                    Some("bevel") => {
+                                        let c = self.vp.rect().center() + vec2(60.0, 0.0);
+                                        self.vp.begin_bevel(&mut self.ed, c);
+                                    }
                                     _ => {}
                                 }
                             });
@@ -2908,11 +2967,29 @@ impl App {
                         return;
                     };
                     let mut o = orig.clone();
+                    let mut tex_action = None;
                     match self.props_tab {
                         PropsTab::Object => object_props(ui, &mut o),
                         PropsTab::Modifiers => modifier_props(ui, &mut o),
-                        PropsTab::Material => material_props(ui, &mut o),
+                        PropsTab::Material => tex_action = material_props(ui, &mut o, &self.ed.scene.textures),
                         _ => {}
+                    }
+                    if let Some(spec) = tex_action {
+                        let spec = if spec == "<load>" {
+                            match rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file() {
+                                Some(p) => p.display().to_string(),
+                                None => String::new(),
+                            }
+                        } else {
+                            spec
+                        };
+                        if !spec.is_empty() {
+                            let log = self.ed.execute(&[Command { action: "set_texture".into(), target: Some(o.name.clone()), name: Some(spec), ..Default::default() }]);
+                            if let Some(l) = log.first() {
+                                self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::ERR });
+                            }
+                        }
+                        return;
                     }
                     if o != orig {
                         if !self.prop_snapshotted {
@@ -3409,6 +3486,7 @@ impl App {
             PaletteAction::Open => self.open(),
             PaletteAction::Export => self.export_obj(),
             PaletteAction::ExportGltf => self.export_gltf(),
+            PaletteAction::ImportGltf => self.import_gltf_dialog(),
             PaletteAction::Tool(t) => self.vp.tool = t,
         }
     }
@@ -3424,6 +3502,7 @@ enum PaletteAction {
     Open,
     Export,
     ExportGltf,
+    ImportGltf,
     Tool(Tool),
 }
 
@@ -3622,6 +3701,7 @@ fn palette_items() -> Vec<(String, PaletteAction)> {
             "File ▸ Export glTF (.glb)".into(),
             PaletteAction::ExportGltf,
         ),
+        ("File ▸ Import glTF (.glb/.gltf)".into(), PaletteAction::ImportGltf),
         (
             "Render ▸ Render Image (F12)".into(),
             PaletteAction::Cmd(Command::new("render")),
@@ -3654,6 +3734,24 @@ fn palette_items() -> Vec<(String, PaletteAction)> {
             PaletteAction::Cmd(Command {
                 action: "inset".into(),
                 number: Some(0.25),
+                ..Default::default()
+            }),
+        ),
+        (
+            "Mesh ▸ Bevel Edges".into(),
+            PaletteAction::Cmd(Command {
+                action: "bevel".into(),
+                number: Some(0.1),
+                segments: Some(1.0),
+                ..Default::default()
+            }),
+        ),
+        (
+            "Mesh ▸ Bevel (rounded)".into(),
+            PaletteAction::Cmd(Command {
+                action: "bevel".into(),
+                number: Some(0.15),
+                segments: Some(4.0),
                 ..Default::default()
             }),
         ),
@@ -3736,6 +3834,8 @@ const HELP: &[(&str, &str)] = &[
     ("1 / 2 / 3 (edit)", "Vertex / edge / face select"),
     ("E / I (edit)", "Extrude along normal / inset faces"),
     ("Ctrl+R (edit)", "Loop cut (wheel or +/- = number of cuts)"),
+    ("Ctrl+B (edit)", "Bevel selected edges (mouse = width, wheel = segments)"),
+    ("O (edit)", "Proportional editing on/off (wheel = radius during G/R/S)"),
     (
         "M / X / Alt+N (edit)",
         "Merge at centre / delete / flip normals",
@@ -3994,14 +4094,16 @@ fn modifier_props(ui: &mut Ui, o: &mut crate::scene::Object) {
     }
 }
 
-fn material_props(ui: &mut Ui, o: &mut crate::scene::Object) {
+/// Returns a texture request: a pattern name, an image path, "none", or "<load>" (file dialog).
+fn material_props(ui: &mut Ui, o: &mut crate::scene::Object, textures: &[crate::textures::Texture]) -> Option<String> {
     if !o.is_mesh() {
         ui.label(
             RichText::new("Lights and cameras have no material — see the Object tab.")
                 .color(theme::TEXT_DIM),
         );
-        return;
+        return None;
     }
+    let mut action = None;
     // preview swatch
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
     let p = ui.painter();
@@ -4048,6 +4150,34 @@ fn material_props(ui: &mut Ui, o: &mut crate::scene::Object) {
                 .color(theme::TEXT_DIM),
         );
     });
+    section(ui, "Texture", |ui| {
+        let current = textures.iter().find(|t| t.id == o.material.texture).map(|t| t.name.clone()).unwrap_or_else(|| "None".into());
+        ui.horizontal(|ui| {
+            ui.label("Image");
+            egui::ComboBox::from_id_salt("tex_pick").selected_text(current).show_ui(ui, |ui| {
+                ui.selectable_value(&mut o.material.texture, 0, "None");
+                for t in textures {
+                    ui.selectable_value(&mut o.material.texture, t.id, &t.name);
+                }
+            });
+            if ui.button("Load image…").clicked() {
+                action = Some("<load>".to_string());
+            }
+        });
+        ui.label(RichText::new("Procedural").small().color(theme::TEXT_DIM));
+        ui.horizontal_wrapped(|ui| {
+            for (name, _, _) in crate::textures::PROCEDURAL {
+                if ui.small_button(*name).clicked() {
+                    action = Some(name.to_string());
+                }
+            }
+        });
+        if o.material.texture != 0 {
+            ui.add(egui::Slider::new(&mut o.material.tex_scale, 0.1..=20.0).logarithmic(true).text("Repeats"));
+            ui.label(RichText::new("The base colour tints the texture (white = original colours). Seen in Material Preview and F12 renders.").small().color(theme::TEXT_DIM));
+        }
+    });
+    action
 }
 
 fn short_model(m: &str) -> &str {
@@ -4094,6 +4224,10 @@ impl eframe::App for App {
             self.vp.ui(ui, &mut self.ed);
         });
         self.popups(&ctx);
+        for f in ctx.input(|i| i.raw.dropped_files.clone()) {
+            let p = f.path().to_path_buf();
+            self.import_path(&p);
+        }
         if std::mem::take(&mut self.ed.render_request) {
             self.render_now(&ctx);
         }
@@ -4120,15 +4254,3 @@ impl eframe::App for App {
     }
 }
 
-/// Encode straight RGBA8 as PNG.
-pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
-    {
-        let mut enc = png::Encoder::new(&mut buf, w as u32, h as u32);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut wr = enc.write_header().map_err(|e| e.to_string())?;
-        wr.write_image_data(rgba).map_err(|e| e.to_string())?;
-    }
-    Ok(buf)
-}

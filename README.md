@@ -6,19 +6,22 @@ A Blender-style 3D editor written in Rust. You can drive it with the mouse and k
 
 ![F12 render](docs/render.png)
 
+![Imported Khronos sample models](docs/import.png)
+
 ## Features
 
 | Area | What you get |
 |---|---|
 | **Viewport** | A **GPU renderer** (wgpu) with 4× MSAA, a real depth buffer and selection outlines drawn in a shader. Picking is pixel-exact from an ID buffer that is read back asynchronously. A multithreaded **software renderer** takes over automatically if the GPU path isn't available, and you can toggle it under *Overlays*. Shading modes are Wireframe, Solid (studio light) and Material Preview (scene lights, Fresnel, metallic and roughness). Also X-ray, a fading grid, a 3D cursor and a clickable navigation gizmo. |
 | **Object mode** | Cube, plane, UV/ico sphere, cylinder, cone, torus and a "blob" head. Modal **G / R / S** transforms like Blender, with X/Y/Z axis locks, typed numbers and Ctrl to snap. Move, Rotate and Scale gizmos, box select, duplicate, hide/reveal, unlimited undo, and Array, Mirror and Radial-Array modifiers. |
-| **Edit mode** (Tab) | Polygon (n-gon) meshes with **vertex / edge / face** selection (1 / 2 / 3), box select and G/R/S on components. **Extrude** (E, constrained to the face normal), **Inset** (I), **Loop Cut** (Ctrl+R, wheel or +/- sets the cut count) with a live preview, **Subdivide**, **Merge** (M), **Delete** (X) and **Flip Normals** (Alt+N). |
+| **Edit mode** (Tab) | Polygon (n-gon) meshes with **vertex / edge / face** selection (1 / 2 / 3), box select and G/R/S on components. **Extrude** (E, constrained to the face normal), **Inset** (I), **Bevel** (Ctrl+B: mouse sets the width, wheel the segments, with round profiles and spherical corners), **Loop Cut** (Ctrl+R, wheel or +/- sets the cut count) with a live preview, **Subdivide**, **Merge** (M), **Delete** (X) and **Flip Normals** (Alt+N). **Proportional editing** (O): G/R/S pulls nearby vertices along with a smooth falloff, and the wheel changes the radius. The AI can bevel too ("round the edges of the cube"). |
 | **Lights & cameras** | Point, Sun and Spot lights that light the Material Preview, and camera objects. **Numpad 0** looks through the camera, with a passepartout around the frame; **Ctrl+Alt+0** aligns the camera to the view. A "look at" command aims lights and cameras. The default scene is Blender's: a cube, a light and a camera. |
 | **Animation** | Keyframes with eased interpolation, a timeline, auto-keying and playback. |
 | **AI Copilot** | **Streams** replies from Ollama: the text appears live, and each command is applied the moment it finishes generating. There's a Stop button, and the whole answer is a single undo step. Simple commands run instantly without the LLM. The app auto-picks the best installed model and can download models from inside the app. The AI can also edit meshes (select faces, extrude, inset, loop cut and so on). |
-| **Voice** | Local Whisper (tiny, base, small or distil) with hands-free auto-stop and a level meter. Replies can optionally be read aloud. |
+| **Voice** | Local Whisper (tiny, base, small or distil) with hands-free auto-stop and a level meter. Spoken requests go through tev1 for sub-second edits, and the app **says what it did** ("Added a red cube"). **Conversation mode** reopens the mic after each reply, an optional **wake word** ("Blender, …") listens in the background, and you can say "no, undo that", "stop", "repeat that" or "that's all" at any time. |
 | **Render (F12)** | Renders a final image through the scene camera: shadows from every light are ray-traced against the real geometry, plus ambient occlusion, ACES filmic tone mapping and 2×2 supersampled anti-aliasing. Choose 720p, 1080p, 4K or square, optionally with a transparent background, then save as PNG. You can trigger it by voice or the AI ("render it") or over MCP. |
-| **Files** | Save and open `.rblend`. Export **glTF 2.0 (.glb)** with meshes (modifiers applied), PBR materials, emissive strength, lights (`KHR_lights_punctual`), cameras and baked animation; the output passes the Khronos glTF-Validator with 0 errors and 0 warnings. Also exports Wavefront `.obj`. |
+| **Textures & UVs** | Image textures (PNG/JPEG) and 10 tileable **procedural** ones (checker, bricks, wood, marble, tiles, grid, noise, stripes, concrete, grass). They show in Material Preview (GPU texture atlas or the software renderer, perspective-correct) and in F12 renders. Meshes keep per-corner UVs from imported files; anything else gets automatic box-projection UVs, with a Repeats slider. Textures are saved inside the `.rblend` file. Ask the AI "make the floor wood", or say "give it a brick texture". |
+| **Files** | Save and open `.rblend`. **Import glTF 2.0** (`.glb`, or `.gltf` with embedded or external buffers and images): meshes with UVs, PBR materials, base-colour textures, lights and cameras, with triangles merged back into quads. You can also drag files onto the window: `.glb`/`.gltf` import, images become a texture on the selection, `.rblend` opens. **Export glTF 2.0 (.glb)** with meshes (modifiers applied), UVs and textures, PBR materials, emissive strength, lights (`KHR_lights_punctual`), cameras and baked animation; the output passes the Khronos glTF-Validator with 0 errors and 0 warnings. Also exports Wavefront `.obj`. |
 
 ## Recommended Ollama model
 
@@ -65,6 +68,7 @@ Rust Blender runs a **Model Context Protocol** server, so external agents such a
 | `check_scene` | Runs the agent-loop geometry checks (floating, sunken, hidden, duplicates) on the whole scene |
 | `ask_copilot` | Hands a plain-English request to the app's own Ollama Copilot |
 | `render_image` | Renders through the camera and returns the PNG as an image, so the agent can see its work (optionally also saves it) |
+| `import_gltf` | Imports a `.glb`/`.gltf` file |
 | `export_gltf` | Writes the scene to a `.glb` file |
 
 **Claude Code** (HTTP):
@@ -112,6 +116,13 @@ Click the mic (or press **Ctrl+Space** or the **`** key), speak, and pause. Exam
 
 Follow-ups work because the AI sees the current scene and the conversation history: "make the second one red", "now hide the hat".
 
+### Hands-free
+
+* After a voice request the app speaks a one-line confirmation, then (with **Conversation** on) listens again. Stay silent for about 7 seconds, or say "that's all", to stop.
+* Turn on **Wake word** in Copilot ⚙ to talk without clicking: "Blender, add a torus", or just "Blender…" and it answers "Yes?". Listening stays on your computer.
+* Say "stop" to cancel a running build, "no, undo that" to revert, or "what did you do?" to hear the last confirmation again. Clicking the mic while it talks interrupts it.
+* Common mishearings are fixed before the request is sent ("queue" → cube, "Taurus" → torus, "in set" → inset), and the decision model is told the text came from speech.
+
 ## Keyboard (Blender-compatible)
 
 | Keys | Action |
@@ -128,7 +139,8 @@ Follow-ups work because the AI sees the current scene and the conversation histo
 | Ctrl+Z / Ctrl+Shift+Z, Ctrl+S / O / N | undo / redo, save / open / new |
 | Tab | edit mode on the active mesh |
 | 1 / 2 / 3 (edit) | vertex / edge / face select |
-| E, I, Ctrl+R (edit) | extrude, inset, loop cut |
+| E, I, Ctrl+B, Ctrl+R (edit) | extrude, inset, bevel, loop cut |
+| O (edit) | proportional editing (wheel = radius) |
 | M, X, Alt+N (edit) | merge, delete, flip normals |
 | Numpad 0, Ctrl+Alt+0 | look through the camera, align the camera to the view |
 | F12 / F11 | render image / show the last render |
@@ -146,9 +158,12 @@ src/
   render.rs    multithreaded software z-buffer rasterizer (fallback), ID buffer, selection outline
   editmesh.rs  mesh operators (extrude, inset, loop cut, subdivide, merge, delete …)
   gltf.rs      glTF 2.0 / .glb exporter
+  gltf_import.rs  glTF 2.0 importer (.glb / .gltf, data URIs, external files), quad merging
+  textures.rs  image + procedural textures, decoding, sampling, cache
   editor.rs    editor state, undo, and the command executor shared by UI / AI / voice
   mcp.rs       MCP server (Streamable HTTP on 127.0.0.1) + --mcp-stdio bridge
   ai.rs        Ollama client, model ranking, JSON schema + system prompt, offline parser
+  voiceflow.rs wake word, voice intents, mishearing fixes, spoken confirmations, interruptible TTS
   voice.rs     cpal mic capture, VAD, resampling, candle Whisper + tiny BPE decoder
   scene.rs     objects, transforms, materials, modifiers, keyframes, OBJ export
   mesh.rs      PolyMesh (n-gons) + render mesh, ear-clipping triangulation, procedural primitives

@@ -50,6 +50,9 @@ impl Viewport {
             id: 0,
             blend: true,
             no_depth,
+            uv: RPrim::NO_UV,
+            tex: 0,
+            iw: [1.0; 4],
         });
     }
 
@@ -339,6 +342,14 @@ impl Viewport {
             self.begin_inset(ed, mouse);
         } else if c(M::COMMAND, Key::R) {
             self.loopcut = Some(1);
+        } else if c(M::COMMAND, Key::B) {
+            self.begin_bevel(ed, mouse);
+        } else if c(M::NONE, Key::O) {
+            self.proportional = !self.proportional;
+            self.flash = Some((
+                format!("Proportional editing {}", if self.proportional { "on — mouse wheel changes the radius during G/R/S" } else { "off" }),
+                std::time::Instant::now(),
+            ));
         } else if c(M::NONE, Key::M) {
             self.report(ed.edit_op(EditOp::Merge));
         } else if c(M::NONE, Key::X) || c(M::NONE, Key::Delete) {
@@ -402,6 +413,55 @@ impl Viewport {
         }
     }
 
+    pub fn begin_bevel(&mut self, ed: &mut Editor, mouse: Pos2) {
+        let Some((pm, st, _)) = ed.edit_mesh() else {
+            return;
+        };
+        if em::selected_edges(pm, &st.sel).is_empty() {
+            self.report(Err("select edges to bevel".into()));
+            return;
+        }
+        let base = (pm.clone(), st.sel.clone());
+        self.begin_vert_modal(ed, ModalKind::Bevel, mouse, false);
+        if let Some(m) = &mut self.modal {
+            m.edit_base = Some(base);
+            m.prop.clear();
+        }
+        self.bevel_scroll = 0.0;
+    }
+
+    pub(super) fn apply_bevel(&mut self, ed: &mut Editor, m: &Modal, mouse: Pos2) {
+        let Some((base, base_sel)) = &m.edit_base else {
+            return;
+        };
+        let center = self.project(m.pivot).unwrap_or(self.rect.center());
+        let d0 = (m.start_mouse - center).length();
+        let d = (mouse - center).length();
+        let mut w = (d - d0 * 0.8).max(0.0) * 0.5 * self.world_per_pixel(m.pivot);
+        if let Ok(v) = m.typed.parse::<f32>() {
+            w = v.max(0.0);
+        }
+        let Some(st) = ed.edit.as_ref() else { return };
+        let Some(o) = ed.scene.get(st.obj) else { return };
+        let scale = (glam::Mat3::from_mat4(o.transform.matrix()) * Vec3::ONE.normalize()).length().max(1e-6);
+        let mut pm = base.clone();
+        let mut sel = base_sel.clone();
+        if w > 1e-4 && em::bevel(&mut pm, &mut sel, w / scale, self.bevel_segments).is_ok() {
+            if let Some(st) = ed.edit.as_mut() {
+                st.sel = sel;
+                if let Some(o) = ed.scene.get_mut(st.obj) {
+                    o.mesh = Some(pm);
+                }
+            }
+        } else if let Some(st) = ed.edit.as_mut() {
+            st.sel = base_sel.clone();
+            if let Some(o) = ed.scene.get_mut(st.obj) {
+                o.mesh = Some(base.clone());
+            }
+        }
+        self.bevel_width = w;
+    }
+
     /// Start a modal transform of the selected vertices.
     pub(super) fn begin_vert_modal(
         &mut self,
@@ -425,6 +485,22 @@ impl Viewport {
             .map(|(i, v)| (i as u32, *v))
             .collect();
         let pivot = m.transform_point3(c);
+        // proportional editing: distances from every unselected vertex to the selection
+        let mut prop = vec![];
+        if self.proportional && matches!(kind, ModalKind::Grab | ModalKind::Rotate | ModalKind::Scale) {
+            let sel_w: Vec<Vec3> = verts.iter().map(|(_, p)| m.transform_point3(*p)).collect();
+            let n_unsel = pm.verts.len() - verts.len();
+            if n_unsel * sel_w.len() <= 40_000_000 {
+                for (i, p) in pm.verts.iter().enumerate() {
+                    if st.sel.get(i).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let w = m.transform_point3(*p);
+                    let d = sel_w.iter().map(|s| s.distance_squared(w)).fold(f32::MAX, f32::min).sqrt();
+                    prop.push((i as u32, *p, d));
+                }
+            }
+        }
         ed.snapshot();
         self.modal = Some(Modal {
             kind,
@@ -434,6 +510,7 @@ impl Viewport {
             originals: vec![],
             verts,
             edit_base: None,
+            prop,
             pivot,
             typed: String::new(),
             from_gizmo,
@@ -458,6 +535,17 @@ impl Viewport {
             for (i, p0) in &m.verts {
                 if let Some(v) = pm.verts.get_mut(*i as usize) {
                     *v = inv.transform_point3(f(mat.transform_point3(*p0)));
+                }
+            }
+            for (i, p0, d) in &m.prop {
+                if let Some(v) = pm.verts.get_mut(*i as usize) {
+                    let w = em::falloff(*d, self.prop_radius);
+                    *v = if w > 0.0 {
+                        let a = mat.transform_point3(*p0);
+                        inv.transform_point3(a + (f(a) - a) * w)
+                    } else {
+                        *p0
+                    };
                 }
             }
         }

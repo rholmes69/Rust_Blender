@@ -84,6 +84,11 @@ pub fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}, "transparent": {"type": "boolean"}, "path": {"type": "string"}}}
         },
         {
+            "name": "import_gltf",
+            "description": "Import a glTF 2.0 file (.glb or .gltf, absolute path) into the scene: meshes with UVs, PBR materials and base-colour textures, lights and cameras. The new objects end up selected.",
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+        },
+        {
             "name": "export_gltf",
             "description": "Export the scene as a binary glTF 2.0 (.glb) file at the given absolute path.",
             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
@@ -278,7 +283,7 @@ mod tests {
         assert!(handle_message(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), "t", &tx, &|| {}).is_none());
         let list = handle_message(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}), "t", &tx, &|| {}).unwrap();
         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["run_commands", "get_scene", "check_scene", "ask_copilot", "render_image", "export_gltf"]);
+        assert_eq!(names, vec!["run_commands", "get_scene", "check_scene", "ask_copilot", "render_image", "import_gltf", "export_gltf"]);
         assert_eq!(base64(b"Man"), "TWFu");
         assert_eq!(base64(b"Ma"), "TWE=");
         assert_eq!(base64(b"M"), "TQ==");

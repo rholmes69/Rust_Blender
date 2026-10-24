@@ -303,6 +303,7 @@ pub fn command_schema() -> Value {
                         "modifier": {"type": "string", "enum": ["array","mirror","radial"]},
                         "view": {"type": "string"},
                         "power": {"type": "number"},
+                        "segments": {"type": "number"},
                         "look_at": {"type": "string"}
                     },
                     "required": ["action"]
@@ -344,11 +345,13 @@ pub const ACTIONS: &[&str] = &[
     "look_at",
     "camera_view",
     "render",
+    "set_texture",
     "edit_mode",
     "object_mode",
     "select_faces",
     "extrude",
     "inset",
+    "bevel",
     "subdivide",
     "loop_cut",
     "merge",
@@ -391,9 +394,13 @@ Each command is an object with "action" plus only the fields it needs:
 - view: view = front|back|left|right|top|bottom|iso|ortho|all|selected|zoom_in|zoom_out.
 - shading: view = wireframe|solid|material.   set_detail: target, number 1-6 (mesh resolution).
 - set_background: color; vector = sun direction; number = sun strength.
+- bevel in object mode: target, number = width (e.g. 0.1), segments (rounds every edge of the object).
+- set_texture: target, name = checker|bricks|wood|marble|tiles|grid|noise|stripes|concrete|grass (or an
+  image file path), number = repeats (e.g. 6 for a big floor), optional color = tint; name "none" removes it.
 - MESH EDITING (Blender edit mode, works on the vertices/faces of one mesh object):
   edit_mode (target) -> select_faces (vector = face direction, e.g. [0,0,1] = top faces; name "extend" to add)
-  -> extrude (number = distance along the face normal) / inset (number 0-1) / subdivide / loop_cut
+  -> extrude (number = distance along the face normal) / inset (number 0-1) / bevel (number = width,
+  segments = 1 for a chamfer or 3-6 for rounded; bevels the edges of the selection) / subdivide / loop_cut
   (vector = axis the cut edges run along, e.g. [0,0,1] cuts a horizontal ring; number = cuts) / merge /
   flip_normals / delete (no target = delete selected faces) / move (vector, no target = move selected
   vertices) / scale (number) -> object_mode. Always finish with object_mode.
@@ -826,6 +833,24 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         "subdivide" | "subdivide it" => return single("subdivide"),
         "merge" | "merge vertices" => return single("merge"),
         "flip normals" => return single("flip_normals"),
+        // "make it wood", "add a brick texture", "give it a marble texture"
+        _ if words.len() <= 6
+            && crate::textures::match_pattern(t).is_some()
+            && (t.starts_with("make it ")
+                || (t.ends_with(" texture") && ["give it a ", "add a ", "apply a ", "use a "].iter().any(|p| t.starts_with(p)))) =>
+        {
+            let p = crate::textures::match_pattern(t).unwrap_or("checker");
+            return Some(vec![Command { action: "set_texture".into(), name: Some(p.into()), ..Default::default() }]);
+        }
+        "remove the texture" | "remove texture" | "no texture" => {
+            return Some(vec![Command { action: "set_texture".into(), name: Some("none".into()), ..Default::default() }]);
+        }
+        "bevel" | "bevel it" | "bevel the edges" | "bevel edges" | "chamfer" | "chamfer it" => {
+            return Some(vec![Command { action: "bevel".into(), number: Some(0.1), segments: Some(1.0), ..Default::default() }]);
+        }
+        "round the edges" | "round it" | "round off the edges" | "smooth the edges" | "rounded bevel" => {
+            return Some(vec![Command { action: "bevel".into(), number: Some(0.15), segments: Some(4.0), ..Default::default() }]);
+        }
         "inset" | "inset faces" | "inset it" => {
             return Some(vec![Command {
                 action: "inset".into(),
@@ -1215,6 +1240,9 @@ mod tests {
             "camera_view"
         );
         assert_eq!(parse_simple("render the scene").unwrap()[0].action, "render");
+        assert_eq!(parse_simple("make it wood").unwrap()[0].name.as_deref(), Some("wood"));
+        assert_eq!(parse_simple("add a brick texture").unwrap()[0].action, "set_texture");
+        assert_eq!(parse_simple("add a cube").unwrap()[0].action, "add");
     }
     #[test]
     fn parse_model_output() {

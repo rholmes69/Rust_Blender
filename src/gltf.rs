@@ -82,6 +82,17 @@ impl Bin {
         self.accessors.push(json!({"bufferView": view, "componentType": 5126, "count": v.len(), "type": "SCALAR", "min": [lo], "max": [hi]}));
         self.accessors.len() - 1
     }
+    fn vec2s(&mut self, v: &[[f32; 2]]) -> usize {
+        let mut b = Vec::with_capacity(v.len() * 8);
+        for q in v {
+            for c in q {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let view = self.view(&b, Some(34962));
+        self.accessors.push(json!({"bufferView": view, "componentType": 5126, "count": v.len(), "type": "VEC2"}));
+        self.accessors.len() - 1
+    }
     fn indices(&mut self, v: &[u32]) -> usize {
         let mut b = Vec::with_capacity(v.len() * 4);
         for i in v {
@@ -92,6 +103,21 @@ impl Bin {
             json!({"bufferView": view, "componentType": 5125, "count": v.len(), "type": "SCALAR"}),
         );
         self.accessors.len() - 1
+    }
+}
+
+/// Image file bytes + MIME type for a texture (procedural ones are rendered to PNG).
+fn texture_bytes(t: &crate::textures::Texture) -> Option<(Vec<u8>, &'static str)> {
+    match &t.source {
+        crate::textures::TexSource::Image { data } => {
+            let mime = if data.starts_with(&[0x89, b'P', b'N', b'G']) { "image/png" } else { "image/jpeg" };
+            Some((data.clone(), mime))
+        }
+        src @ crate::textures::TexSource::Procedural { .. } => {
+            let img = crate::textures::decode(src).ok()?;
+            let raw: Vec<u8> = img.rgba.iter().flatten().copied().collect();
+            Some((crate::textures::encode_png(img.w, img.h, &raw).ok()?, "image/png"))
+        }
     }
 }
 
@@ -113,6 +139,10 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     let mut channels = vec![];
     let mut samplers = vec![];
     let mut uses_emissive_strength = false;
+    // textures: scene texture id -> glTF texture index
+    let mut images = vec![];
+    let mut gl_textures = vec![];
+    let mut tex_map: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     // glTF lights/cameras look down -Z with +Y up; ours look down local -Z with +Y up in Z-up
     // space. After the axis conversion that axis becomes -Y, so add a -90° X rotation.
     let fix = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
@@ -137,11 +167,31 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
             ObjectKind::Mesh => {
                 let mesh = cache.for_object(o);
                 let (mut pos, mut nrm, mut idx) = (vec![], vec![], vec![]);
+                let mut uvs: Vec<[f32; 2]> = vec![];
+                let tex = scene.texture(o.material.texture);
                 for inst in o.instance_matrices() {
                     let nm = Mat3::from_mat4(inst).inverse().transpose();
                     let flip = inst.determinant() < 0.0;
                     let base = pos.len() as u32;
-                    if mesh.smooth {
+                    if tex.is_some() {
+                        // per-corner vertices so UV seams survive
+                        let s = o.material.tex_scale;
+                        for (ti, tri) in mesh.tris.iter().enumerate() {
+                            let order: [usize; 3] = if flip { [0, 2, 1] } else { [0, 1, 2] };
+                            let [a, b, c] = tri.map(|i| inst.transform_point3(mesh.positions[i as usize]));
+                            let fnrm = (b - a).cross(c - a).normalize_or_zero() * if flip { -1.0 } else { 1.0 };
+                            let k = pos.len() as u32;
+                            for &q in &order {
+                                let vi = tri[q] as usize;
+                                pos.push(cv(inst.transform_point3(mesh.positions[vi])));
+                                let n = if mesh.smooth { (nm * mesh.normals[vi]).normalize_or_zero() } else { fnrm };
+                                nrm.push(cv(n));
+                                let uv = mesh.tri_uv.get(ti).map(|t| t[q]).unwrap_or([0.0; 2]);
+                                uvs.push([uv[0] * s, uv[1] * s]);
+                            }
+                            idx.extend([k, k + 1, k + 2]);
+                        }
+                    } else if mesh.smooth {
                         for (p, n) in mesh.positions.iter().zip(&mesh.normals) {
                             pos.push(cv(inst.transform_point3(*p)));
                             nrm.push(cv((nm * *n).normalize_or_zero()));
@@ -170,6 +220,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 }
                 let pa = bin.vec3s(&pos, Some(34962));
                 let na = bin.vec3s(&nrm, Some(34962));
+                let ua = (!uvs.is_empty()).then(|| bin.vec2s(&uvs));
                 let ia = bin.indices(&idx);
                 let m = o.material;
                 let mut mat = json!({
@@ -192,8 +243,27 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 if m.alpha < 0.999 {
                     mat["alphaMode"] = json!("BLEND");
                 }
+                if let (Some(t), Some(_)) = (tex, ua) {
+                    let ti = match tex_map.get(&t.id) {
+                        Some(i) => Some(*i),
+                        None => texture_bytes(t).map(|(bytes, mime)| {
+                            let view = bin.view(&bytes, None);
+                            images.push(json!({"name": t.name, "bufferView": view, "mimeType": mime}));
+                            gl_textures.push(json!({"sampler": 0, "source": images.len() - 1}));
+                            tex_map.insert(t.id, gl_textures.len() - 1);
+                            gl_textures.len() - 1
+                        }),
+                    };
+                    if let Some(ti) = ti {
+                        mat["pbrMetallicRoughness"]["baseColorTexture"] = json!({"index": ti});
+                    }
+                }
                 materials.push(mat);
-                meshes.push(json!({"name": o.name, "primitives": [{"attributes": {"POSITION": pa, "NORMAL": na}, "indices": ia, "material": materials.len() - 1, "mode": 4}]}));
+                let mut attrs = json!({"POSITION": pa, "NORMAL": na});
+                if let Some(ua) = ua {
+                    attrs["TEXCOORD_0"] = json!(ua);
+                }
+                meshes.push(json!({"name": o.name, "primitives": [{"attributes": attrs, "indices": ia, "material": materials.len() - 1, "mode": 4}]}));
                 node["mesh"] = json!(meshes.len() - 1);
             }
             ObjectKind::Light(l) => {
@@ -276,6 +346,11 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     if !meshes.is_empty() {
         root["meshes"] = json!(meshes);
         root["materials"] = json!(materials);
+    }
+    if !images.is_empty() {
+        root["images"] = json!(images);
+        root["textures"] = json!(gl_textures);
+        root["samplers"] = json!([{"magFilter": 9729, "minFilter": 9729, "wrapS": 10497, "wrapT": 10497}]);
     }
     if !cameras.is_empty() {
         root["cameras"] = json!(cameras);

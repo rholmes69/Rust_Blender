@@ -16,6 +16,15 @@ pub struct RPrim {
     pub blend: bool,
     /// ignore the depth test (x-ray wire)
     pub no_depth: bool,
+    /// Texture coordinates per corner and texture (index + 1 into `Raster::textures`; 0 = none).
+    pub uv: [[f32; 2]; 4],
+    pub tex: u32,
+    /// 1 / clip-space w per corner, for perspective-correct texturing (1 = affine).
+    pub iw: [f32; 4],
+}
+
+impl RPrim {
+    pub const NO_UV: [[f32; 2]; 4] = [[0.0; 2]; 4];
 }
 
 pub struct Raster {
@@ -24,6 +33,8 @@ pub struct Raster {
     pub color: Vec<Color32>,
     pub depth: Vec<f32>,
     pub id: Vec<u32>,
+    /// Textures referenced by `RPrim::tex`.
+    pub textures: Vec<std::sync::Arc<crate::textures::TexImage>>,
 }
 
 impl Default for Raster {
@@ -34,6 +45,7 @@ impl Default for Raster {
             color: vec![],
             depth: vec![],
             id: vec![],
+            textures: vec![],
         }
     }
 }
@@ -94,6 +106,7 @@ impl Raster {
                 let rows = col.len() / w;
                 let opaque = &opaque;
                 let blended = &blended;
+                let textures = &self.textures;
                 s.spawn(move || {
                     // clear with vertical gradient
                     for r in 0..rows {
@@ -119,6 +132,7 @@ impl Raster {
                         col,
                         dep,
                         ids,
+                        textures,
                     };
                     for p in opaque.iter() {
                         band.prim(p);
@@ -207,6 +221,7 @@ struct Band<'a> {
     col: &'a mut [Color32],
     dep: &'a mut [f32],
     ids: &'a mut [u32],
+    textures: &'a [std::sync::Arc<crate::textures::TexImage>],
 }
 
 #[inline]
@@ -237,7 +252,10 @@ impl Band<'_> {
         }
         let inv = 1.0 / area;
         let (ca, cb, cc) = (p.c[i0], p.c[i1], p.c[i2]);
-        let flat = ca == cb && cb == cc;
+        let tex = if p.tex > 0 { self.textures.get(p.tex as usize - 1) } else { None };
+        let (ua, ub, uc) = (p.uv[i0], p.uv[i1], p.uv[i2]);
+        let (wa, wb, wc) = (p.iw[i0], p.iw[i1], p.iw[i2]);
+        let flat = ca == cb && cb == cc && tex.is_none();
         let flat_px = if flat {
             to_px(ca)
         } else {
@@ -260,8 +278,14 @@ impl Band<'_> {
                 if !p.no_depth && (z > self.dep[i] || z < 0.0) {
                     continue;
                 }
+                // texture modulation (perspective-correct UVs)
+                let texel = tex.map(|t| {
+                    let (q0, q1, q2) = (w0 * wa, w1 * wb, w2 * wc);
+                    let d = 1.0 / (q0 + q1 + q2).max(1e-12);
+                    t.sample((q0 * ua[0] + q1 * ub[0] + q2 * uc[0]) * d, (q0 * ua[1] + q1 * ub[1] + q2 * uc[1]) * d)
+                });
                 if blend {
-                    let s = if flat {
+                    let mut s = if flat {
                         ca
                     } else {
                         [
@@ -271,6 +295,11 @@ impl Band<'_> {
                             ca[3] * w0 + cb[3] * w1 + cc[3] * w2,
                         ]
                     };
+                    if let Some(t) = texel {
+                        for k in 0..4 {
+                            s[k] *= t[k];
+                        }
+                    }
                     let d = self.col[i];
                     let al = s[3].clamp(0.0, 1.0);
                     let mix = |sv: f32, dv: u8| {
@@ -287,10 +316,11 @@ impl Band<'_> {
                     self.col[i] = if flat {
                         flat_px
                     } else {
+                        let t = texel.unwrap_or([1.0; 4]);
                         to_px([
-                            ca[0] * w0 + cb[0] * w1 + cc[0] * w2,
-                            ca[1] * w0 + cb[1] * w1 + cc[1] * w2,
-                            ca[2] * w0 + cb[2] * w1 + cc[2] * w2,
+                            (ca[0] * w0 + cb[0] * w1 + cc[0] * w2) * t[0],
+                            (ca[1] * w0 + cb[1] * w1 + cc[1] * w2) * t[1],
+                            (ca[2] * w0 + cb[2] * w1 + cc[2] * w2) * t[2],
                             1.0,
                         ])
                     };
@@ -328,6 +358,9 @@ mod tests {
             id,
             blend: false,
             no_depth: false,
+            uv: RPrim::NO_UV,
+            tex: 0,
+            iw: [1.0; 4],
         };
         // far drawn after near must not overwrite
         r.render(

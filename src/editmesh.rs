@@ -110,6 +110,7 @@ fn cleanup_keep_sel(pm: &mut PolyMesh, sel: &mut Vec<bool>) {
 /// Extrude the selected faces as a region (or selected edges into new quads).
 /// The new geometry becomes the selection. Returns the average normal (for "extrude along normal").
 pub fn extrude(pm: &mut PolyMesh, sel: &mut Vec<bool>) -> Result<Vec3, String> {
+    pm.uvs.clear(); // topology changes: fall back to generated UVs
     sel.resize(pm.verts.len(), false);
     let faces = selected_faces(pm, sel);
     if !faces.is_empty() {
@@ -208,6 +209,7 @@ pub fn extrude(pm: &mut PolyMesh, sel: &mut Vec<bool>) -> Result<Vec3, String> {
 
 /// Inset each selected face individually by `t` (0..1, fraction towards the face centre).
 pub fn inset(pm: &mut PolyMesh, sel: &mut Vec<bool>, t: f32) -> Result<usize, String> {
+    pm.uvs.clear(); // topology changes: fall back to generated UVs
     sel.resize(pm.verts.len(), false);
     let faces = selected_faces(pm, sel);
     if faces.is_empty() {
@@ -290,6 +292,7 @@ pub fn loop_cut(
     edge: (u32, u32),
     cuts: usize,
 ) -> Result<usize, String> {
+    pm.uvs.clear(); // topology changes: fall back to generated UVs
     let cuts = cuts.clamp(1, 32);
     let (ring_faces, ring_edges) = edge_ring(pm, edge);
     if ring_faces.is_empty() {
@@ -364,6 +367,7 @@ pub fn loop_cut(
 
 /// Delete selected geometry. Vertex mode removes faces touching any selected vertex.
 pub fn delete(pm: &mut PolyMesh, sel: &mut Vec<bool>, mode: SelectMode) -> usize {
+    pm.uvs.clear(); // topology changes: fall back to generated UVs
     sel.resize(pm.verts.len(), false);
     let before = pm.faces.len();
     let s = sel.clone();
@@ -381,6 +385,7 @@ pub fn delete(pm: &mut PolyMesh, sel: &mut Vec<bool>, mode: SelectMode) -> usize
 
 /// Merge all selected vertices at their centre.
 pub fn merge_center(pm: &mut PolyMesh, sel: &mut Vec<bool>) -> Result<usize, String> {
+    pm.uvs.clear(); // topology changes: fall back to generated UVs
     sel.resize(pm.verts.len(), false);
     let ids: Vec<u32> = (0..pm.verts.len() as u32)
         .filter(|&i| sel[i as usize])
@@ -405,6 +410,7 @@ pub fn merge_center(pm: &mut PolyMesh, sel: &mut Vec<bool>) -> Result<usize, Str
 
 /// Subdivide selected faces: each n-gon becomes n quads (centre + edge midpoints).
 pub fn subdivide(pm: &mut PolyMesh, sel: &mut Vec<bool>) -> Result<usize, String> {
+    pm.uvs.clear(); // topology changes: fall back to generated UVs
     sel.resize(pm.verts.len(), false);
     let faces = selected_faces(pm, sel);
     if faces.is_empty() {
@@ -461,6 +467,7 @@ pub fn subdivide(pm: &mut PolyMesh, sel: &mut Vec<bool>) -> Result<usize, String
 
 /// Reverse the winding of selected faces (flip normals).
 pub fn flip_normals(pm: &mut PolyMesh, sel: &[bool]) -> usize {
+    pm.uvs.clear(); // topology changes: fall back to generated UVs
     let faces = selected_faces(pm, sel);
     for &f in &faces {
         pm.faces[f].reverse();
@@ -501,6 +508,262 @@ pub fn edge_along(pm: &PolyMesh, axis: Vec3) -> Option<(u32, u32)> {
             .abs();
         dx.partial_cmp(&dy).unwrap_or(std::cmp::Ordering::Equal)
     })
+}
+
+/// Bevel the selected edges (both vertices selected, shared by two faces).
+/// `offset` is the width along each adjacent face; `segments` > 1 rounds the profile.
+/// Returns the number of beveled edges; the new bevel faces end up selected.
+pub fn bevel(pm: &mut PolyMesh, sel: &mut Vec<bool>, offset: f32, segments: usize) -> Result<usize, String> {
+    pm.uvs.clear(); // topology changes: fall back to generated UVs
+    sel.resize(pm.verts.len(), false);
+    let key = |a: u32, b: u32| (a.min(b), a.max(b));
+    let ef = pm.edge_faces();
+    let bev: HashSet<(u32, u32)> = selected_edges(pm, sel)
+        .into_iter()
+        .map(|(a, b)| key(a, b))
+        .filter(|k| ef.get(k).is_some_and(|f| f.len() == 2))
+        .collect();
+    if bev.is_empty() {
+        return Err("select edges to bevel (edges shared by two faces)".into());
+    }
+    let offset = offset.max(1e-4);
+    let segs = segments.clamp(1, 16);
+    let bev_verts: HashSet<u32> = bev.iter().flat_map(|&(a, b)| [a, b]).collect();
+    let orig = pm.verts.clone();
+    let mut verts = pm.verts.clone();
+    let new_vert = |verts: &mut Vec<Vec3>, p: Vec3| -> u32 {
+        verts.push(p);
+        (verts.len() - 1) as u32
+    };
+    // distance we may move along edge v→w without crossing the other end's bevel
+    let reach = |v: u32, w: u32| -> f32 {
+        let len = (orig[w as usize] - orig[v as usize]).length();
+        let cap = if bev_verts.contains(&w) { 0.49 } else { 0.95 };
+        offset.min(len * cap)
+    };
+    let dir = |v: u32, w: u32| (orig[w as usize] - orig[v as usize]).normalize_or_zero();
+
+    // 1. new corner points for every face corner at a bevel vertex
+    let mut on_edge: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut corner: HashMap<(usize, u32), Vec<u32>> = HashMap::new();
+    let mut bisector: HashSet<u32> = HashSet::new();
+    for (fi, f) in pm.faces.iter().enumerate() {
+        let n = f.len();
+        for i in 0..n {
+            let v = f[i];
+            if !bev_verts.contains(&v) {
+                continue;
+            }
+            let (prev, next) = (f[(i + n - 1) % n], f[(i + 1) % n]);
+            let ein = bev.contains(&key(prev, v));
+            let eout = bev.contains(&key(v, next));
+            let mut on = |w: u32, verts: &mut Vec<Vec3>| -> u32 {
+                *on_edge.entry((v, w)).or_insert_with(|| {
+                    let p = orig[v as usize] + dir(v, w) * reach(v, w);
+                    new_vert(verts, p)
+                })
+            };
+            let pts = match (ein, eout) {
+                (false, false) => vec![on(prev, &mut verts), on(next, &mut verts)],
+                (true, false) => vec![on(next, &mut verts)],
+                (false, true) => vec![on(prev, &mut verts)],
+                (true, true) => {
+                    let p = orig[v as usize] + dir(v, prev) * reach(v, prev) + dir(v, next) * reach(v, next);
+                    let id = new_vert(&mut verts, p);
+                    bisector.insert(id);
+                    vec![id]
+                }
+            };
+            corner.insert((fi, v), pts);
+        }
+    }
+
+    // 2. profile arcs at each end of each beveled edge (quadratic Bézier through the old corner)
+    let mut arcs: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    let mut strips: Vec<Vec<u32>> = vec![];
+    for &(a0, b0) in &bev {
+        let fs = &ef[&(a0, b0)];
+        // F1 = the face where the edge runs a→b
+        let runs = |fi: usize, a: u32, b: u32| {
+            let f = &pm.faces[fi];
+            (0..f.len()).any(|i| f[i] == a && f[(i + 1) % f.len()] == b)
+        };
+        let (f1, f2) = if runs(fs[0], a0, b0) { (fs[0], fs[1]) } else { (fs[1], fs[0]) };
+        let mut profile = |v: u32, w: u32, verts: &mut Vec<Vec3>| -> Vec<u32> {
+            let p1 = corner[&(f1, v)][0];
+            let p2 = corner[&(f2, v)][0];
+            // the profile's corner: on the beveled edge, as far in as the corner points are
+            let inward = (bisector.contains(&p1) as u8 + bisector.contains(&p2) as u8) as f32 * 0.5;
+            let ctrl = orig[v as usize] + dir(v, w) * reach(v, w) * inward;
+            let mut out = vec![p1];
+            if segs > 1 {
+                let interior: Vec<u32> = arcs.get(&(p1, p2)).cloned().unwrap_or_else(|| {
+                    let (q1, c, q2) = (verts[p1 as usize], ctrl, verts[p2 as usize]);
+                    // quarter-circle-like arc around the point opposite the profile corner
+                    let k0 = q1 + q2 - c;
+                    let pts: Vec<u32> = (1..segs)
+                        .map(|k| {
+                            let th = std::f32::consts::FRAC_PI_2 * k as f32 / segs as f32;
+                            let p = k0 + (q1 - k0) * th.cos() + (q2 - k0) * th.sin();
+                            new_vert(verts, p)
+                        })
+                        .collect();
+                    arcs.insert((p1, p2), pts.clone());
+                    arcs.insert((p2, p1), pts.iter().rev().copied().collect());
+                    pts
+                });
+                out.extend(interior);
+            }
+            out.push(p2);
+            out
+        };
+        let pa = profile(a0, b0, &mut verts);
+        let pb = profile(b0, a0, &mut verts);
+        for k in 0..segs {
+            strips.push(vec![pb[k], pa[k], pa[k + 1], pb[k + 1]]);
+        }
+    }
+
+    // insert arc interiors between consecutive points of a loop
+    let expand = |lp: &[u32]| -> Vec<u32> {
+        let mut out = vec![];
+        for i in 0..lp.len() {
+            let (p, q) = (lp[i], lp[(i + 1) % lp.len()]);
+            out.push(p);
+            if let Some(mid) = arcs.get(&(p, q)) {
+                out.extend(mid);
+            }
+        }
+        out
+    };
+
+    // 3. rebuild the original faces
+    let mut faces: Vec<Vec<u32>> = vec![];
+    for (fi, f) in pm.faces.iter().enumerate() {
+        let mut lp = vec![];
+        for &v in f {
+            match corner.get(&(fi, v)) {
+                Some(pts) => lp.extend(pts),
+                None => lp.push(v),
+            }
+        }
+        faces.push(expand(&lp));
+    }
+
+    // 4. patch the hole at vertices where several bevels meet
+    let mut patches = vec![];
+    for &v in &bev_verts {
+        // corners around v: (face, prev, next)
+        let around: Vec<(usize, u32, u32)> = pm
+            .faces
+            .iter()
+            .enumerate()
+            .filter_map(|(fi, f)| {
+                let i = f.iter().position(|&x| x == v)?;
+                let n = f.len();
+                Some((fi, f[(i + n - 1) % n], f[(i + 1) % n]))
+            })
+            .collect();
+        // fan order: the face after (prev, v, next) is the one whose prev is our next
+        let mut order = vec![around[0]];
+        while order.len() < around.len() {
+            let last = order[order.len() - 1];
+            match around.iter().find(|c| c.1 == last.2) {
+                Some(c) if c.0 != order[0].0 => order.push(*c),
+                _ => break,
+            }
+        }
+        if order.len() != around.len() || order.last().map(|c| c.2) != Some(order[0].1) {
+            continue; // open fan (mesh boundary): leave it
+        }
+        let mut lp: Vec<u32> = vec![];
+        for c in &order {
+            for &p in &corner[&(c.0, v)] {
+                if lp.last() != Some(&p) {
+                    lp.push(p);
+                }
+            }
+        }
+        while lp.len() > 1 && lp.first() == lp.last() {
+            lp.pop();
+        }
+        if lp.len() < 3 {
+            continue;
+        }
+        let mut patch = expand(&lp);
+        // orient like the surrounding surface
+        let pn = newell(&verts, &patch);
+        let vn: Vec3 = order.iter().map(|c| pm.face_normal(c.0)).sum();
+        if pn.dot(vn) < 0.0 {
+            patch.reverse();
+        }
+        if patch.len() <= 4 {
+            patches.push(patch);
+        } else {
+            // rounded corner: fan around a centre pulled towards the old corner (sphere-like)
+            // sphere centre: in from the corner along every beveled edge
+            let vp = orig[v as usize];
+            let sc = vp + order.iter().filter(|c| bev.contains(&key(v, c.2))).map(|c| dir(v, c.2) * reach(v, c.2)).sum::<Vec3>();
+            let r = patch.iter().map(|&i| verts[i as usize].distance(sc)).sum::<f32>() / patch.len() as f32;
+            let c = new_vert(&mut verts, sc + (vp - sc).normalize_or_zero() * r);
+            for i in 0..patch.len() {
+                patches.push(vec![patch[i], patch[(i + 1) % patch.len()], c]);
+            }
+        }
+    }
+
+    let nb = bev.len();
+    let strip_verts: HashSet<u32> = strips.iter().flatten().copied().collect();
+    faces.extend(strips);
+    faces.extend(patches);
+    pm.verts = verts;
+    pm.faces = faces;
+    let mut ns = vec![false; pm.verts.len()];
+    for v in strip_verts {
+        ns[v as usize] = true;
+    }
+    // drop the old corner vertices (keeping the selection aligned)
+    let mut used = vec![false; pm.verts.len()];
+    for f in &pm.faces {
+        for &i in f {
+            used[i as usize] = true;
+        }
+    }
+    let mut remap = vec![u32::MAX; pm.verts.len()];
+    let (mut nv, mut nsel) = (vec![], vec![]);
+    for i in 0..pm.verts.len() {
+        if used[i] {
+            remap[i] = nv.len() as u32;
+            nv.push(pm.verts[i]);
+            nsel.push(ns[i]);
+        }
+    }
+    pm.verts = nv;
+    for f in &mut pm.faces {
+        for i in f.iter_mut() {
+            *i = remap[*i as usize];
+        }
+    }
+    *sel = nsel;
+    Ok(nb)
+}
+
+fn newell(verts: &[Vec3], f: &[u32]) -> Vec3 {
+    let mut n = Vec3::ZERO;
+    for i in 0..f.len() {
+        let (a, b) = (verts[f[i] as usize], verts[f[(i + 1) % f.len()] as usize]);
+        n += Vec3::new((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y));
+    }
+    n
+}
+
+/// Smooth proportional-editing falloff: 1 at the selection, 0 at `radius`.
+pub fn falloff(dist: f32, radius: f32) -> f32 {
+    if radius <= 0.0 || dist >= radius {
+        return 0.0;
+    }
+    let t = 1.0 - dist / radius;
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(test)]
@@ -592,5 +855,55 @@ mod tests {
         merge_center(&mut pm, &mut sel).unwrap();
         assert_eq!(pm.verts.len(), 5); // a pyramid
         assert_eq!(pm.faces.len(), 5);
+    }
+
+    #[test]
+    fn bevel_edges() {
+        // one edge of a cube
+        let mut pm = cube();
+        let e = edge_along(&pm, Vec3::Z).unwrap();
+        let mut sel = vec![false; pm.verts.len()];
+        sel[e.0 as usize] = true;
+        sel[e.1 as usize] = true;
+        assert_eq!(bevel(&mut pm, &mut sel, 0.2, 1).unwrap(), 1);
+        assert_eq!(pm.faces.len(), 7);
+        assert_eq!(pm.verts.len(), 10);
+        assert!(closed(&pm) && outward(&pm));
+        assert_eq!(sel.iter().filter(|s| **s).count(), 4);
+        // rounded: 3 segments
+        let mut pm = cube();
+        let mut sel = vec![false; pm.verts.len()];
+        sel[e.0 as usize] = true;
+        sel[e.1 as usize] = true;
+        bevel(&mut pm, &mut sel, 0.3, 3).unwrap();
+        assert_eq!(pm.faces.len(), 6 + 3);
+        assert!(closed(&pm) && outward(&pm));
+        // every edge of a cube, with corner patches
+        for segs in [1, 2, 4] {
+            let mut pm = cube();
+            let mut sel = vec![true; pm.verts.len()];
+            assert_eq!(bevel(&mut pm, &mut sel, 0.15, segs).unwrap(), 12);
+            let corner_faces = if segs == 1 { 8 } else { 8 * 3 * segs };
+            assert_eq!(pm.faces.len(), 6 + 12 * segs + corner_faces, "segments {segs}");
+            assert!(closed(&pm), "closed, segments {segs}");
+            assert!(outward(&pm), "outward, segments {segs}");
+            let lo = pm.verts.iter().fold(Vec3::splat(f32::MAX), |a, b| a.min(*b));
+            let hi = pm.verts.iter().fold(Vec3::splat(f32::MIN), |a, b| a.max(*b));
+            assert!((hi - lo - Vec3::splat(2.0)).abs().max_element() < 1e-4, "keeps its size");
+        }
+        // the top face's 4 edges
+        let mut pm = cube();
+        let mut sel = vec![];
+        select_by_normal(&pm, Vec3::Z, false, &mut sel);
+        assert_eq!(bevel(&mut pm, &mut sel, 0.2, 2).unwrap(), 4);
+        assert!(closed(&pm) && outward(&pm));
+        assert!(bevel(&mut cube(), &mut vec![false; 8], 0.2, 1).is_err());
+    }
+
+    #[test]
+    fn falloff_curve() {
+        assert_eq!(falloff(0.0, 1.0), 1.0);
+        assert_eq!(falloff(1.0, 1.0), 0.0);
+        assert!((falloff(0.5, 1.0) - 0.5).abs() < 1e-6);
     }
 }

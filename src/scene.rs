@@ -51,6 +51,16 @@ pub struct Material {
     pub metallic: f32,
     pub emission: f32,
     pub alpha: f32,
+    /// Base-colour texture (`Scene::textures` id; 0 = none), multiplied with `color`.
+    #[serde(default)]
+    pub texture: u32,
+    /// UV repeats of the texture.
+    #[serde(default = "one")]
+    pub tex_scale: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 impl Default for Material {
@@ -61,6 +71,8 @@ impl Default for Material {
             metallic: 0.0,
             emission: 0.0,
             alpha: 1.0,
+            texture: 0,
+            tex_scale: 1.0,
         }
     }
 }
@@ -333,6 +345,9 @@ pub struct Scene {
     /// Render output settings (F12).
     #[serde(default)]
     pub output: Output,
+    /// Image and procedural textures used by materials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub textures: Vec<crate::textures::Texture>,
     next_id: u64,
 }
 
@@ -362,6 +377,7 @@ impl Default for Scene {
             frame_end: 120,
             fps: 24,
             output: Output::default(),
+            textures: vec![],
             next_id: 1,
         };
         s.add(Primitive::Cube, None);
@@ -379,6 +395,26 @@ impl Default for Scene {
 }
 
 impl Scene {
+    /// Add (or reuse an identical) texture and return its id.
+    pub fn add_texture(&mut self, name: &str, source: crate::textures::TexSource) -> u32 {
+        if let Some(t) = self.textures.iter().find(|t| t.source == source) {
+            return t.id;
+        }
+        let id = self.textures.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        let mut nm = name.to_string();
+        let mut k = 1;
+        while self.textures.iter().any(|t| t.name == nm) {
+            nm = format!("{name}.{k:03}");
+            k += 1;
+        }
+        self.textures.push(crate::textures::Texture { id, name: nm, source });
+        id
+    }
+
+    pub fn texture(&self, id: u32) -> Option<&crate::textures::Texture> {
+        (id != 0).then(|| self.textures.iter().find(|t| t.id == id)).flatten()
+    }
+
     pub fn fresh_id(&mut self) -> u64 {
         self.next_id = self
             .next_id

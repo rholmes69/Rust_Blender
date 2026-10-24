@@ -594,6 +594,59 @@ impl Editor {
                     p.z
                 ))
             }
+            "import" | "import_gltf" => {
+                let path = c.name.clone().ok_or("import needs name = the .glb/.gltf file path")?;
+                let (st, ids) = crate::gltf_import::import_file(&mut self.scene, std::path::Path::new(path.trim()))?;
+                self.exit_edit();
+                self.selection = ids.clone();
+                self.active = ids.first().copied();
+                if !self.scene.textures.is_empty() && st.textures > 0 && self.shading == Shading::Solid {
+                    self.shading = Shading::Material;
+                }
+                self.view_requests.push(ViewRequest::FrameSelected);
+                Ok(format!("Imported {}", st.summary()))
+            }
+            "set_texture" | "texture" => {
+                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                if ids.is_empty() {
+                    return Err("no mesh object to texture".into());
+                }
+                let spec = c.name.clone().or(c.primitive.clone()).unwrap_or_default();
+                let spec_t = spec.trim();
+                let low = spec_t.to_lowercase();
+                let (tex_id, label) = if low.is_empty() || matches!(low.as_str(), "none" | "remove" | "off" | "clear") {
+                    (0, "no texture".to_string())
+                } else if std::path::Path::new(spec_t).is_file() {
+                    let data = std::fs::read(spec_t).map_err(|e| format!("can't read {spec_t}: {e}"))?;
+                    crate::textures::decode(&crate::textures::TexSource::Image { data: data.clone() })?;
+                    let name = std::path::Path::new(spec_t).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("Image".into());
+                    (self.scene.add_texture(&name, crate::textures::TexSource::Image { data }), format!("image {name}"))
+                } else if let Some(t) = self.scene.textures.iter().find(|t| t.name.eq_ignore_ascii_case(spec_t)) {
+                    (t.id, t.name.clone())
+                } else if let Some(p) = crate::textures::match_pattern(spec_t) {
+                    let (a, b) = crate::textures::procedural_defaults(p).unwrap();
+                    (self.scene.add_texture(p, crate::textures::TexSource::Procedural { pattern: p.into(), color_a: a, color_b: b }), format!("{p} texture"))
+                } else {
+                    let list: Vec<&str> = crate::textures::PROCEDURAL.iter().map(|p| p.0).collect();
+                    return Err(format!("unknown texture '{spec_t}' (use an image path or one of: {})", list.join(", ")));
+                };
+                let tint = c.color.as_ref().and_then(parse_color);
+                for id in &ids {
+                    if let Some(o) = self.scene.get_mut(*id) {
+                        o.material.texture = tex_id;
+                        if tex_id != 0 {
+                            o.material.color = tint.unwrap_or([1.0, 1.0, 1.0]);
+                            if let Some(n) = c.number {
+                                o.material.tex_scale = (n as f32).clamp(0.05, 100.0);
+                            }
+                        }
+                    }
+                }
+                if tex_id != 0 && self.shading == Shading::Solid {
+                    self.shading = Shading::Material;
+                }
+                Ok(format!("Applied {label} to {}", self.names(&ids)))
+            }
             "render" | "render_image" => {
                 self.render_request = true;
                 Ok("Rendering an image (F12)".into())
@@ -873,6 +926,8 @@ impl Editor {
 pub enum EditOp {
     Extrude(f32),
     Inset(f32),
+    /// width, segments
+    Bevel(f32, usize),
     Subdivide,
     Delete,
     Merge,
@@ -997,6 +1052,11 @@ impl Editor {
                 format!("Extruded {} vertices", sel.iter().filter(|s| **s).count())
             }
             EditOp::Inset(t) => format!("Inset {} face(s)", em::inset(pm, sel, t)?),
+            EditOp::Bevel(w, segs) => {
+                // the width is given in world units; edit in local space
+                let s = (m3 * Vec3::ONE.normalize()).length().max(1e-6);
+                format!("Beveled {} edge(s)", em::bevel(pm, sel, w / s, segs)?)
+            }
             EditOp::Subdivide => format!("Subdivided {} face(s)", em::subdivide(pm, sel)?),
             EditOp::Delete => format!("Deleted {} face(s)", em::delete(pm, sel, st.mode)),
             EditOp::Merge => format!("Merged {} vertices", em::merge_center(pm, sel)?),
@@ -1093,6 +1153,46 @@ impl Editor {
                 self.edit_op(EditOp::Extrude(dist))
             }),
             "inset" => ensure(self).and_then(|_| self.edit_op(EditOp::Inset(num(0.25) as f32))),
+            "bevel" => {
+                let w = num(0.1).clamp(0.001, 100.0) as f32;
+                let segs = c.segments.unwrap_or(if c.name.as_deref() == Some("round") { 4.0 } else { 1.0 }).clamp(1.0, 16.0) as usize;
+                if self.editing() {
+                    self.edit_op(EditOp::Bevel(w, segs))
+                } else {
+                    // object mode: bevel every edge of the target meshes
+                    let ids: Vec<u64> = self.resolve_target(c.target.as_deref()).into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                    if ids.is_empty() {
+                        Err("no mesh object to bevel".into())
+                    } else {
+                        if !self.in_batch {
+                            self.snapshot();
+                        }
+                        let mut done = vec![];
+                        let mut err = None;
+                        for id in &ids {
+                            let o = self.scene.get_mut(*id).unwrap();
+                            let mut pm = o.mesh.clone().unwrap_or_else(|| o.primitive.poly(o.detail));
+                            let mut sel = vec![true; pm.verts.len()];
+                            let s = (glam::Mat3::from_mat4(o.transform.matrix()) * Vec3::ONE.normalize()).length().max(1e-6);
+                            match em::bevel(&mut pm, &mut sel, w / s, segs) {
+                                Ok(_) => {
+                                    o.mesh = Some(pm);
+                                    done.push(*id);
+                                }
+                                Err(e) => err = Some(e),
+                            }
+                        }
+                        if done.is_empty() {
+                            if !self.in_batch {
+                                self.undo_stack.pop();
+                            }
+                            Err(err.unwrap_or_default())
+                        } else {
+                            Ok(format!("Beveled {}", self.names(&done)))
+                        }
+                    }
+                }
+            }
             "loop_cut" | "loopcut" => ensure(self).and_then(|_| {
                 self.edit_op(EditOp::LoopCutAxis {
                     axis: vec3(&c.vector).unwrap_or(Vec3::Z),
@@ -1291,6 +1391,13 @@ pub struct Command {
         deserialize_with = "lenient_f64"
     )]
     pub power: Option<f64>,
+    /// Bevel profile segments.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_f64"
+    )]
+    pub segments: Option<f64>,
     /// Point [x,y,z] or object name to aim a camera/light at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub look_at: Option<Value>,

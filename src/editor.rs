@@ -62,6 +62,11 @@ pub struct Editor {
     /// Armature in Pose Mode and its active bone.
     pub pose: Option<u64>,
     pub active_bone: usize,
+    /// Rigged mesh in Weight Paint mode (paints `active_bone` of its armature).
+    pub weight_paint: Option<u64>,
+    /// Armature in Edit Mode (rest bones) and the selected part of `active_bone`.
+    pub bone_edit: Option<u64>,
+    pub bone_part: crate::armature::BonePart,
     /// Last known world matrix per object, used to make children follow their parents.
     parent_cache: std::collections::HashMap<u64, glam::Mat4>,
     /// True while a command batch runs (the batch owns the undo step).
@@ -91,6 +96,9 @@ impl Default for Editor {
             sculpt: None,
             pose: None,
             active_bone: 0,
+            weight_paint: None,
+            bone_edit: None,
+            bone_part: Default::default(),
             in_batch: false,
         }
     }
@@ -168,6 +176,58 @@ impl Editor {
         self.bind_to_armature(mesh_id, arm_id)?;
         self.reset_parent_cache();
         Ok(arm_id)
+    }
+
+    /// Replace an armature's bones after editing their rest positions, keeping bound meshes in
+    /// place: `orig` is the armature before the edit, `orig_skins` the skins bound to it then and
+    /// `map` sends each original bone to its new index (None = deleted).
+    pub fn apply_bone_edit(&mut self, arm_id: u64, new_arm: crate::armature::Armature, orig: &crate::armature::Armature, orig_skins: &[(u64, crate::armature::Skin)], map: &[Option<usize>]) {
+        let Some(a) = self.scene.get(arm_id) else { return };
+        let aw = a.transform.matrix();
+        let g_old = orig.rest_globals();
+        let g_new = new_arm.rest_globals();
+        let n = new_arm.bones.len();
+        // new index of each original bone, deleted ones fall back to their nearest kept ancestor
+        let fallback = |mut k: usize| -> u16 {
+            loop {
+                if let Some(Some(j)) = map.get(k) {
+                    return *j as u16;
+                }
+                match orig.bones.get(k).and_then(|b| b.parent) {
+                    Some(p) => k = p,
+                    None => return 0,
+                }
+            }
+        };
+        for (oid, sk0) in orig_skins {
+            let Some(o) = self.scene.get_mut(*oid) else { continue };
+            let om = o.transform.matrix();
+            let mut ibm = vec![glam::Mat4::IDENTITY; n];
+            let mut have = vec![false; n];
+            for (k, m) in map.iter().enumerate() {
+                if let (Some(j), Some(ib)) = (m, sk0.inverse_bind.get(k)) {
+                    ibm[*j] = g_new[*j].inverse() * g_old[k] * *ib;
+                    have[*j] = true;
+                }
+            }
+            for j in 0..n {
+                if !have[j] {
+                    ibm[j] = (aw * g_new[j]).inverse() * om;
+                }
+            }
+            let joints = sk0.joints.iter().map(|q| q.map(|k| fallback(k as usize))).collect();
+            o.skin = Some(crate::armature::Skin { armature: arm_id, joints, weights: sk0.weights.clone(), inverse_bind: ibm });
+            o.posed_key = 0;
+        }
+        if let Some(a) = self.scene.get_mut(arm_id) {
+            a.armature = Some(new_arm);
+        }
+        self.dirty = true;
+    }
+
+    /// Skins bound to an armature (for edits that must keep meshes in place).
+    pub fn skins_of(&self, arm_id: u64) -> Vec<(u64, crate::armature::Skin)> {
+        self.scene.objects.iter().filter_map(|o| o.skin.as_ref().filter(|s| s.armature == arm_id).map(|s| (o.id, s.clone()))).collect()
     }
 
     /// A texture by spec: an image path, an existing texture's name or a procedural pattern
@@ -335,6 +395,16 @@ impl Editor {
     }
     /// Leave edit mode if the edited object no longer exists (deleted, undone, …).
     pub fn validate_edit(&mut self) {
+        if let Some(id) = self.bone_edit {
+            if !self.scene.get(id).is_some_and(|o| o.armature.as_ref().is_some_and(|a| !a.bones.is_empty())) {
+                self.bone_edit = None;
+            }
+        }
+        if let Some(id) = self.weight_paint {
+            if !self.scene.get(id).is_some_and(|o| o.skin.is_some()) {
+                self.weight_paint = None;
+            }
+        }
         if let Some(id) = self.pose {
             if !self.scene.get(id).is_some_and(|o| o.armature.is_some()) {
                 self.pose = None;
@@ -994,6 +1064,52 @@ impl Editor {
                 self.select_only(arm_id);
                 Ok(format!("Rigged \"{}\" with {an} ({n} bones, automatic weights) — Ctrl+Tab for Pose Mode", self.scene.get(mesh_id).unwrap().name))
             }
+            "weight_paint" | "weight_paint_mode" | "paint_weights" => {
+                if let Some(t) = c.target.as_deref().and_then(|t| self.scene.find_by_name(t)) {
+                    self.active = Some(t);
+                    self.weight_paint = None;
+                }
+                if let Some(b) = c.name.as_deref() {
+                    if let Some(i) = self.active.and_then(|id| self.scene.get(id)).and_then(|o| o.skin.as_ref()).and_then(|s| self.scene.get(s.armature)).and_then(|a| a.armature.as_ref()).and_then(|a| a.find(b)) {
+                        self.active_bone = i;
+                    }
+                }
+                if self.weight_paint.is_some() {
+                    return Ok("Already in weight paint".into());
+                }
+                self.toggle_weight_paint()
+            }
+            "set_action" | "play_action" | "action" | "new_action" => {
+                let aid = c
+                    .target
+                    .as_deref()
+                    .and_then(|t| self.scene.find_by_name(t))
+                    .and_then(|t| if self.scene.get(t)?.armature.is_some() { Some(t) } else { self.scene.get(t)?.skin.as_ref().map(|s| s.armature) })
+                    .or(self.pose)
+                    .or_else(|| self.active.filter(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some())))
+                    .or_else(|| self.scene.objects.iter().find(|o| o.armature.as_ref().is_some_and(|a| !a.actions.is_empty())).map(|o| o.id))
+                    .or_else(|| self.scene.objects.iter().find(|o| o.armature.is_some()).map(|o| o.id))
+                    .ok_or("no armature in the scene")?;
+                let arm = self.scene.get_mut(aid).unwrap().armature.as_mut().unwrap();
+                if c.action == "new_action" {
+                    let i = arm.new_action(c.name.as_deref().unwrap_or("Action"));
+                    return Ok(format!("New action \"{}\" (pose bones and press I to key it)", arm.actions[i].name));
+                }
+                let list: Vec<String> = arm.actions.iter().map(|a| a.name.clone()).collect();
+                let name = c.name.clone().ok_or(format!("which action? ({})", if list.is_empty() { "none stored".into() } else { list.join(", ") }))?;
+                let i = arm.find_action(&name).ok_or(format!("no action {name:?} (actions: {})", list.join(", ")))?;
+                let range = arm.set_action(i);
+                let an = arm.actions[i].name.clone();
+                if let Some((lo, hi)) = range {
+                    self.scene.frame_start = lo;
+                    self.scene.frame_end = hi.max(lo + 1);
+                    self.set_frame(lo);
+                }
+                if c.action == "play_action" || c.primitive.as_deref() == Some("play") {
+                    self.playing = true;
+                }
+                Ok(format!("Action \"{an}\"{}", range.map(|(a, b)| format!(" (frames {a}–{b})")).unwrap_or_default()))
+            }
             "pose_mode" | "pose" => {
                 if let Some(t) = c.target.as_deref().and_then(|t| self.scene.find_by_name(t)) {
                     self.active = Some(t);
@@ -1512,6 +1628,8 @@ pub enum EditOp {
         axis: Vec3,
         cuts: usize,
     },
+    /// knife cut along these points (in path order)
+    Knife(Vec<crate::editmesh::KnifePoint>),
     /// world-space translation of selected vertices
     Translate(Vec3),
     Scale(Vec3),
@@ -1542,6 +1660,7 @@ impl Editor {
         self.select_only(id);
         self.sculpt = None;
         self.pose = None;
+        self.weight_paint = None;
         self.edit = Some(EditState {
             obj: id,
             mode: SelectMode::Vertex,
@@ -1552,8 +1671,32 @@ impl Editor {
 
     pub fn exit_edit(&mut self) {
         self.edit = None;
+        self.bone_edit = None;
         self.sculpt = None;
         self.pose = None;
+        self.weight_paint = None;
+    }
+
+    /// Enter / leave Weight Paint on the active rigged mesh.
+    pub fn toggle_weight_paint(&mut self) -> Result<String, String> {
+        if self.weight_paint.take().is_some() {
+            return Ok("Object mode".into());
+        }
+        let id = self
+            .active
+            .filter(|id| self.scene.get(*id).is_some_and(|o| o.skin.is_some()))
+            .or_else(|| self.selection.iter().copied().find(|id| self.scene.get(*id).is_some_and(|o| o.skin.is_some())))
+            .ok_or("select a rigged mesh (Object ▸ Rig, or Ctrl+P to an armature) to paint its weights")?;
+        self.edit = None;
+        self.sculpt = None;
+        self.pose = None;
+        self.bone_edit = None;
+        self.select_only(id);
+        self.weight_paint = Some(id);
+        let o = self.scene.get(id).unwrap();
+        let nb = o.skin.as_ref().and_then(|s| self.scene.get(s.armature)).and_then(|a| a.armature.as_ref()).map(|a| a.bones.len()).unwrap_or(1);
+        self.active_bone = self.active_bone.min(nb.saturating_sub(1));
+        Ok(format!("Weight Paint: \"{}\"", o.name))
     }
 
     /// Enter / leave Pose Mode on the active armature.
@@ -1569,6 +1712,8 @@ impl Editor {
             .ok_or("no armature in the scene (add one with Add ▸ Armature, or ask to rig a mesh)")?;
         self.edit = None;
         self.sculpt = None;
+        self.weight_paint = None;
+        self.bone_edit = None;
         self.select_only(id);
         self.pose = Some(id);
         self.active_bone = 0;
@@ -1583,6 +1728,8 @@ impl Editor {
             return Err("only mesh objects can be sculpted".into());
         }
         self.edit = None;
+        self.pose = None;
+        self.weight_paint = None;
         let name = o.name.clone();
         let mut pm = o.poly();
         let before = pm.verts.len();
@@ -1596,8 +1743,18 @@ impl Editor {
     }
 
     pub fn toggle_edit(&mut self) -> Result<String, String> {
-        if self.pose.take().is_some() {
+        if self.pose.take().is_some() || self.weight_paint.take().is_some() || self.bone_edit.take().is_some() {
             return Ok("Object mode".into());
+        }
+        if let Some(id) = self.active.filter(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some())) {
+            self.sculpt = None;
+            self.edit = None;
+            self.select_only(id);
+            self.bone_edit = Some(id);
+            self.bone_part = crate::armature::BonePart::Body;
+            let nb = self.scene.get(id).and_then(|o| o.armature.as_ref()).map(|a| a.bones.len()).unwrap_or(1);
+            self.active_bone = self.active_bone.min(nb.saturating_sub(1));
+            return Ok(format!("Edit mode (bones): \"{}\"", self.scene.get(id).unwrap().name));
         }
         if self.sculpt.is_some() {
             self.sculpt = None;
@@ -1697,6 +1854,7 @@ impl Editor {
                 st.mode = SelectMode::Face;
                 format!("Selected {n} face(s)")
             }
+            EditOp::Knife(pts) => format!("Knife: split {} face(s)", em::knife(pm, &pts, sel)?),
             EditOp::LoopCut { edge, cuts } => format!(
                 "Loop cut through {} faces",
                 em::loop_cut(pm, sel, edge, cuts)?
@@ -2420,5 +2578,69 @@ mod tests {
         let back: crate::scene::Scene = serde_json::from_str(&json).unwrap();
         assert!(back.get(tube).unwrap().skin.is_some() && back.get(rig).unwrap().armature.as_ref().unwrap().bones[1].keys.len() == 2);
         assert!(ed.toggle_pose().is_ok() && ed.pose == Some(rig));
+    }
+    #[test]
+    fn rig_gltf_round_trip() {
+        let mut ed = Editor::default();
+        ed.execute(&[
+            cmd(r#"{"action":"add","primitive":"cylinder","name":"Tube","location":[1,0,1.5],"scale":[0.4,0.4,1.5]}"#),
+            cmd(r#"{"action":"rig","target":"Tube","number":3}"#),
+        ]);
+        ed.set_frame(1);
+        ed.execute(&[cmd(r#"{"action":"keyframe","target":"Tube Rig"}"#)]);
+        ed.set_frame(10);
+        ed.execute(&[cmd(r#"{"action":"pose_bone","name":"bone 1","rotation":[50,0,0]}"#), cmd(r#"{"action":"keyframe","target":"Tube Rig"}"#)]);
+        let world = |sc: &crate::scene::Scene, name: &str| -> Vec<Vec3> {
+            let o = sc.get(sc.find_by_name(name).unwrap()).unwrap();
+            let m = o.transform.matrix();
+            o.posed.as_ref().unwrap().verts.iter().map(|v| m.transform_point3(*v)).collect()
+        };
+        let bbox = |v: &[Vec3]| v.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), p| (l.min(*p), h.max(*p)));
+        let (glb, _) = crate::gltf::export_glb(&ed.scene, &mut crate::scene::MeshCache::default());
+        let mut sc = crate::scene::Scene::default();
+        sc.objects.clear();
+        let (st, _) = crate::gltf_import::import_bytes(&mut sc, &glb, None).unwrap();
+        assert!(st.animation.is_some(), "{}", st.summary());
+        for f in [1, 5, 10] {
+            ed.set_frame(f);
+            sc.evaluate(f);
+            sc.update_skins();
+            let (a, b) = (bbox(&world(&ed.scene, "Tube")), bbox(&world(&sc, "Tube")));
+            assert!(a.0.distance(b.0) < 0.02 && a.1.distance(b.1) < 0.02, "frame {f}: {a:?} vs {b:?}");
+        }
+    }
+    #[test]
+    fn bone_edits_keep_mesh() {
+        let mut ed = Editor::default();
+        ed.execute(&[
+            cmd(r#"{"action":"add","primitive":"cylinder","name":"Tube","location":[0,0,1.5],"scale":[0.4,0.4,1.5]}"#),
+            cmd(r#"{"action":"rig","target":"Tube","number":3}"#),
+        ]);
+        let tube = ed.scene.find_by_name("Tube").unwrap();
+        let rig = ed.scene.find_by_name("Tube Rig").unwrap();
+        assert!(ed.toggle_edit().unwrap().contains("bones") && ed.bone_edit == Some(rig));
+        let posed = |ed: &mut Editor| {
+            ed.scene.update_skins();
+            ed.scene.get(tube).unwrap().posed.as_ref().unwrap().verts.clone()
+        };
+        let before = posed(&mut ed);
+        let orig = ed.scene.get(rig).unwrap().armature.clone().unwrap();
+        let skins = ed.skins_of(rig);
+        let mut a = orig.clone();
+        a.set_rest_points(1, glam::Vec3::new(0.0, 0.0, 1.0), glam::Vec3::new(0.5, 0.0, 2.0));
+        let n = a.extrude(2);
+        let map: Vec<Option<usize>> = (0..orig.bones.len()).map(Some).collect();
+        ed.apply_bone_edit(rig, a.clone(), &orig, &skins, &map);
+        let after = posed(&mut ed);
+        assert!(before.iter().zip(&after).all(|(p, q)| p.distance(*q) < 1e-4), "rest edits don't move the mesh");
+        // deleting a bone hands its weights to the parent and keeps the skin valid
+        let skins = ed.skins_of(rig);
+        let mut b = a.clone();
+        let map = b.delete_bone(1);
+        ed.apply_bone_edit(rig, b.clone(), &a, &skins, &map);
+        let after2 = posed(&mut ed);
+        assert!(before.iter().zip(&after2).all(|(p, q)| p.distance(*q) < 1e-4));
+        assert_eq!(ed.scene.get(rig).unwrap().armature.as_ref().unwrap().bones.len(), n);
+        assert!(ed.scene.get(tube).unwrap().skin.as_ref().unwrap().joints.iter().flatten().all(|j| (*j as usize) < n));
     }
 }

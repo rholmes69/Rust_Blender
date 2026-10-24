@@ -1,10 +1,21 @@
 //! Binary glTF 2.0 (.glb) export: meshes (modifiers applied), PBR materials, lights
-//! (KHR_lights_punctual), cameras and baked keyframe animation.
+//! (KHR_lights_punctual), cameras, skins (armatures + weights) and baked keyframe / bone animation.
 //! Converts Blender-style Z-up to glTF Y-up exactly like Blender's own exporter (+Y up, -Z forward).
 
 use crate::scene::{LightType, MeshCache, ObjectKind, Scene};
 use glam::{Mat3, Quat, Vec3};
 use serde_json::{Value, json};
+
+/// Z-up -> Y-up for a whole matrix (the conjugation matching `cv`/`cq`).
+fn cm(m: glam::Mat4) -> glam::Mat4 {
+    let c = glam::Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    c * m * c.inverse()
+}
+
+fn trs_json(m: glam::Mat4) -> (Value, Value, Value) {
+    let (s, r, t) = m.to_scale_rotation_translation();
+    (json!([t.x, t.y, t.z]), json!([r.x, r.y, r.z, r.w]), json!([s.x, s.y, s.z]))
+}
 
 /// Z-up -> Y-up: (x, y, z) -> (x, z, -y)
 fn cv(v: Vec3) -> Vec3 {
@@ -93,6 +104,39 @@ impl Bin {
         self.accessors.push(json!({"bufferView": view, "componentType": 5126, "count": v.len(), "type": "VEC2"}));
         self.accessors.len() - 1
     }
+    fn joints(&mut self, v: &[[u16; 4]]) -> usize {
+        let mut b = Vec::with_capacity(v.len() * 8);
+        for q in v {
+            for c in q {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let view = self.view(&b, Some(34962));
+        self.accessors.push(json!({"bufferView": view, "componentType": 5123, "count": v.len(), "type": "VEC4"}));
+        self.accessors.len() - 1
+    }
+    fn weights(&mut self, v: &[[f32; 4]]) -> usize {
+        let mut b = Vec::with_capacity(v.len() * 16);
+        for q in v {
+            for c in q {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let view = self.view(&b, Some(34962));
+        self.accessors.push(json!({"bufferView": view, "componentType": 5126, "count": v.len(), "type": "VEC4"}));
+        self.accessors.len() - 1
+    }
+    fn mat4s(&mut self, v: &[glam::Mat4]) -> usize {
+        let mut b = Vec::with_capacity(v.len() * 64);
+        for m in v {
+            for c in m.to_cols_array() {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let view = self.view(&b, None);
+        self.accessors.push(json!({"bufferView": view, "componentType": 5126, "count": v.len(), "type": "MAT4"}));
+        self.accessors.len() - 1
+    }
     fn indices(&mut self, v: &[u32]) -> usize {
         let mut b = Vec::with_capacity(v.len() * 4);
         for i in v {
@@ -148,6 +192,19 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     let fix = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
 
     let mut node_of: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    // armature object id -> glTF node of each bone
+    let mut bone_nodes: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+    // (mesh node, object) of skinned meshes, resolved into skins after all nodes exist
+    let mut skinned: Vec<(usize, u64)> = vec![];
+    // animations: index 0 holds object keys (and the first action); more actions follow
+    let mut anim_names: Vec<Option<String>> = vec![None];
+    let mut extra: Vec<(Vec<Value>, Vec<Value>)> = vec![];
+    // skinned meshes are exported in their rest shape when their armature is exported too
+    let exports_skin = |o: &crate::scene::Object| -> bool {
+        o.skin.as_ref().is_some_and(|sk| {
+            scene.get(sk.armature).is_some_and(|a| a.visible && a.armature.as_ref().is_some_and(|arm| o.mesh.as_ref().is_some_and(|pm| sk.valid_for(pm, arm))))
+        })
+    };
     for o in scene.objects.iter().filter(|o| o.visible) {
         let t = &o.transform;
         let mut node = json!({"name": o.name});
@@ -155,7 +212,8 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
             let r = cq(q);
             if special { r * fix } else { r }
         };
-        let special = !o.is_mesh();
+        let special = matches!(o.kind, ObjectKind::Light(_) | ObjectKind::Camera(_));
+        let skin_rest = o.is_mesh() && exports_skin(o);
         let r = rot(t.quat(), special);
         let tr = cv(t.location);
         node["translation"] = json!([tr.x, tr.y, tr.z]);
@@ -166,14 +224,17 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         }
         match &o.kind {
             ObjectKind::Mesh => {
-                let mesh = cache.for_object(o);
+                // rigged meshes: the rest shape (the viewer skins it); others: as displayed
+                let mesh = if skin_rest { o.mesh.as_ref().unwrap().to_mesh_opts(o.smooth(), o.auto_smooth) } else { cache.for_object(o) };
                 let (mut pos, mut nrm, mut idx) = (vec![], vec![], vec![]);
+                let mut src: Vec<u32> = vec![];
                 let mut uvs: Vec<[f32; 2]> = vec![];
                 let tex = scene.texture(o.material.texture);
                 let ntex = scene.texture(o.material.normal_tex);
                 let rtex = scene.texture(o.material.rough_tex);
                 let textured = tex.is_some() || ntex.is_some() || rtex.is_some();
-                for inst in o.instance_matrices() {
+                let insts = if skin_rest { vec![glam::Mat4::IDENTITY] } else { o.instance_matrices() };
+                for inst in insts {
                     let nm = Mat3::from_mat4(inst).inverse().transpose();
                     let flip = inst.determinant() < 0.0;
                     let base = pos.len() as u32;
@@ -187,6 +248,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                             let k = pos.len() as u32;
                             for &q in &order {
                                 let vi = tri[q] as usize;
+                                src.push(vi as u32);
                                 pos.push(cv(inst.transform_point3(mesh.positions[vi])));
                                 let cn = mesh.corner_normals.get(ti).map(|c| c[q]).unwrap_or(mesh.normals[vi]);
                                 let n = if mesh.smooth { (nm * cn).normalize_or_zero() * if flip { -1.0 } else { 1.0 } } else { fnrm };
@@ -197,7 +259,8 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                             idx.extend([k, k + 1, k + 2]);
                         }
                     } else if mesh.smooth {
-                        for (p, n) in mesh.positions.iter().zip(&mesh.normals) {
+                        for (k, (p, n)) in mesh.positions.iter().zip(&mesh.normals).enumerate() {
+                            src.push(k as u32);
                             pos.push(cv(inst.transform_point3(*p)));
                             nrm.push(cv((nm * *n).normalize_or_zero()));
                         }
@@ -212,6 +275,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                                 tri.map(|i| inst.transform_point3(mesh.positions[i as usize]));
                             let n = cv((b - a).cross(c - a).normalize_or_zero());
                             let k = pos.len() as u32;
+                            src.extend(tri);
                             for p in [a, b, c] {
                                 pos.push(cv(p));
                                 nrm.push(n);
@@ -276,6 +340,24 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 if let Some(ua) = ua {
                     attrs["TEXCOORD_0"] = json!(ua);
                 }
+                if skin_rest {
+                    let sk = o.skin.as_ref().unwrap();
+                    let j: Vec<[u16; 4]> = src.iter().map(|i| sk.joints[*i as usize]).collect();
+                    let w: Vec<[f32; 4]> = src
+                        .iter()
+                        .map(|i| {
+                            let w = sk.weights[*i as usize];
+                            let s: f32 = w.iter().sum();
+                            if s > 1e-6 { w.map(|x| x / s) } else { [1.0, 0.0, 0.0, 0.0] }
+                        })
+                        .collect();
+                    attrs["JOINTS_0"] = json!(bin.joints(&j));
+                    attrs["WEIGHTS_0"] = json!(bin.weights(&w));
+                    // glTF ignores a skinned mesh node's transform: leave it at the origin
+                    for k in ["translation", "rotation", "scale"] {
+                        node.as_object_mut().unwrap().remove(k);
+                    }
+                }
                 meshes.push(json!({"name": o.name, "primitives": [{"attributes": attrs, "indices": ia, "material": materials.len() - 1, "mode": 4}]}));
                 node["mesh"] = json!(meshes.len() - 1);
             }
@@ -298,7 +380,29 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 lights.push(lj);
                 node["extensions"] = json!({"KHR_lights_punctual": {"light": lights.len() - 1}});
             }
-            ObjectKind::Armature => {}
+            ObjectKind::Armature => {
+                if let Some(arm) = &o.armature {
+                    let mut ids = vec![];
+                    for b in &arm.bones {
+                        let (t, r, s) = trs_json(cm(b.rest.matrix() * b.pose.matrix()));
+                        nodes.push(json!({"name": b.name, "translation": t, "rotation": r, "scale": s}));
+                        ids.push(nodes.len() - 1);
+                    }
+                    let mut roots = vec![];
+                    for (i, b) in arm.bones.iter().enumerate() {
+                        match b.parent {
+                            Some(p) => {
+                                let mut kids = nodes[ids[p]]["children"].as_array().cloned().unwrap_or_default();
+                                kids.push(json!(ids[i]));
+                                nodes[ids[p]]["children"] = json!(kids);
+                            }
+                            None => roots.push(json!(ids[i])),
+                        }
+                    }
+                    node["children"] = json!(roots);
+                    bone_nodes.insert(o.id, ids);
+                }
+            }
             ObjectKind::Camera(cd) => {
                 cameras.push(json!({"name": o.name, "type": "perspective", "perspective": {"yfov": cd.fov_deg.to_radians(), "aspectRatio": 16.0 / 9.0, "znear": 0.1, "zfar": 1000.0}}));
                 node["camera"] = json!(cameras.len() - 1);
@@ -307,6 +411,75 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         nodes.push(node);
         let ni = nodes.len() - 1;
         node_of.insert(o.id, ni);
+        if skin_rest && nodes[ni].get("mesh").is_some() {
+            skinned.push((ni, o.id));
+        }
+        // bone animation (baked per frame): the active keys, plus every stored action
+        if let (Some(arm), Some(ids)) = (o.armature.as_ref(), bone_nodes.get(&o.id)) {
+            let mut sets: Vec<(Option<String>, crate::armature::Armature)> = vec![];
+            if arm.actions.len() > 1 {
+                let mut a = arm.clone();
+                a.stash_action();
+                for k in 0..a.actions.len() {
+                    let mut b = a.clone();
+                    b.set_action(k);
+                    sets.push((Some(a.actions[k].name.clone()), b));
+                }
+            } else {
+                sets.push((arm.actions.first().map(|a| a.name.clone()), arm.clone()));
+            }
+            for (name, mut a) in sets {
+                let keyed: Vec<usize> = (0..a.bones.len()).filter(|i| a.bones[*i].keys.len() >= 2).collect();
+                if keyed.is_empty() {
+                    continue;
+                }
+                let f0 = keyed.iter().map(|i| a.bones[*i].keys[0].frame).min().unwrap();
+                let f1 = keyed.iter().map(|i| a.bones[*i].keys.last().unwrap().frame).max().unwrap();
+                let fps = scene.fps.max(1) as f32;
+                a.rest_position = false;
+                let mut times = vec![];
+                let mut tl: Vec<Vec<Vec3>> = vec![vec![]; keyed.len()];
+                let mut rl: Vec<Vec<[f32; 4]>> = vec![vec![]; keyed.len()];
+                let mut sl: Vec<Vec<Vec3>> = vec![vec![]; keyed.len()];
+                for f in f0..=f1 {
+                    a.evaluate(f as f32);
+                    times.push((f - f0) as f32 / fps);
+                    for (k, &bi) in keyed.iter().enumerate() {
+                        let b = &a.bones[bi];
+                        let (sc, r, t) = cm(b.rest.matrix() * b.pose.matrix()).to_scale_rotation_translation();
+                        tl[k].push(t);
+                        rl[k].push([r.x, r.y, r.z, r.w]);
+                        sl[k].push(sc);
+                    }
+                }
+                // which glTF animation: the first named action shares the main one
+                let bucket = match &name {
+                    None => 0,
+                    Some(n) => {
+                        if anim_names[0].is_none() {
+                            anim_names[0] = Some(n.clone());
+                        }
+                        match anim_names.iter().position(|x| x.as_deref() == Some(n.as_str())) {
+                            Some(i) => i,
+                            None => {
+                                anim_names.push(Some(n.clone()));
+                                extra.push((vec![], vec![]));
+                                anim_names.len() - 1
+                            }
+                        }
+                    }
+                };
+                let input = bin.scalars(&times);
+                for (k, &bi) in keyed.iter().enumerate() {
+                    let outs = [("translation", bin.vec3s(&tl[k], None)), ("rotation", bin.vec4s(&rl[k])), ("scale", bin.vec3s(&sl[k], None))];
+                    for (path, out) in outs {
+                        let (ch, sm) = if bucket == 0 { (&mut channels, &mut samplers) } else { let e = &mut extra[bucket - 1]; (&mut e.0, &mut e.1) };
+                        sm.push(json!({"input": input, "output": out, "interpolation": "LINEAR"}));
+                        ch.push(json!({"sampler": sm.len() - 1, "target": {"node": ids[bi], "path": path}}));
+                    }
+                }
+            }
+        }
 
         // baked animation (one sample per frame, preserving the eased interpolation)
         if o.keyframes.len() >= 2 {
@@ -352,7 +525,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     for o in scene.objects.iter().filter(|o| o.visible) {
         let (Some(&ci), Some(&pi)) = (node_of.get(&o.id), o.parent.and_then(|p| node_of.get(&p))) else { continue };
         let animated = o.keyframes.len() >= 2;
-        if animated {
+        if animated || skinned.iter().any(|(_, id)| *id == o.id) {
             continue;
         }
         let local = world[pi].inverse() * world[ci];
@@ -372,8 +545,24 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         nodes[pi]["children"] = json!(kids);
         is_child[ci] = true;
     }
+    // bone nodes are children of their armature / parent bone
+    for ids in bone_nodes.values() {
+        for &i in ids {
+            is_child[i] = true;
+        }
+    }
+    let mut skins = vec![];
+    for (ni, oid) in &skinned {
+        let o = scene.get(*oid).unwrap();
+        let sk = o.skin.as_ref().unwrap();
+        let Some(ids) = bone_nodes.get(&sk.armature) else { continue };
+        let ibm: Vec<glam::Mat4> = sk.inverse_bind.iter().map(|m| cm(*m)).collect();
+        let acc = bin.mat4s(&ibm);
+        skins.push(json!({"name": format!("{} Skin", o.name), "inverseBindMatrices": acc, "joints": ids, "skeleton": node_of[&sk.armature]}));
+        nodes[*ni]["skin"] = json!(skins.len() - 1);
+    }
     let roots: Vec<usize> = (0..nodes.len()).filter(|i| !is_child[*i]).collect();
-    let n_anim = usize::from(!channels.is_empty());
+    let n_anim = usize::from(!channels.is_empty()) + extra.iter().filter(|e| !e.0.is_empty()).count();
     let mut ext_used = vec![];
     if !lights.is_empty() {
         ext_used.push("KHR_lights_punctual");
@@ -404,15 +593,26 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     if !cameras.is_empty() {
         root["cameras"] = json!(cameras);
     }
+    if !skins.is_empty() {
+        root["skins"] = json!(skins);
+    }
     if !lights.is_empty() {
         root["extensions"] = json!({"KHR_lights_punctual": {"lights": lights}});
     }
     if !ext_used.is_empty() {
         root["extensionsUsed"] = json!(ext_used);
     }
+    let mut animations = vec![];
     if !channels.is_empty() {
-        root["animations"] =
-            json!([{"name": "Action", "channels": channels, "samplers": samplers}]);
+        animations.push(json!({"name": anim_names[0].clone().unwrap_or_else(|| "Action".into()), "channels": channels, "samplers": samplers}));
+    }
+    for (k, (ch, sm)) in extra.into_iter().enumerate() {
+        if !ch.is_empty() {
+            animations.push(json!({"name": anim_names[k + 1].clone().unwrap_or_default(), "channels": ch, "samplers": sm}));
+        }
+    }
+    if !animations.is_empty() {
+        root["animations"] = json!(animations);
     }
     let mut js = serde_json::to_vec(&root).unwrap();
     while !js.len().is_multiple_of(4) {

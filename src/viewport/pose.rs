@@ -24,8 +24,9 @@ impl Viewport {
     pub(super) fn draw_bones(&mut self, o: &crate::scene::Object, pid: u32, col: [f32; 4], view: &Mat4) {
         let Some(arm) = o.armature.as_ref() else { return };
         let aw = o.transform.matrix();
-        let g = arm.pose_globals();
-        let posing = self.pose_draw.filter(|(id, _)| *id == o.id);
+        let editing = self.bone_edit_draw.filter(|(id, _, _)| *id == o.id);
+        let g = if editing.is_some() { arm.rest_globals() } else { arm.pose_globals() };
+        let posing = self.pose_draw.filter(|(id, _)| *id == o.id).or(editing.map(|e| (e.0, e.1)));
         let lw = self.px_scale;
         // in pose mode bones aren't object-pickable (and get no selection outline)
         if posing.is_some() {
@@ -64,11 +65,14 @@ impl Viewport {
                 }
             }
         }
+        if editing.is_some() {
+            self.draw_bone_joints(o, view);
+        }
         self.line_id = pid;
     }
 
     /// Bone under the mouse (screen distance to the bone segment).
-    fn bone_at(&self, ed: &Editor, id: u64, mouse: Pos2) -> Option<usize> {
+    pub(super) fn bone_at(&self, ed: &Editor, id: u64, mouse: Pos2) -> Option<usize> {
         let o = ed.scene.get(id)?;
         let arm = o.armature.as_ref()?;
         let aw = o.transform.matrix();

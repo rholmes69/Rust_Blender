@@ -758,6 +758,124 @@ fn newell(verts: &[Vec3], f: &[u32]) -> Vec3 {
 }
 
 /// Smooth proportional-editing falloff: 1 at the selection, 0 at `radius`.
+/// A point of a knife cut: an existing vertex, or a position along edge (a → b).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KnifePoint {
+    Vert(u32),
+    Edge { a: u32, b: u32, t: f32 },
+}
+
+/// Knife: insert the cut points on their edges and split every face that two consecutive
+/// points both lie on. Returns the new/used cut vertices (they become the selection).
+pub fn knife(pm: &mut PolyMesh, cut: &[KnifePoint], sel: &mut Vec<bool>) -> Result<usize, String> {
+    if cut.len() < 2 {
+        return Err("the knife needs a cut across at least one face".into());
+    }
+    let has_uv = pm.has_uvs();
+    // 1. new vertices on edges, grouped per undirected edge
+    let key = |a: u32, b: u32| (a.min(b), a.max(b));
+    let mut on_edge: HashMap<(u32, u32), Vec<(f32, u32)>> = HashMap::new();
+    let mut verts: Vec<u32> = vec![];
+    for p in cut {
+        let v = match *p {
+            KnifePoint::Vert(v) => v,
+            KnifePoint::Edge { a, b, t } => {
+                let (k, tt) = if a < b { (key(a, b), t) } else { (key(a, b), 1.0 - t) };
+                let tt = tt.clamp(0.0, 1.0);
+                if tt < 1e-4 {
+                    k.0
+                } else if tt > 1.0 - 1e-4 {
+                    k.1
+                } else {
+                    let list = on_edge.entry(k).or_default();
+                    match list.iter().find(|(t0, _)| (t0 - tt).abs() < 1e-4) {
+                        Some((_, v)) => *v,
+                        None => {
+                            let pos = pm.verts[k.0 as usize].lerp(pm.verts[k.1 as usize], tt);
+                            pm.verts.push(pos);
+                            let v = (pm.verts.len() - 1) as u32;
+                            list.push((tt, v));
+                            v
+                        }
+                    }
+                }
+            }
+        };
+        if verts.last() != Some(&v) {
+            verts.push(v);
+        }
+    }
+    for l in on_edge.values_mut() {
+        l.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    // insert them into every face using those edges
+    for fi in 0..pm.faces.len() {
+        let f = pm.faces[fi].clone();
+        let mut nf = Vec::with_capacity(f.len() + 2);
+        let mut nu = Vec::with_capacity(f.len() + 2);
+        for i in 0..f.len() {
+            let (x, y) = (f[i], f[(i + 1) % f.len()]);
+            nf.push(x);
+            if has_uv {
+                nu.push(pm.uvs[fi][i]);
+            }
+            if let Some(list) = on_edge.get(&key(x, y)) {
+                let ordered: Vec<(f32, u32)> = if x < y { list.clone() } else { list.iter().rev().map(|(t, v)| (1.0 - t, *v)).collect() };
+                for (t, v) in ordered {
+                    nf.push(v);
+                    if has_uv {
+                        let (ua, ub) = (pm.uvs[fi][i], pm.uvs[fi][(i + 1) % f.len()]);
+                        nu.push([ua[0] + (ub[0] - ua[0]) * t, ua[1] + (ub[1] - ua[1]) * t]);
+                    }
+                }
+            }
+        }
+        pm.faces[fi] = nf;
+        if has_uv {
+            pm.uvs[fi] = nu;
+        }
+    }
+    // 2. split faces along consecutive cut vertices
+    let mut splits = 0;
+    for w in verts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let Some(fi) = (0..pm.faces.len()).find(|&fi| {
+            let f = &pm.faces[fi];
+            match (f.iter().position(|&v| v == a), f.iter().position(|&v| v == b)) {
+                (Some(i), Some(j)) => {
+                    let n = f.len();
+                    let d = (i as i64 - j as i64).rem_euclid(n as i64) as usize;
+                    d != 1 && d != n - 1
+                }
+                _ => false,
+            }
+        }) else {
+            continue;
+        };
+        let f = pm.faces[fi].clone();
+        let (i, j) = (f.iter().position(|&v| v == a).unwrap(), f.iter().position(|&v| v == b).unwrap());
+        let (lo, hi) = (i.min(j), i.max(j));
+        let f1: Vec<u32> = f[lo..=hi].to_vec();
+        let f2: Vec<u32> = f[hi..].iter().chain(f[..=lo].iter()).copied().collect();
+        pm.faces[fi] = f1;
+        pm.faces.push(f2);
+        if has_uv {
+            let u = pm.uvs[fi].clone();
+            pm.uvs[fi] = u[lo..=hi].to_vec();
+            pm.uvs.push(u[hi..].iter().chain(u[..=lo].iter()).copied().collect());
+        }
+        splits += 1;
+    }
+    if splits == 0 {
+        return Err("the cut didn't cross any face".into());
+    }
+    *sel = vec![false; pm.verts.len()];
+    for v in &verts {
+        sel[*v as usize] = true;
+    }
+    Ok(splits)
+}
+
 pub fn falloff(dist: f32, radius: f32) -> f32 {
     if radius <= 0.0 || dist >= radius {
         return 0.0;
@@ -1022,5 +1140,22 @@ mod tests {
         assert_eq!(p.faces.len(), 4);
         assert!(p.verts.iter().any(|v| (v.x - 1.0).abs() < 1e-5 && v.y.abs() < 1e-5));
         assert!(p.verts.iter().all(|v| v.x.abs() <= 1.0 + 1e-5 && v.y.abs() <= 1.0 + 1e-5 && v.z.abs() < 1e-5));
+    }
+    #[test]
+    fn knife_cuts_faces() {
+        let mut pm = crate::mesh::cube();
+        let nf = pm.faces.len();
+        // find the top face and cut it corner-to-middle-of-opposite-edge
+        let top = (0..pm.faces.len()).find(|&f| pm.face_normal(f).z > 0.9).unwrap();
+        let f = pm.faces[top].clone();
+        let mut sel = vec![];
+        let cut = [KnifePoint::Vert(f[0]), KnifePoint::Edge { a: f[1], b: f[2], t: 0.5 }, KnifePoint::Edge { a: f[2], b: f[3], t: 0.5 }];
+        let n = knife(&mut pm, &cut, &mut sel).unwrap();
+        assert_eq!(n, 2, "two splits on the top face");
+        assert_eq!(pm.faces.len(), nf + 2);
+        assert_eq!(pm.verts.len(), 10);
+        assert_eq!(sel.iter().filter(|s| **s).count(), 3);
+        // still closed and manifold
+        assert!(pm.edge_faces().values().all(|f| f.len() == 2));
     }
 }

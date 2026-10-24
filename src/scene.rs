@@ -822,7 +822,7 @@ impl Scene {
 pub struct MeshCache {
     map: HashMap<(Primitive, u32, bool), Mesh>,
     /// object id (and whether it's the cage) -> (source mesh, smooth, subsurf levels, auto smooth, result)
-    custom: HashMap<(u64, bool), (Option<crate::mesh::PolyMesh>, (Primitive, u32), bool, u32, u32, u64, Mesh)>,
+    custom: HashMap<(u64, u8), (Option<crate::mesh::PolyMesh>, (Primitive, u32), bool, u32, u32, u64, Mesh)>,
 }
 
 impl MeshCache {
@@ -835,24 +835,31 @@ impl MeshCache {
     /// Render mesh for an object (custom edited mesh or cached primitive), with its
     /// Subdivision Surface modifiers and auto smooth applied.
     pub fn for_object(&mut self, o: &Object) -> Mesh {
-        self.build(o, false)
+        self.build(o, 0)
     }
 
     /// The editable cage (no subdivision), as drawn in edit mode.
     pub fn for_object_cage(&mut self, o: &Object) -> Mesh {
-        self.build(o, true)
+        self.build(o, 1)
     }
 
-    fn build(&mut self, o: &Object, cage: bool) -> Mesh {
+    /// Posed (armature-deformed) but not subdivided: vertices match the mesh's own (weight paint).
+    pub fn for_object_posed_base(&mut self, o: &Object) -> Mesh {
+        self.build(o, 2)
+    }
+
+    /// mode 0: final, 1: edit cage (rest, no subdivision), 2: posed without subdivision
+    fn build(&mut self, o: &Object, mode: u8) -> Mesh {
+        let cage = mode == 1;
         let smooth = o.smooth();
-        let levels = if cage { 0 } else { o.subsurf_levels() };
+        let levels = if mode != 0 { 0 } else { o.subsurf_levels() };
         let auto = (o.auto_smooth * 100.0).round() as u32;
         if o.mesh.is_none() && levels == 0 && auto == 0 && o.posed.is_none() {
             return self.get(o.primitive, o.detail, smooth).clone();
         }
         let prim = (o.primitive, o.detail);
         let key2 = if !cage && o.posed.is_some() { o.posed_key } else { 0 };
-        if let Some((src, p, s, l, a, k, m)) = self.custom.get(&(o.id, cage)) {
+        if let Some((src, p, s, l, a, k, m)) = self.custom.get(&(o.id, mode)) {
             if *src == o.mesh && *p == prim && *s == smooth && *l == levels && *a == auto && *k == key2 {
                 return m.clone();
             }
@@ -863,7 +870,7 @@ impl MeshCache {
         };
         let pm = if levels > 0 { crate::editmesh::subdivide_surface(&base, levels) } else { base };
         let m = pm.to_mesh_opts(smooth, o.auto_smooth);
-        self.custom.insert((o.id, cage), (o.mesh.clone(), prim, smooth, levels, auto, key2, m.clone()));
+        self.custom.insert((o.id, mode), (o.mesh.clone(), prim, smooth, levels, auto, key2, m.clone()));
         m
     }
 }

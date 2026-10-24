@@ -1209,6 +1209,8 @@ impl App {
                         "sculpt"
                     } else if self.ed.pose.is_some() {
                         "pose"
+                    } else if self.ed.weight_paint.is_some() {
+                        "weight_paint"
                     } else {
                         "object"
                     }
@@ -1802,6 +1804,8 @@ impl App {
                 Ok("Object mode".to_string())
             } else if self.ed.pose.is_some() || arm_active {
                 self.ed.toggle_pose()
+            } else if self.ed.weight_paint.is_some() || self.ed.active.and_then(|id| self.ed.scene.get(id)).is_some_and(|o| o.skin.is_some()) {
+                self.ed.toggle_weight_paint()
             } else {
                 let log = self.ed.execute(&[Command::new("sculpt_mode")]);
                 let l = log.first().cloned().unwrap_or_default();
@@ -3708,7 +3712,16 @@ impl App {
                         if o.name != orig.name {
                             o.name = self.ed.scene.unique_name(&o.name);
                         }
+                        let switched = match (&orig.armature, &o.armature) {
+                            (Some(a0), Some(a1)) if a0.active_action != a1.active_action || a0.actions.len() != a1.actions.len() => a1.actions.get(a1.active_action).and_then(|a| a.range()),
+                            _ => None,
+                        };
                         *self.ed.scene.get_mut(id).unwrap() = o;
+                        if let Some((lo, hi)) = switched {
+                            self.ed.scene.frame_start = lo;
+                            self.ed.scene.frame_end = hi.max(lo + 1);
+                            self.ed.set_frame(lo);
+                        }
                         self.ed.dirty = true;
                     }
                 }
@@ -5003,6 +5016,26 @@ fn armature_props(ui: &mut Ui, o: &mut crate::scene::Object) {
         let keyed = arm.bones.iter().filter(|b| !b.keys.is_empty()).count();
         ui.label(RichText::new(format!("{} bones{}", arm.bones.len(), if keyed > 0 { format!(", {keyed} animated") } else { String::new() })).small().color(theme::TEXT_DIM));
     });
+    if !arm.actions.is_empty() {
+        section(ui, "Actions", |ui| {
+            let mut pick = None;
+            for (i, a) in arm.actions.iter().enumerate() {
+                let r = a.range().map(|(l, h)| format!("  {l}–{h}")).unwrap_or_default();
+                if ui.selectable_label(i == arm.active_action, format!("{}{r}", a.name)).clicked() && i != arm.active_action {
+                    pick = Some(i);
+                }
+            }
+            if let Some(i) = pick {
+                arm.set_action(i);
+            }
+            if ui.small_button("New Action").clicked() {
+                arm.new_action("Action");
+            }
+            ui.label(RichText::new("Switching sets the timeline to the action's frames.").small().color(theme::TEXT_DIM));
+        });
+    } else if arm.has_keys() && ui.small_button("Store as Action").on_hover_text("Keep this animation as a named action and start another").clicked() {
+        arm.new_action("Action");
+    }
     section(ui, "Bones (pose)", |ui| {
         egui::ScrollArea::vertical().max_height(260.0).id_salt("bones").show(ui, |ui| {
             for b in arm.bones.iter_mut() {

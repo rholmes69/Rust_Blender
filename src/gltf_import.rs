@@ -733,7 +733,7 @@ fn skins_and_animation(
             bones[bi].tail = Some(tail);
         }
         let name = sk["name"].as_str().filter(|s| !s.is_empty()).unwrap_or("Armature").to_string();
-        let arm = Armature { bones, rest_position: false };
+        let arm = Armature { bones, ..Default::default() };
         let aid = scene.add_armature(arm, Some(&name));
         new_ids.push(aid);
         // inverse bind matrices in our space, in bone order
@@ -765,12 +765,9 @@ fn skins_and_animation(
         }
     }
 
-    // ---- animation (the first one; baked per frame) ----
+    // ---- animations: the first one keys objects and bones; every one becomes an action of the
+    // armatures it moves (walk, run …), baked per frame ----
     let anims = j["animations"].as_array().cloned().unwrap_or_default();
-    if anims.len() > 1 {
-        stats.notes.push(format!("{} more animation(s)", anims.len() - 1));
-    }
-    let Some(anim) = anims.first() else { return Ok(()) };
     struct Ch {
         node: usize,
         path: String,
@@ -778,120 +775,139 @@ fn skins_and_animation(
         vals: Vec<f32>,
         interp: String,
     }
-    let mut chans = vec![];
-    for c in anim["channels"].as_array().into_iter().flatten() {
-        let (Some(node), Some(path)) = (c["target"]["node"].as_u64().map(|x| x as usize), c["target"]["path"].as_str()) else { continue };
-        if node >= nn || !matches!(path, "translation" | "rotation" | "scale") {
-            if path == "weights" && !stats.notes.iter().any(|n| n == "morph targets") {
-                stats.notes.push("morph targets".into());
+    let mut actions: HashMap<u64, Vec<crate::armature::Action>> = HashMap::new();
+    let base_trs: Vec<(Vec3, Quat, Vec3)> = nodes.iter().map(node_trs).collect();
+    let mut first_summary: Option<String> = None;
+    for (ai, anim) in anims.iter().enumerate().take(64) {
+        let mut chans = vec![];
+        for c in anim["channels"].as_array().into_iter().flatten() {
+            let (Some(node), Some(path)) = (c["target"]["node"].as_u64().map(|x| x as usize), c["target"]["path"].as_str()) else { continue };
+            if node >= nn || !matches!(path, "translation" | "rotation" | "scale") {
+                if path == "weights" && !stats.notes.iter().any(|n| n == "morph targets") {
+                    stats.notes.push("morph targets".into());
+                }
+                continue;
             }
+            let smp = &anim["samplers"][c["sampler"].as_u64().unwrap_or(0) as usize];
+            let (Some(ia), Some(oa)) = (smp["input"].as_u64(), smp["output"].as_u64()) else { continue };
+            let (times, _) = doc.floats(ia as usize)?;
+            let (vals, _) = doc.floats(oa as usize)?;
+            chans.push(Ch { node, path: path.to_string(), times, vals, interp: smp["interpolation"].as_str().unwrap_or("LINEAR").to_string() });
+        }
+        if chans.is_empty() {
             continue;
         }
-        let smp = &anim["samplers"][c["sampler"].as_u64().unwrap_or(0) as usize];
-        let (Some(ia), Some(oa)) = (smp["input"].as_u64(), smp["output"].as_u64()) else { continue };
-        let (times, _) = doc.floats(ia as usize)?;
-        let (vals, _) = doc.floats(oa as usize)?;
-        chans.push(Ch { node, path: path.to_string(), times, vals, interp: smp["interpolation"].as_str().unwrap_or("LINEAR").to_string() });
-    }
-    if chans.is_empty() {
-        return Ok(());
-    }
-    let tmax = chans.iter().filter_map(|c| c.times.last().copied()).fold(0.0, f32::max);
-    let nframes = ((tmax * fps).round() as usize + 1).clamp(1, 5000);
-    let base_trs: Vec<(Vec3, Quat, Vec3)> = nodes.iter().map(node_trs).collect();
-    // objects to key: those whose node or an ancestor is animated (not skinned meshes)
-    let animated: std::collections::HashSet<usize> = chans.iter().map(|c| c.node).collect();
-    let moved = |mut i: usize| -> bool {
-        loop {
-            if animated.contains(&i) {
-                return true;
+        let aname = anim["name"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| format!("Action.{ai:03}"));
+        let tmin = chans.iter().filter_map(|c| c.times.first().copied()).fold(f32::MAX, f32::min).max(0.0);
+        let tmax = chans.iter().filter_map(|c| c.times.last().copied()).fold(0.0, f32::max);
+        let nframes = (((tmax - tmin) * fps).round() as usize + 1).clamp(1, 5000);
+        let animated: std::collections::HashSet<usize> = chans.iter().map(|c| c.node).collect();
+        let moved = |mut i: usize| -> bool {
+            loop {
+                if animated.contains(&i) {
+                    return true;
+                }
+                match parent_of[i] {
+                    Some(p) => i = p,
+                    None => return false,
+                }
             }
-            match parent_of[i] {
-                Some(p) => i = p,
-                None => return false,
+        };
+        let keyed_nodes: Vec<usize> = if ai == 0 { node_ids.keys().copied().filter(|n| moved(*n)).collect() } else { vec![] };
+        let mut obj_keys: HashMap<u64, Vec<crate::scene::Keyframe>> = HashMap::new();
+        let mut bone_keys: HashMap<u64, Vec<Vec<BoneKey>>> = HashMap::new();
+        for f in 0..nframes {
+            let t = tmin + f as f32 / fps;
+            let mut trs = base_trs.clone();
+            for c in &chans {
+                let nc = if c.path == "rotation" { 4 } else { 3 };
+                let v = sample_channel(&c.times, &c.vals, nc, &c.interp, t);
+                match c.path.as_str() {
+                    "translation" => trs[c.node].0 = Vec3::new(v[0], v[1], v[2]),
+                    "rotation" => trs[c.node].1 = Quat::from_xyzw(v[0], v[1], v[2], v[3]).normalize(),
+                    _ => trs[c.node].2 = Vec3::new(v[0], v[1], v[2]),
+                }
             }
-        }
-    };
-    let keyed_nodes: Vec<usize> = node_ids.keys().copied().filter(|n| moved(*n)).collect();
-    let mut obj_keys: HashMap<u64, Vec<crate::scene::Keyframe>> = HashMap::new();
-    for f in 0..nframes {
-        let t = f as f32 / fps;
-        let mut trs = base_trs.clone();
-        for c in &chans {
-            let nc = if c.path == "rotation" { 4 } else { 3 };
-            let v = sample_channel(&c.times, &c.vals, nc, &c.interp, t);
-            match c.path.as_str() {
-                "translation" => trs[c.node].0 = Vec3::new(v[0], v[1], v[2]),
-                "rotation" => trs[c.node].1 = Quat::from_xyzw(v[0], v[1], v[2], v[3]).normalize(),
-                _ => trs[c.node].2 = Vec3::new(v[0], v[1], v[2]),
-            }
-        }
-        let locals: Vec<Mat4> = trs.iter().map(|(t, r, s)| Mat4::from_scale_rotation_translation(*s, *r, *t)).collect();
-        let frame = 1 + f as i32;
-        // bones
-        for (aid, bone_nodes, _) in arms.iter().flatten() {
-            let gw: Vec<Mat4> = bone_nodes.iter().map(|n| cv(world(&locals, *n))).collect();
-            if let Some(arm) = scene.get_mut(*aid).and_then(|o| o.armature.as_mut()) {
-                for (bi, b) in arm.bones.iter_mut().enumerate() {
+            let locals: Vec<Mat4> = trs.iter().map(|(t, r, s)| Mat4::from_scale_rotation_translation(*s, *r, *t)).collect();
+            let frame = 1 + f as i32;
+            for (aid, bone_nodes, _) in arms.iter().flatten() {
+                let gw: Vec<Mat4> = bone_nodes.iter().map(|n| cv(world(&locals, *n))).collect();
+                let Some(arm) = scene.get(*aid).and_then(|o| o.armature.as_ref()) else { continue };
+                let keys = bone_keys.entry(*aid).or_insert_with(|| vec![vec![]; arm.bones.len()]);
+                for (bi, b) in arm.bones.iter().enumerate() {
                     let local = match b.parent {
                         Some(p) => gw[p].inverse() * gw[bi],
                         None => gw[bi],
                     };
-                    let pose = BonePose::from_matrix(b.rest.matrix().inverse() * local);
-                    b.keys.push(BoneKey { frame, pose });
+                    keys[bi].push(BoneKey { frame, pose: BonePose::from_matrix(b.rest.matrix().inverse() * local) });
+                }
+            }
+            for n in &keyed_nodes {
+                let (s, r, tr) = world(&locals, *n).to_scale_rotation_translation();
+                for oid in &node_ids[n] {
+                    let Some(o) = scene.get(*oid) else { continue };
+                    if o.skin.is_some() {
+                        continue;
+                    }
+                    let special = !o.is_mesh();
+                    let mut tf = crate::scene::Transform { location: icv(tr), rotation: Vec3::ZERO, scale: if special { o.transform.scale } else { ics(s) } };
+                    tf.set_quat(if special { icq(r * fix_inv) } else { icq(r) });
+                    obj_keys.entry(*oid).or_default().push(crate::scene::Keyframe { frame, transform: tf });
                 }
             }
         }
-        // objects
-        for n in &keyed_nodes {
-            let (s, r, tr) = world(&locals, *n).to_scale_rotation_translation();
-            for oid in &node_ids[n] {
-                let Some(o) = scene.get(*oid) else { continue };
-                if o.skin.is_some() {
-                    continue;
-                }
-                let special = !o.is_mesh();
-                let mut tf = crate::scene::Transform { location: icv(tr), rotation: Vec3::ZERO, scale: if special { o.transform.scale } else { ics(s) } };
-                tf.set_quat(if special { icq(r * fix_inv) } else { icq(r) });
-                obj_keys.entry(*oid).or_default().push(crate::scene::Keyframe { frame, transform: tf });
+        let mut keyed = 0;
+        for (oid, keys) in obj_keys {
+            if keys.windows(2).all(|w| w[0].transform == w[1].transform) {
+                continue;
+            }
+            if let Some(o) = scene.get_mut(oid) {
+                o.keyframes = keys;
+                o.evaluate(1);
+                keyed += 1;
             }
         }
-    }
-    let mut keyed = 0;
-    for (oid, keys) in obj_keys {
-        let constant = keys.windows(2).all(|w| w[0].transform == w[1].transform);
-        if constant {
-            continue;
-        }
-        if let Some(o) = scene.get_mut(oid) {
-            o.keyframes = keys;
-            o.evaluate(1);
-            keyed += 1;
-        }
-    }
-    let mut bones_keyed = 0;
-    for (aid, _, _) in arms.iter().flatten() {
-        if let Some(a) = scene.get_mut(*aid).and_then(|o| o.armature.as_mut()) {
-            // drop bones that never move
-            for b in &mut a.bones {
-                if b.keys.windows(2).all(|w| w[0].pose == w[1].pose) {
-                    b.keys.clear();
+        let mut bones_keyed = 0;
+        for (aid, mut keys) in bone_keys {
+            let mut any = false;
+            for k in &mut keys {
+                if k.windows(2).all(|w| w[0].pose == w[1].pose) {
+                    k.clear();
                 } else {
+                    any = true;
                     bones_keyed += 1;
                 }
+            }
+            if any {
+                actions.entry(aid).or_default().push(crate::armature::Action { name: aname.clone(), keys });
+            }
+        }
+        if first_summary.is_none() && keyed + bones_keyed > 0 {
+            scene.frame_end = (nframes as i32).max(2);
+            first_summary = Some(format!(
+                "animation \"{aname}\": {nframes} frames{}{}",
+                if keyed > 0 { format!(", {keyed} object(s)") } else { String::new() },
+                if bones_keyed > 0 { format!(", {bones_keyed} bone(s)") } else { String::new() }
+            ));
+        }
+    }
+    let mut n_actions = 0;
+    for (aid, acts) in actions {
+        if let Some(a) = scene.get_mut(aid).and_then(|o| o.armature.as_mut()) {
+            n_actions = n_actions.max(acts.len());
+            a.actions = acts;
+            a.active_action = 0;
+            for (k, b) in a.bones.iter_mut().enumerate() {
+                b.keys = a.actions[0].keys.get(k).cloned().unwrap_or_default();
             }
             a.evaluate(1.0);
         }
     }
-    if keyed + bones_keyed > 0 {
-        scene.frame_end = (nframes as i32).max(2);
-        stats.animation = Some(format!(
-            "animation \"{}\": {} frames{}{}",
-            anim["name"].as_str().unwrap_or("Action"),
-            nframes,
-            if keyed > 0 { format!(", {keyed} object(s)") } else { String::new() },
-            if bones_keyed > 0 { format!(", {bones_keyed} bone(s)") } else { String::new() }
-        ));
+    if let Some(mut s) = first_summary {
+        if n_actions > 1 {
+            s += &format!(" (+{} more actions)", n_actions - 1);
+        }
+        stats.animation = Some(s);
     }
     Ok(())
 }
@@ -1075,6 +1091,17 @@ mod anim_tests {
             sc.objects.clear();
             let (st, _) = super::import_file(&mut sc, &std::path::Path::new(&dir).join(format!("{name}.glb"))).unwrap();
             println!("{name}: {}", st.summary());
+            if name == "Fox" {
+                let a = sc.objects.iter().find_map(|o| o.armature.as_ref()).unwrap();
+                assert_eq!(a.actions.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Survey", "Walk", "Run"]);
+                // round trip keeps all three
+                let (glb, st2) = crate::gltf::export_glb(&sc, &mut crate::scene::MeshCache::default());
+                assert_eq!(st2.animations, 3);
+                let mut sc2 = crate::scene::Scene::default();
+                sc2.objects.clear();
+                super::import_bytes(&mut sc2, &glb, None).unwrap();
+                assert_eq!(sc2.objects.iter().find_map(|o| o.armature.as_ref()).unwrap().actions.len(), 3);
+            }
             assert!(st.animation.is_some(), "{name} has an animation");
             let arms = sc.objects.iter().filter(|o| o.armature.is_some()).count();
             assert_eq!(arms > 0, want_arm, "{name}");

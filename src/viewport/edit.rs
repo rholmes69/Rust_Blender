@@ -129,7 +129,7 @@ impl Viewport {
     }
 
     /// Is a world point visible (not hidden behind geometry) in the last rendered frame?
-    fn visible(&self, p: Vec3, xray: bool) -> bool {
+    pub(super) fn visible(&self, p: Vec3, xray: bool) -> bool {
         if xray {
             return true;
         }
@@ -209,7 +209,7 @@ impl Viewport {
         }
     }
 
-    fn nearest_edge(&self, ed: &Editor, mouse: Pos2, max: f32) -> Option<(u32, u32)> {
+    pub(super) fn nearest_edge(&self, ed: &Editor, mouse: Pos2, max: f32) -> Option<(u32, u32)> {
         let d = self.edit_draw.as_ref()?;
         let xray = self.overlays.xray || ed.shading == Shading::Wireframe;
         let mut best: Option<(f32, (u32, u32))> = None;
@@ -342,6 +342,8 @@ impl Viewport {
             self.begin_inset(ed, mouse);
         } else if c(M::COMMAND, Key::R) {
             self.loopcut = Some(1);
+        } else if c(M::NONE, Key::K) {
+            self.knife = Some(vec![]);
         } else if c(M::NONE, Key::U) {
             self.report(ed.execute(&[crate::editor::Command { action: "unwrap".into(), name: Some("smart".into()), ..Default::default() }]).first().cloned().map(|l| if l.starts_with('✔') { Ok(l) } else { Err(l) }).unwrap_or(Ok(String::new())));
             self.flash = Some(("Smart UV Project".into(), std::time::Instant::now()));

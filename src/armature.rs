@@ -78,6 +78,27 @@ pub struct Armature {
     /// Show (and deform with) the rest position instead of the pose.
     #[serde(default)]
     pub rest_position: bool,
+    /// Stored animations (walk, run …). The active one's keys live in the bones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<Action>,
+    #[serde(default)]
+    pub active_action: usize,
+}
+
+/// A named set of bone keys (Blender's Action).
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct Action {
+    pub name: String,
+    /// Keys per bone (same order as `Armature::bones`).
+    pub keys: Vec<Vec<BoneKey>>,
+}
+
+impl Action {
+    pub fn range(&self) -> Option<(i32, i32)> {
+        let lo = self.keys.iter().filter_map(|k| k.first()).map(|k| k.frame).min()?;
+        let hi = self.keys.iter().filter_map(|k| k.last()).map(|k| k.frame).max()?;
+        Some((lo, hi))
+    }
 }
 
 impl Armature {
@@ -97,7 +118,7 @@ impl Armature {
                 keys: vec![],
             })
             .collect();
-        Armature { bones, rest_position: false }
+        Armature { bones, ..Default::default() }
     }
 
     fn globals(&self, posed: bool) -> Vec<Mat4> {
@@ -143,6 +164,186 @@ impl Armature {
                 (head, g.transform_point3(b.tail_local()))
             })
             .collect()
+    }
+
+    // ---- actions ----
+
+    /// Copy the bones' keys into the active action (if actions are in use).
+    pub fn stash_action(&mut self) {
+        let keys: Vec<Vec<BoneKey>> = self.bones.iter().map(|b| b.keys.clone()).collect();
+        if let Some(a) = self.actions.get_mut(self.active_action) {
+            a.keys = keys;
+        }
+    }
+
+    /// Make action `i` active: its keys go into the bones. Returns its frame range.
+    pub fn set_action(&mut self, i: usize) -> Option<(i32, i32)> {
+        if i >= self.actions.len() {
+            return None;
+        }
+        self.stash_action();
+        self.active_action = i;
+        let a = &self.actions[i];
+        for (k, b) in self.bones.iter_mut().enumerate() {
+            b.keys = a.keys.get(k).cloned().unwrap_or_default();
+        }
+        if !self.has_keys() {
+            self.reset_pose();
+        }
+        let r = self.actions[i].range();
+        if let Some((lo, _)) = r {
+            self.evaluate(lo as f32);
+        }
+        r
+    }
+
+    /// Start a new empty action (the current keys are kept in the previous one).
+    pub fn new_action(&mut self, name: &str) -> usize {
+        if self.actions.is_empty() {
+            self.actions.push(Action { name: "Action".into(), keys: vec![] });
+            self.active_action = 0;
+        }
+        self.stash_action();
+        let mut nm = name.to_string();
+        let mut k = 1;
+        while self.actions.iter().any(|a| a.name == nm) {
+            nm = format!("{name}.{k:03}");
+            k += 1;
+        }
+        self.actions.push(Action { name: nm, keys: vec![vec![]; self.bones.len()] });
+        self.active_action = self.actions.len() - 1;
+        for b in &mut self.bones {
+            b.keys.clear();
+        }
+        self.active_action
+    }
+
+    pub fn find_action(&self, name: &str) -> Option<usize> {
+        let n = name.trim().to_lowercase();
+        self.actions.iter().position(|a| a.name.to_lowercase() == n).or_else(|| self.actions.iter().position(|a| a.name.to_lowercase().contains(&n)))
+    }
+
+    // ---- edit mode (rest pose) ----
+
+    /// Rebuild the parent-relative rest poses from armature-space matrices.
+    fn set_rest_globals(&mut self, g: &[Mat4]) {
+        for i in 0..self.bones.len() {
+            let local = match self.bones[i].parent {
+                Some(p) => g[p].inverse() * g[i],
+                None => g[i],
+            };
+            self.bones[i].rest = BonePose::from_matrix(local);
+        }
+    }
+
+    /// Head and tail (armature space, rest) of bone `i`.
+    pub fn rest_points(&self, i: usize) -> (Vec3, Vec3) {
+        self.segments(&self.rest_globals())[i]
+    }
+
+    /// Move bone `i` so its rest head/tail are `head`/`tail` (armature space). Other bones keep
+    /// their place, except connected neighbours: children whose head sat on the old tail follow
+    /// it, and a parent whose tail sat on the old head follows that.
+    pub fn set_rest_points(&mut self, i: usize, head: Vec3, tail: Vec3) {
+        let mut g = self.rest_globals();
+        let segs = self.segments(&g);
+        let (oh, ot) = segs[i];
+        let len = head.distance(tail).max(1e-4);
+        let eps = (oh.distance(ot) * 1e-3).max(1e-6);
+        let place = |g: &Mat4, b: &Bone, h: Vec3, t: Vec3| -> (Mat4, f32) {
+            let (_, r, oh2) = g.to_scale_rotation_translation();
+            let old_t = g.transform_point3(b.tail_local());
+            let od = (old_t - oh2).normalize_or(Vec3::Y);
+            let nd = (t - h).normalize_or(od);
+            let r2 = (Quat::from_rotation_arc(od, nd) * r).normalize();
+            (Mat4::from_rotation_translation(r2, h), h.distance(t).max(1e-4))
+        };
+        let mut new_len = vec![None; self.bones.len()];
+        let (m, l) = place(&g[i], &self.bones[i], head, tail);
+        g[i] = m;
+        new_len[i] = Some(l);
+        let _ = len;
+        for k in 0..self.bones.len() {
+            if k == i {
+                continue;
+            }
+            let (kh, kt) = segs[k];
+            if self.bones[k].parent == Some(i) && kh.distance(ot) < eps {
+                let (m, l) = place(&g[k], &self.bones[k], tail, kt);
+                g[k] = m;
+                new_len[k] = Some(l);
+            } else if self.bones[i].parent == Some(k) && kt.distance(oh) < eps {
+                let (m, l) = place(&g[k], &self.bones[k], kh, head);
+                g[k] = m;
+                new_len[k] = Some(l);
+            }
+        }
+        for (k, l) in new_len.iter().enumerate() {
+            if let Some(l) = l {
+                let b = &mut self.bones[k];
+                b.tail = b.tail.map(|t| t.normalize_or(Vec3::Y) * *l);
+                b.length = *l;
+            }
+        }
+        self.set_rest_globals(&g);
+    }
+
+    /// New bone continuing from bone `i`'s tail (Blender's E). Returns its index.
+    pub fn extrude(&mut self, i: usize) -> usize {
+        let (h, t) = self.rest_points(i);
+        let dir = (t - h).normalize_or(Vec3::Z);
+        let len = h.distance(t).max(0.05) * 0.6;
+        self.add_bone(t, t + dir * len, Some(i))
+    }
+
+    /// Add a bone between `head` and `tail` (armature space).
+    pub fn add_bone(&mut self, head: Vec3, tail: Vec3, parent: Option<usize>) -> usize {
+        let mut g = self.rest_globals();
+        let dir = (tail - head).normalize_or(Vec3::Z);
+        let m = Mat4::from_rotation_translation(Quat::from_rotation_arc(Vec3::Y, dir), head);
+        let mut name = format!("Bone.{:03}", self.bones.len());
+        let mut k = self.bones.len();
+        while self.bones.iter().any(|b| b.name == name) {
+            k += 1;
+            name = format!("Bone.{k:03}");
+        }
+        self.bones.push(Bone { name, parent, rest: BonePose::default(), length: head.distance(tail).max(1e-4), tail: None, pose: BonePose::default(), keys: vec![] });
+        for a in &mut self.actions {
+            a.keys.resize(self.bones.len(), vec![]);
+        }
+        g.push(m);
+        self.set_rest_globals(&g);
+        self.bones.len() - 1
+    }
+
+    /// Delete bone `i`; its children move to its parent. Returns old index → new index.
+    pub fn delete_bone(&mut self, i: usize) -> Vec<Option<usize>> {
+        let g = self.rest_globals();
+        let parent = self.bones[i].parent;
+        let map: Vec<Option<usize>> = (0..self.bones.len()).map(|k| if k == i { None } else if k > i { Some(k - 1) } else { Some(k) }).collect();
+        let mut g2 = vec![];
+        let mut bones = vec![];
+        for (k, b) in self.bones.iter().enumerate() {
+            if k == i {
+                continue;
+            }
+            let mut b = b.clone();
+            b.parent = match b.parent {
+                Some(p) if p == i => parent.and_then(|q| map[q]),
+                Some(p) => map[p],
+                None => None,
+            };
+            bones.push(b);
+            g2.push(g[k]);
+        }
+        self.bones = bones;
+        for a in &mut self.actions {
+            if i < a.keys.len() {
+                a.keys.remove(i);
+            }
+        }
+        self.set_rest_globals(&g2);
+        map
     }
 
     pub fn find(&self, name: &str) -> Option<usize> {
@@ -226,6 +427,121 @@ impl Skin {
         let _ = pm;
         Skin { armature, joints, weights, inverse_bind }
     }
+}
+
+/// Which part of a bone is selected in armature edit mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BonePart {
+    Head,
+    Tail,
+    #[default]
+    Body,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaintMode {
+    Add,
+    Subtract,
+    Blur,
+}
+
+impl Skin {
+    /// Weight of `bone` on vertex `i`.
+    pub fn weight(&self, i: usize, bone: usize) -> f32 {
+        let (j, w) = (self.joints[i], self.weights[i]);
+        (0..4).filter(|k| j[*k] as usize == bone).map(|k| w[k]).sum()
+    }
+
+    /// Set the weight of `bone` on vertex `i`; the other influences share the rest (auto
+    /// normalize). A vertex keeps its four strongest bones.
+    pub fn set_weight(&mut self, i: usize, bone: usize, w: f32) {
+        let w = w.clamp(0.0, 1.0);
+        let (j, ws) = (&mut self.joints[i], &mut self.weights[i]);
+        let slot = match (0..4).find(|k| j[*k] as usize == bone && ws[*k] > 0.0).or_else(|| (0..4).find(|k| j[*k] as usize == bone)) {
+            Some(k) => k,
+            None => {
+                if w <= 0.0 {
+                    return;
+                }
+                let k = (0..4).min_by(|a, b| ws[*a].partial_cmp(&ws[*b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap();
+                j[k] = bone as u16;
+                ws[k] = 0.0;
+                k
+            }
+        };
+        // duplicates of the same bone in other slots fold into this one
+        for k in 0..4 {
+            if k != slot && j[k] as usize == bone {
+                ws[k] = 0.0;
+            }
+        }
+        let others: f32 = (0..4).filter(|k| *k != slot).map(|k| ws[k]).sum();
+        ws[slot] = w;
+        if others > 1e-6 {
+            let s = (1.0 - w) / others;
+            for k in 0..4 {
+                if k != slot {
+                    ws[k] *= s;
+                }
+            }
+        }
+    }
+}
+
+/// One weight-paint dab on the posed mesh (`posed`, local space; `to_world` places it) around
+/// the world point `c` with world radius `r`. Returns how many vertices changed.
+#[allow(clippy::too_many_arguments)]
+pub fn paint(posed: &PolyMesh, to_world: Mat4, adj: &[Vec<u32>], skin: &mut Skin, c: Vec3, r: f32, bone: usize, strength: f32, mode: PaintMode) -> usize {
+    let inside: Vec<(usize, f32)> = posed
+        .verts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            let d = to_world.transform_point3(*v).distance(c);
+            (d < r).then(|| (i, crate::editmesh::falloff(d, r)))
+        })
+        .collect();
+    let old: Vec<f32> = match mode {
+        PaintMode::Blur => (0..posed.verts.len()).map(|i| skin.weight(i, bone)).collect(),
+        _ => vec![],
+    };
+    let mut n = 0;
+    for (i, f) in inside {
+        if i >= skin.joints.len() {
+            continue;
+        }
+        let f = (f * strength).clamp(0.0, 1.0);
+        let w = skin.weight(i, bone);
+        let nw = match mode {
+            PaintMode::Add => w + (1.0 - w) * f,
+            PaintMode::Subtract => w * (1.0 - f),
+            PaintMode::Blur => {
+                let nb = &adj[i];
+                if nb.is_empty() {
+                    w
+                } else {
+                    let m = nb.iter().map(|&k| old[k as usize]).sum::<f32>() / nb.len() as f32;
+                    w + (m - w) * f
+                }
+            }
+        };
+        if (nw - w).abs() > 1e-5 {
+            skin.set_weight(i, bone, nw);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Weight → colour (blue 0 · green 0.5 · red 1), like Blender's weight display.
+pub fn weight_color(w: f32) -> [f32; 3] {
+    let w = w.clamp(0.0, 1.0);
+    let stops = [[0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 0.0]];
+    let x = w * 4.0;
+    let i = (x.floor() as usize).min(3);
+    let t = x - i as f32;
+    let (a, b) = (stops[i], stops[i + 1]);
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
 /// Deformed copy of `pm` (local space of the object with matrix `obj`).
@@ -338,6 +654,43 @@ mod tests {
         let a = arm.bones[1].pose.rot.angle_between(Quat::IDENTITY);
         assert!(a > 0.3 && a < 1.3, "{a}");
         assert_eq!(arm.find("bone 1"), Some(1));
+        // weight painting keeps weights normalised
+        let mut sk = skin.clone();
+        sk.set_weight(0, 1, 0.75);
+        assert!((sk.weight(0, 1) - 0.75).abs() < 1e-5 && (sk.weight(0, 0) - 0.25).abs() < 1e-3, "{:?}", sk.weights[0]);
+        let adj = crate::sculpt::adjacency(&pm);
+        let n = paint(&pm, Mat4::IDENTITY, &adj, &mut sk, pm.verts[8], 0.6, 0, 1.0, PaintMode::Add);
+        assert!(n > 0 && sk.weight(8, 0) > 0.5, "painting bone 0 at the top");
+        paint(&pm, Mat4::IDENTITY, &adj, &mut sk, pm.verts[8], 0.6, 0, 1.0, PaintMode::Subtract);
+        assert!(sk.weight(8, 0) < 0.3);
+        assert_eq!(weight_color(0.0), [0.0, 0.0, 1.0]);
+        // edit bones
+        let mut e = Armature::chain(2, 2.0);
+        e.set_rest_points(0, Vec3::ZERO, Vec3::new(0.0, 1.0, 1.0));
+        let (h1, t1) = e.rest_points(1);
+        assert!(h1.distance(Vec3::new(0.0, 1.0, 1.0)) < 1e-4, "connected child follows: {h1}");
+        assert!(t1.distance(Vec3::Z * 2.0) < 1e-4, "its tail stays: {t1}");
+        let n = e.extrude(1);
+        assert_eq!(e.bones[n].parent, Some(1));
+        assert!(e.rest_points(n).0.distance(t1) < 1e-4);
+        let map = e.delete_bone(1);
+        assert_eq!(map, vec![Some(0), None, Some(1)]);
+        assert_eq!(e.bones[1].parent, Some(0));
+        assert!(e.rest_points(1).0.distance(t1) < 1e-4, "orphans keep their place");
+        // actions
+        let mut a = Armature::chain(2, 2.0);
+        a.bones[1].pose.rot = Quat::from_rotation_x(0.5);
+        a.insert_keys(1);
+        let walk = a.new_action("Walk");
+        assert_eq!((walk, a.actions.len()), (1, 2));
+        assert!(!a.has_keys());
+        a.bones[1].pose.rot = Quat::from_rotation_x(-0.5);
+        a.insert_keys(5);
+        assert_eq!(a.set_action(0), Some((1, 1)));
+        assert!(a.bones[1].pose.rot.angle_between(Quat::from_rotation_x(0.5)) < 1e-4);
+        assert_eq!(a.set_action(a.find_action("walk").unwrap()), Some((5, 5)));
+        assert!(a.bones[1].pose.rot.angle_between(Quat::from_rotation_x(-0.5)) < 1e-4);
+        assert_eq!(weight_color(1.0), [1.0, 0.0, 0.0]);
         assert_eq!(arm.find("Bone.000"), Some(0));
     }
 }

@@ -428,6 +428,10 @@ pub const ACTIONS: &[&str] = &[
     "pose_mode",
     "pose_bone",
     "reset_pose",
+    "weight_paint",
+    "play_action",
+    "set_action",
+    "new_action",
     "subsurf",
     "boolean",
     "unwrap",
@@ -507,7 +511,9 @@ Each command is an object with "action" plus only the fields it needs:
   with automatic weights, e.g. a snake 6, a tail 3, a tree trunk 4). add primitive "armature" (number = bones)
   adds a bone chain; parent a mesh to an armature to bind it. pose_bone: target = armature (or the rigged
   mesh), name = bone ("Bone.001", or "bone 2"), rotation = [x,y,z] degrees in the bone's axes (x bends
-  forward/back). reset_pose. Animate a pose: set_frame, pose_bone…, keyframe (target = armature), repeat.
+  forward/back). reset_pose. weight_paint: target = rigged mesh, name = bone (opens Weight Paint so the user
+  can paint which parts a bone moves). play_action / set_action: target = armature or character, name =
+  action ("walk", "run": imported characters often have several); new_action: name. Animate a pose: set_frame, pose_bone…, keyframe (target = armature), repeat.
 - roughness_map: target, name = "auto" (from its texture) | pattern | image path | "none"; number = base
   roughness. Makes the grooves matte and the tops shinier in renders.
 - MESH EDITING (Blender edit mode, works on the vertices/faces of one mesh object):

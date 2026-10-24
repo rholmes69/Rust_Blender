@@ -211,6 +211,10 @@ pub struct Viewport {
     inset_amount: f32,
     pub sculpt_ui: sculpt::SculptUi,
     pose_ui: pose::PoseUi,
+    weight_ui: weightpaint::WeightUi,
+    bone_ui: boneedit::BoneEditUi,
+    /// (armature in edit mode, active bone, selected part) while building the frame
+    bone_edit_draw: Option<(u64, usize, crate::armature::BonePart)>,
     /// (armature in pose mode, active bone) while building the frame
     pose_draw: Option<(u64, usize)>,
     /// Proportional editing (O) and its radius in world units (mouse wheel during G/R/S).
@@ -225,6 +229,8 @@ pub struct Viewport {
     edit_draw: Option<edit::EditDraw>,
     /// Active loop-cut tool (number of cuts) and hovered edge.
     pub loopcut: Option<usize>,
+    /// Knife tool path (K)
+    pub knife: Option<Vec<knife::KnifeClick>>,
     loopcut_scroll: f32,
     loopcut_edge: Option<(u32, u32)>,
     line_id: u32,
@@ -289,6 +295,9 @@ impl Default for Viewport {
             proportional: false,
             sculpt_ui: Default::default(),
             pose_ui: Default::default(),
+            weight_ui: Default::default(),
+            bone_ui: Default::default(),
+            bone_edit_draw: None,
             pose_draw: None,
             prop_radius: 1.0,
             bevel_width: 0.0,
@@ -297,6 +306,7 @@ impl Default for Viewport {
             edit_obj: None,
             edit_draw: None,
             loopcut: None,
+            knife: None,
             loopcut_scroll: 0.0,
             loopcut_edge: None,
             line_id: 0,
@@ -333,6 +343,9 @@ impl Default for Viewport {
 mod edit;
 mod sculpt;
 mod pose;
+mod weightpaint;
+mod boneedit;
+mod knife;
 
 /// Triangle ids at or above this value encode a face index of the mesh in edit mode.
 pub const FACE_BASE: u32 = 1 << 24;
@@ -795,11 +808,13 @@ impl Viewport {
             );
         }
         self.draw_cursor(&painter);
-        if ed.sculpt.is_none() {
+        if ed.sculpt.is_none() && ed.weight_paint.is_none() {
             self.draw_gizmo(&painter, ed);
         }
         self.draw_sculpt_cursor(&painter, ui, ed);
+        self.draw_weight_cursor(&painter, ui, ed);
         self.draw_loopcut_preview(&painter, ed);
+        self.draw_knife_preview(&painter, ed);
         self.draw_modal_overlay(&painter, ed);
         if let Some((a, b)) = self.box_select {
             let r = Rect::from_two_pos(a, b);
@@ -1112,7 +1127,8 @@ impl Viewport {
         self.raster.textures.clear();
         self.frame_tex.clear();
         self.edit_obj = if self.render_mode { None } else { ed.edit.as_ref().map(|s| s.obj) };
-        self.pose_draw = ed.pose.map(|id| (id, ed.active_bone));
+        self.bone_edit_draw = if self.render_mode { None } else { ed.bone_edit.map(|id| (id, ed.active_bone, ed.bone_part)) };
+        self.pose_draw = ed.pose.or_else(|| Self::weight_armature(ed).map(|w| w.1)).map(|id| (id, ed.active_bone));
         self.edit_draw = None;
         let view = self.cam.view();
         let eye = self.cam.eye();
@@ -1235,7 +1251,15 @@ impl Viewport {
             }
             // edit mode shows the editable cage (no subdivision surface)
             let is_edit = !self.render_mode && ed.edit.as_ref().is_some_and(|s| s.obj == o.id);
-            let mesh = if is_edit { self.mesh_cache.for_object_cage(o) } else { self.mesh_cache.for_object(o) };
+            // weight paint: the posed mesh without subdivision, coloured by the active bone's weights
+            let wp_skin = (!self.render_mode && ed.weight_paint == Some(o.id)).then(|| o.skin.as_ref()).flatten().filter(|_| o.posed.is_some());
+            let mesh = if is_edit {
+                self.mesh_cache.for_object_cage(o)
+            } else if wp_skin.is_some() {
+                self.mesh_cache.for_object_posed_base(o)
+            } else {
+                self.mesh_cache.for_object(o)
+            };
             let smooth = mesh.smooth;
             let base = lin(o.material.color);
             let mat = o.material;
@@ -1473,6 +1497,18 @@ impl Viewport {
                             let n = if facing[fi] { face_n[fi] } else { -face_n[fi] };
                             let k = if facing[fi] { 1.0 } else { 0.6 };
                             [srgb4(shade(ctr, n) * k, alpha); 3]
+                        };
+                        let cols = match wp_skin {
+                            Some(sk) if sk.joints.len() == wp.len() => {
+                                let to_eye = |p: Vec3| if ortho { -fwd } else { (eye - p).normalize() };
+                                t.map(|i| {
+                                    let i = i as usize;
+                                    let c = crate::armature::weight_color(sk.weight(i, ed.active_bone));
+                                    let k = 0.45 + 0.55 * wn[i].dot(to_eye(wp[i])).abs();
+                                    [c[0] * k, c[1] * k, c[2] * k, 1.0]
+                                })
+                            }
+                            _ => cols,
                         };
                         let (tid, cols) = if editing_this.is_some() && inst_i == 0 {
                             let f = mesh.tri_face[fi] as usize;
@@ -2321,16 +2357,20 @@ impl Viewport {
             .inner_margin(egui::Margin::symmetric(4, 2))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let editing = ed.editing();
+                    let editing = ed.editing() || ed.bone_edit.is_some();
                     let sculpting = ed.sculpt.is_some();
                     let posing = ed.pose.is_some();
+                    let painting = ed.weight_paint.is_some();
                     let arm_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.armature.is_some());
+                    let rigged_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.skin.is_some());
                     let label = if editing {
                         "✎ Edit Mode"
                     } else if sculpting {
                         "🖌 Sculpt Mode"
                     } else if posing {
                         "🏃 Pose Mode"
+                    } else if painting {
+                        "⚖ Weight Paint"
                     } else {
                         "▣ Object Mode"
                     };
@@ -2339,7 +2379,7 @@ impl Viewport {
                         .selected_text(egui::RichText::new(label).size(12.5).color(if editing { Color32::from_rgb(255, 170, 90) } else if sculpting { Color32::from_rgb(140, 200, 255) } else { theme::TEXT }))
                         .width(118.0)
                         .show_ui(ui, |ui| {
-                            if ui.selectable_label(!editing && !sculpting && !posing, "▣ Object Mode").clicked() {
+                            if ui.selectable_label(!editing && !sculpting && !posing && !painting, "▣ Object Mode").clicked() {
                                 pick = Some(0);
                             }
                             if ui.selectable_label(editing, "✎ Edit Mode   Tab").clicked() {
@@ -2349,12 +2389,21 @@ impl Viewport {
                                 if ui.selectable_label(posing, "🏃 Pose Mode   Ctrl+Tab").clicked() {
                                     pick = Some(3);
                                 }
-                            } else if ui.selectable_label(sculpting, "🖌 Sculpt Mode   Ctrl+Tab").clicked() {
+                            } else if ui.selectable_label(sculpting, if rigged_active { "🖌 Sculpt Mode" } else { "🖌 Sculpt Mode   Ctrl+Tab" }).clicked() {
                                 pick = Some(2);
+                            }
+                            if rigged_active || painting {
+                                if ui.selectable_label(painting, "⚖ Weight Paint   Ctrl+Tab").clicked() {
+                                    pick = Some(4);
+                                }
                             }
                         });
                     match pick {
                         Some(0) => ed.exit_edit(),
+                        Some(4) if !painting => {
+                            let r = ed.toggle_weight_paint();
+                            self.report(r);
+                        }
                         Some(3) if !posing => {
                             let r = ed.toggle_pose();
                             self.report(r);
@@ -2384,6 +2433,10 @@ impl Viewport {
                     if posing {
                         ui.separator();
                         self.pose_header(ui, ed);
+                    }
+                    if painting {
+                        ui.separator();
+                        self.weight_header(ui, ed);
                     }
                     if let Some(st) = ed.edit.as_mut() {
                         ui.separator();
@@ -2893,9 +2946,12 @@ impl Viewport {
         self.status_hint = String::new();
         if ed.editing() {
             self.status_hint = format!(
-                "Edit Mode · 1/2/3 vertex/edge/face · E extrude · I inset · Ctrl+B bevel · Ctrl+R loop cut · M merge · X delete · G/R/S · O proportional ({}) · Tab exit",
+                "Edit Mode · 1/2/3 vertex/edge/face · E extrude · I inset · Ctrl+B bevel · Ctrl+R loop cut · K knife · M merge · X delete · G/R/S · O proportional ({}) · Tab exit",
                 if self.proportional { "on" } else { "off" }
             );
+        }
+        if self.knife_input(&ctx, resp, ed, mouse) {
+            return;
         }
         if self.loopcut_input(&ctx, resp, ed, mouse) {
             // still allow navigation while choosing the loop
@@ -2938,6 +2994,22 @@ impl Viewport {
             }
             if scroll.x.abs() > 0.0 {
                 self.cam.yaw -= scroll.x * 0.2;
+            }
+        }
+
+        // ---------- armature edit mode ----------
+        if ed.bone_edit.is_some() {
+            self.gizmo_hover = None;
+            if self.bone_edit_input(&ctx, resp, ed, mouse) {
+                return;
+            }
+        }
+
+        // ---------- weight paint ----------
+        if ed.weight_paint.is_some() {
+            self.gizmo_hover = None;
+            if self.weight_input(&ctx, resp, ed, mouse, shift, ctrl) {
+                return;
             }
         }
 

@@ -143,11 +143,94 @@ fn build(tris: &mut [([Vec3; 3], u32)], nodes: &mut Vec<Node>, ni: usize, start:
         nodes[ni] = Node { lo, hi, start: start as u32, count: (end - start) as u32 };
         return;
     }
-    let ext = hi - lo;
-    let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
-    let mid = (start + end) / 2;
-    let key = |t: &([Vec3; 3], u32)| t.0[0][axis] + t.0[1][axis] + t.0[2][axis];
-    tris[start..end].select_nth_unstable_by(mid - start, |a, b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal));
+    // binned SAH split (falls back to a median split)
+    let n = end - start;
+    let cent = |t: &([Vec3; 3], u32)| (t.0[0] + t.0[1] + t.0[2]) / 3.0;
+    let (mut clo, mut chi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for t in &tris[start..end] {
+        let c = cent(t);
+        clo = clo.min(c);
+        chi = chi.max(c);
+    }
+    let cext = chi - clo;
+    let area = |l: Vec3, h: Vec3| {
+        let d = (h - l).max(Vec3::ZERO);
+        d.x * d.y + d.y * d.z + d.z * d.x
+    };
+    const BINS: usize = 12;
+    let mut best: Option<(f32, usize, f32)> = None; // cost, axis, split position
+    for axis in 0..3 {
+        if cext[axis] < 1e-9 {
+            continue;
+        }
+        let mut cnt = [0u32; BINS];
+        let mut blo = [Vec3::splat(f32::MAX); BINS];
+        let mut bhi = [Vec3::splat(f32::MIN); BINS];
+        for t in &tris[start..end] {
+            let b = (((cent(t)[axis] - clo[axis]) / cext[axis]) * BINS as f32).min(BINS as f32 - 1.0) as usize;
+            cnt[b] += 1;
+            for p in &t.0 {
+                blo[b] = blo[b].min(*p);
+                bhi[b] = bhi[b].max(*p);
+            }
+        }
+        // sweep
+        let mut left_area = [0.0f32; BINS];
+        let mut left_cnt = [0u32; BINS];
+        let (mut l, mut h, mut c) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), 0u32);
+        for i in 0..BINS {
+            if cnt[i] > 0 {
+                l = l.min(blo[i]);
+                h = h.max(bhi[i]);
+            }
+            c += cnt[i];
+            left_area[i] = if c > 0 { area(l, h) } else { 0.0 };
+            left_cnt[i] = c;
+        }
+        let (mut l, mut h, mut c) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), 0u32);
+        for i in (1..BINS).rev() {
+            if cnt[i] > 0 {
+                l = l.min(blo[i]);
+                h = h.max(bhi[i]);
+            }
+            c += cnt[i];
+            let lc = left_cnt[i - 1];
+            if lc == 0 || c == 0 {
+                continue;
+            }
+            let cost = left_area[i - 1] * lc as f32 + area(l, h) * c as f32;
+            if best.is_none_or(|b| cost < b.0) {
+                best = Some((cost, axis, clo[axis] + cext[axis] * i as f32 / BINS as f32));
+            }
+        }
+    }
+    let leaf_cost = area(lo, hi) * n as f32;
+    if n <= 8 && best.is_none_or(|b| b.0 >= leaf_cost) {
+        nodes[ni] = Node { lo, hi, start: start as u32, count: n as u32 };
+        return;
+    }
+    let mut mid = match best {
+        Some((_, axis, pos)) => {
+            // partition in place
+            let slice = &mut tris[start..end];
+            let mut i = 0;
+            for j in 0..slice.len() {
+                if cent(&slice[j])[axis] < pos {
+                    slice.swap(i, j);
+                    i += 1;
+                }
+            }
+            start + i
+        }
+        None => start,
+    };
+    if mid == start || mid == end {
+        let ext = hi - lo;
+        let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
+        mid = (start + end) / 2;
+        let key = |t: &([Vec3; 3], u32)| t.0[0][axis] + t.0[1][axis] + t.0[2][axis];
+        tris[start..end].select_nth_unstable_by(mid - start, |a, b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal));
+    }
     let left = nodes.len();
     nodes.push(Node { lo, hi, start: 0, count: 0 });
     nodes.push(Node { lo, hi, start: 0, count: 0 });

@@ -59,6 +59,9 @@ pub struct Editor {
     pub render_request: bool,
     /// Sculpt mode on this mesh object.
     pub sculpt: Option<u64>,
+    /// Armature in Pose Mode and its active bone.
+    pub pose: Option<u64>,
+    pub active_bone: usize,
     /// Last known world matrix per object, used to make children follow their parents.
     parent_cache: std::collections::HashMap<u64, glam::Mat4>,
     /// True while a command batch runs (the batch owns the undo step).
@@ -86,6 +89,8 @@ impl Default for Editor {
             render_request: false,
             parent_cache: Default::default(),
             sculpt: None,
+            pose: None,
+            active_bone: 0,
             in_batch: false,
         }
     }
@@ -103,6 +108,91 @@ impl Editor {
     }
     /// Make children follow parents that moved since the last call. Children that were moved
     /// themselves in the same step (e.g. grabbed together with the parent) are left alone.
+    /// Bind a mesh to an armature with automatic weights (the mesh's current shape is the bind
+    /// pose; the armature's rest position is used).
+    pub fn bind_to_armature(&mut self, mesh_id: u64, arm_id: u64) -> Result<(), String> {
+        let a = self.scene.get(arm_id).ok_or("no armature")?;
+        let arm = a.armature.clone().ok_or("not an armature")?;
+        let aw = a.transform.matrix();
+        let o = self.scene.get(mesh_id).ok_or("no mesh")?;
+        if !o.is_mesh() {
+            return Err("only meshes can be bound".into());
+        }
+        let pm = o.poly();
+        let om = o.transform.matrix();
+        let (j, w) = crate::armature::auto_weights(&pm, om, &arm, aw);
+        let skin = crate::armature::Skin::bind(arm_id, &pm, om, &arm, aw, j, w);
+        let o = self.scene.get_mut(mesh_id).unwrap();
+        o.mesh = Some(pm);
+        o.skin = Some(skin);
+        o.posed = None;
+        o.parent = Some(arm_id);
+        Ok(())
+    }
+
+    /// Add an armature fitted to a mesh (a chain along its longest axis) and bind the mesh.
+    pub fn rig(&mut self, mesh_id: u64, bones: usize) -> Result<u64, String> {
+        let o = self.scene.get(mesh_id).ok_or("no mesh")?;
+        let m = o.transform.matrix();
+        let pm = o.poly();
+        let (lo, hi) = pm.verts.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| {
+            let w = m.transform_point3(*v);
+            (l.min(w), h.max(w))
+        });
+        if lo.x > hi.x {
+            return Err("the mesh is empty".into());
+        }
+        let size = hi - lo;
+        let c = (lo + hi) * 0.5;
+        let name = format!("{} Rig", o.name);
+        let coll = o.collection;
+        // upright shapes get a spine from the bottom up; long ones a chain along x or y
+        let (start, rot, len) = if size.z >= size.x * 0.8 && size.z >= size.y * 0.8 {
+            (Vec3::new(c.x, c.y, lo.z), Vec3::ZERO, size.z)
+        } else if size.x >= size.y {
+            (Vec3::new(lo.x, c.y, c.z), Vec3::new(0.0, 90.0, 0.0), size.x)
+        } else {
+            (Vec3::new(c.x, lo.y, c.z), Vec3::new(-90.0, 0.0, 0.0), size.y)
+        };
+        // coarse meshes can't bend smoothly: add rings first (keeps the shape)
+        if pm.verts.len() < 600 {
+            let mut dense = pm.clone();
+            crate::sculpt::densify(&mut dense, 600, false);
+            self.scene.get_mut(mesh_id).unwrap().mesh = Some(dense);
+        }
+        let arm_id = self.scene.add_armature(crate::armature::Armature::chain(bones, len.max(1e-3)), Some(&name));
+        let a = self.scene.get_mut(arm_id).unwrap();
+        a.transform.location = start;
+        a.transform.rotation = rot;
+        a.collection = coll;
+        self.bind_to_armature(mesh_id, arm_id)?;
+        self.reset_parent_cache();
+        Ok(arm_id)
+    }
+
+    /// A texture by spec: an image path, an existing texture's name or a procedural pattern
+    /// ("none" etc. → 0).
+    pub fn resolve_texture(&mut self, spec: &str) -> Result<(u32, String), String> {
+        let spec_t = spec.trim();
+        let low = spec_t.to_lowercase();
+        Ok(if low.is_empty() || matches!(low.as_str(), "none" | "remove" | "off" | "clear") {
+            (0, "no texture".to_string())
+        } else if std::path::Path::new(spec_t).is_file() {
+            let data = std::fs::read(spec_t).map_err(|e| format!("can't read {spec_t}: {e}"))?;
+            crate::textures::decode(&crate::textures::TexSource::Image { data: data.clone() })?;
+            let name = std::path::Path::new(spec_t).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("Image".into());
+            (self.scene.add_texture(&name, crate::textures::TexSource::Image { data }), format!("image {name}"))
+        } else if let Some(t) = self.scene.textures.iter().find(|t| t.name.eq_ignore_ascii_case(spec_t)) {
+            (t.id, t.name.clone())
+        } else if let Some(p) = crate::textures::match_pattern(spec_t) {
+            let (a, b) = crate::textures::procedural_defaults(p).unwrap();
+            (self.scene.add_texture(p, crate::textures::TexSource::Procedural { pattern: p.into(), color_a: a, color_b: b }), format!("{p} texture"))
+        } else {
+            let list: Vec<&str> = crate::textures::PROCEDURAL.iter().map(|p| p.0).collect();
+            return Err(format!("unknown texture '{spec_t}' (use an image path or one of: {})", list.join(", ")));
+        })
+    }
+
     pub fn propagate_parents(&mut self) {
         let order = self.scene.hierarchy_order();
         let mut changed: std::collections::HashMap<u64, (glam::Mat4, glam::Mat4)> = Default::default();
@@ -117,7 +207,8 @@ impl Editor {
             let mut cur = o.transform.matrix();
             let old = self.parent_cache.get(&id).copied();
             if let (Some(p), Some(old_m)) = (o.parent, old) {
-                if old_m == cur {
+                // keyed children are placed by their own keys (world space)
+                if old_m == cur && o.keyframes.is_empty() {
                     if let Some((po, pn)) = changed.get(&p) {
                         let new = *pn * po.inverse() * cur;
                         let o = self.scene.get_mut(id).unwrap();
@@ -131,6 +222,84 @@ impl Editor {
             }
         }
         self.reset_parent_cache();
+    }
+
+    /// Destructive mesh boolean: `main` becomes main ∘ cutters; cutters are hidden in a
+    /// "Cutters" collection (so they can be reused).
+    pub fn boolean(&mut self, main: u64, cutters: &[u64], op: crate::csg::BoolOp) -> Result<String, String> {
+        use crate::csg::Polygon;
+        use glam::DVec3;
+        let mut cache = crate::scene::MeshCache::default();
+        let to_polys = |o: &crate::scene::Object, cache: &mut crate::scene::MeshCache, with_instances: bool| -> Vec<Polygon> {
+            let mesh = cache.for_object(o);
+            let mats = if with_instances { o.instance_matrices() } else { vec![glam::Mat4::IDENTITY] };
+            let mut out = vec![];
+            for inst in mats {
+                let m = (o.transform.matrix() * inst).as_dmat4();
+                let flip = m.determinant() < 0.0;
+                for t in &mesh.tris {
+                    let mut v: Vec<DVec3> = t.iter().map(|&i| m.transform_point3(mesh.positions[i as usize].as_dvec3())).collect();
+                    if flip {
+                        v.swap(1, 2);
+                    }
+                    if let Some(p) = Polygon::new(v) {
+                        out.push(p);
+                    }
+                }
+            }
+            out
+        };
+        let mo = self.scene.get(main).ok_or("main object is gone")?;
+        if !mo.is_mesh() {
+            return Err("booleans work on mesh objects".into());
+        }
+        let mut acc = to_polys(mo, &mut cache, false);
+        let mut names = vec![];
+        for &cid in cutters {
+            let Some(co) = self.scene.get(cid) else { continue };
+            if !co.is_mesh() || cid == main {
+                continue;
+            }
+            names.push(co.name.clone());
+            let cp = to_polys(co, &mut cache, true);
+            acc = crate::csg::boolean(acc, cp, op);
+        }
+        if names.is_empty() {
+            return Err("no mesh cutter selected".into());
+        }
+        if acc.is_empty() {
+            return Err(format!("the {} left nothing (do the objects overlap?)", op.label().to_lowercase()));
+        }
+        let inv = self.scene.get(main).unwrap().transform.matrix().as_dmat4().inverse();
+        for p in &mut acc {
+            for v in &mut p.verts {
+                *v = inv.transform_point3(*v);
+            }
+        }
+        let size = acc.iter().flat_map(|p| p.verts.iter()).fold(0.0f64, |m, v| m.max(v.abs().max_element()));
+        let pm = crate::csg::to_polymesh(&acc, (size * 1e-6).max(1e-9));
+        let nfaces = pm.faces.len();
+        let cut_col = self.scene.collection_by_name("Cutters");
+        let o = self.scene.get_mut(main).unwrap();
+        o.mesh = Some(pm);
+        o.modifiers.retain(|m| !matches!(m, Modifier::Subsurf { .. }));
+        if o.smooth() && o.auto_smooth == 0.0 {
+            o.auto_smooth = 30.0; // keep the new cut edges sharp
+        }
+        let main_name = o.name.clone();
+        for &cid in cutters {
+            if let Some(co) = self.scene.get_mut(cid) {
+                if co.is_mesh() && cid != main {
+                    co.visible = false;
+                    co.collection = cut_col;
+                }
+            }
+        }
+        if let Some(c) = self.scene.collections.iter_mut().find(|c| c.id == cut_col) {
+            c.visible = false;
+        }
+        self.select_only(main);
+        Ok(format!("Boolean {} on \"{main_name}\" with {} ({nfaces} faces; cutter hidden in \"Cutters\")", op.label(), names.join(", ")))
     }
 
     /// Forget previous positions (after undo, opening a file …) so nothing jumps.
@@ -166,6 +335,11 @@ impl Editor {
     }
     /// Leave edit mode if the edited object no longer exists (deleted, undone, …).
     pub fn validate_edit(&mut self) {
+        if let Some(id) = self.pose {
+            if !self.scene.get(id).is_some_and(|o| o.armature.is_some()) {
+                self.pose = None;
+            }
+        }
         if let Some(id) = self.sculpt {
             if !self.scene.get(id).is_some_and(|o| o.is_mesh() && o.mesh.is_some()) {
                 self.sculpt = None;
@@ -264,6 +438,8 @@ impl Editor {
     pub fn set_frame(&mut self, f: i32) {
         self.frame = f;
         self.scene.evaluate(f);
+        self.propagate_parents();
+        self.scene.update_skins();
     }
 
     pub fn insert_keyframes(&mut self) -> usize {
@@ -413,6 +589,7 @@ impl Editor {
         let log = self.execute_batch(cmds);
         self.in_batch = false;
         self.validate_edit();
+        self.scene.update_skins();
         log
     }
 
@@ -453,7 +630,12 @@ impl Editor {
                     None => self.scene.add(p, c.name.as_deref()),
                     Some(Special::Light(t)) => self.scene.add_light(t, c.name.as_deref()),
                     Some(Special::Camera) => self.scene.add_camera(c.name.as_deref()),
+                    Some(Special::Armature) => {
+                        let n = c.number.map(|n| n as usize).unwrap_or(1);
+                        self.scene.add_armature(crate::armature::Armature::chain(n, 2.0), c.name.as_deref())
+                    }
                 };
+                let is_arm = matches!(special, Some(Special::Armature));
                 let o = self.scene.get_mut(id).unwrap();
                 if let Some(v) = vec3(&c.location) {
                     o.transform.location = v;
@@ -467,7 +649,7 @@ impl Editor {
                 if let Some(col) = c.color.as_ref().and_then(parse_color) {
                     o.material.color = col;
                 }
-                if let Some(d) = c.number {
+                if let Some(d) = c.number.filter(|_| !is_arm) {
                     if (1.0..=6.0).contains(&d) && c.modifier.is_none() {
                         o.detail = d as u32;
                     }
@@ -672,6 +854,44 @@ impl Editor {
                 self.view_requests.push(ViewRequest::FrameSelected);
                 Ok(format!("Imported {}", st.summary()))
             }
+            "unwrap" | "uv_unwrap" | "uv_project" => {
+                let method = crate::uv::Unwrap::parse(c.name.as_deref().unwrap_or("smart"));
+                let (ids, faces): (Vec<u64>, Option<Vec<usize>>) = match &self.edit {
+                    Some(st) => {
+                        let o = self.scene.get(st.obj).ok_or("edited object is gone")?;
+                        let pm = o.mesh.clone().unwrap_or_else(|| o.poly());
+                        let f = em::selected_faces(&pm, &st.sel);
+                        (vec![st.obj], Some(f))
+                    }
+                    None => (targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect(), None),
+                };
+                if ids.is_empty() {
+                    return Err("no mesh object to unwrap".into());
+                }
+                for id in &ids {
+                    let o = self.scene.get_mut(*id).unwrap();
+                    let mut pm = o.mesh.clone().unwrap_or_else(|| o.poly());
+                    crate::uv::unwrap(&mut pm, faces.as_deref().unwrap_or(&[]), method);
+                    o.mesh = Some(pm);
+                }
+                Ok(format!("{} on {}", method.label(), self.names(&ids)))
+            }
+            "boolean" | "bool" | "cut" => {
+                let op = c.name.as_deref().or(c.modifier.as_deref()).and_then(crate::csg::BoolOp::parse).unwrap_or(crate::csg::BoolOp::Difference);
+                // main object: target, else the active; cutters: `object`, else the other selected
+                let main = match c.target.as_deref() {
+                    Some(t) => self.scene.find_by_name(t).ok_or(format!("no object named {t:?}"))?,
+                    None => self.active.ok_or("select the object to cut (active) and the cutter")?,
+                };
+                let cutters: Vec<u64> = match c.object.as_deref() {
+                    Some(n) => vec![self.scene.find_by_name(n).ok_or(format!("no object named {n:?}"))?],
+                    None => self.selection.iter().copied().filter(|i| *i != main).collect(),
+                };
+                if cutters.is_empty() {
+                    return Err("boolean needs a second object (object = the cutter)".into());
+                }
+                self.boolean(main, &cutters, op)
+            }
             "parent" | "set_parent" => {
                 let pname = c.parent.clone().or(c.name.clone()).ok_or("parent needs parent = the parent object's name")?;
                 let p = self.scene.find_by_name(&pname).ok_or(format!("no object named {pname:?}"))?;
@@ -687,7 +907,23 @@ impl Editor {
                 if done.is_empty() {
                     return Err("nothing to parent (an object can't be its own ancestor)".into());
                 }
-                Ok(format!("Parented {} to \"{}\"", self.names(&done), self.scene.get(p).unwrap().name))
+                // parenting meshes to an armature binds them with automatic weights (Blender's
+                // Ctrl+P ▸ With Automatic Weights)
+                let mut bound = vec![];
+                if self.scene.get(p).is_some_and(|o| o.armature.is_some()) {
+                    for id in &done {
+                        if self.bind_to_armature(*id, p).is_ok() {
+                            bound.push(*id);
+                        }
+                    }
+                }
+                self.reset_parent_cache();
+                Ok(format!(
+                    "Parented {} to \"{}\"{}",
+                    self.names(&done),
+                    self.scene.get(p).unwrap().name,
+                    if bound.is_empty() { String::new() } else { " with automatic weights".into() }
+                ))
             }
             "clear_parent" | "unparent" => {
                 let ids = targets();
@@ -749,30 +985,174 @@ impl Editor {
                 }
                 Ok(format!("{} collection \"{cname}\"", if show { "Showed" } else { "Hid" }))
             }
+            "rig" | "auto_rig" | "add_rig" | "add_armature" => {
+                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                let &mesh_id = ids.first().ok_or("select the mesh to rig")?;
+                let n = c.number.map(|n| n as usize).unwrap_or(4).clamp(1, 32);
+                let arm_id = self.rig(mesh_id, n)?;
+                let an = self.scene.get(arm_id).unwrap().name.clone();
+                self.select_only(arm_id);
+                Ok(format!("Rigged \"{}\" with {an} ({n} bones, automatic weights) — Ctrl+Tab for Pose Mode", self.scene.get(mesh_id).unwrap().name))
+            }
+            "pose_mode" | "pose" => {
+                if let Some(t) = c.target.as_deref().and_then(|t| self.scene.find_by_name(t)) {
+                    self.active = Some(t);
+                    self.pose = None;
+                }
+                if self.pose.is_some() {
+                    return Ok("Already in pose mode".into());
+                }
+                self.toggle_pose()
+            }
+            "pose_bone" | "rotate_bone" | "bend" | "bend_bone" => {
+                let aid = self
+                    .pose
+                    .or_else(|| c.target.as_deref().and_then(|t| self.scene.find_by_name(t)).filter(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some())))
+                    .or_else(|| self.active.filter(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some())))
+                    .or_else(|| {
+                        // a rigged mesh's armature
+                        let t = c.target.as_deref().and_then(|t| self.scene.find_by_name(t)).or(self.active)?;
+                        self.scene.get(t)?.skin.as_ref().map(|s| s.armature)
+                    })
+                    .or_else(|| self.scene.objects.iter().find(|o| o.armature.is_some()).map(|o| o.id))
+                    .ok_or("no armature in the scene")?;
+                let o = self.scene.get(aid).unwrap();
+                let arm = o.armature.as_ref().unwrap();
+                let bi = match c.name.as_deref() {
+                    Some(n) => arm.find(n).ok_or(format!("no bone {n:?} (bones: {})", arm.bones.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(", ")))?,
+                    None => self.active_bone.min(arm.bones.len().saturating_sub(1)),
+                };
+                let rot = vec3(&c.rotation).or_else(|| vec3(&c.vector)).or_else(|| c.number.map(|n| Vec3::new(n as f32, 0.0, 0.0)));
+                let loc = vec3(&c.location);
+                if rot.is_none() && loc.is_none() {
+                    return Err("pose_bone needs rotation = [x,y,z] degrees (or location)".into());
+                }
+                let a = self.scene.get_mut(aid).unwrap().armature.as_mut().unwrap();
+                let b = &mut a.bones[bi];
+                if let Some(r) = rot {
+                    b.pose.set_euler_deg(r);
+                }
+                if let Some(l) = loc {
+                    b.pose.loc = l;
+                }
+                let bn = b.name.clone();
+                self.active_bone = bi;
+                Ok(format!("Posed bone \"{bn}\""))
+            }
+            "reset_pose" | "rest_pose" | "clear_pose" => {
+                let mut n = 0;
+                for o in self.scene.objects.iter_mut() {
+                    if let Some(a) = o.armature.as_mut() {
+                        a.reset_pose();
+                        n += 1;
+                    }
+                }
+                if n == 0 {
+                    return Err("no armature in the scene".into());
+                }
+                Ok("Reset the pose".into())
+            }
+            "bump" | "normal_map" | "set_normal_map" | "bumpy" => {
+                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                if ids.is_empty() {
+                    return Err("no mesh object for a normal map".into());
+                }
+                let spec = c.name.clone().or(c.primitive.clone()).unwrap_or_default();
+                let low = spec.trim().to_lowercase();
+                let strength = c.number.map(|n| (n as f32).clamp(0.0, 10.0));
+                if matches!(low.as_str(), "none" | "remove" | "off" | "clear" | "flat") {
+                    for id in &ids {
+                        if let Some(o) = self.scene.get_mut(*id) {
+                            o.material.normal_tex = 0;
+                        }
+                    }
+                    return Ok(format!("Removed the normal map from {}", self.names(&ids)));
+                }
+                let mut made = vec![];
+                for id in &ids {
+                    let base = self.scene.get(*id).map(|o| o.material.texture).unwrap_or(0);
+                    // the source: given texture / image / pattern, else the object's colour texture
+                    let auto = low.replace("invert", "").replace("ed", "");
+                    let src_id = if matches!(auto.trim(), "" | "auto" | "texture") {
+                        if base == 0 {
+                            return Err("give a pattern or image for the bumps (the object has no texture)".into());
+                        }
+                        base
+                    } else {
+                        self.resolve_texture(&spec)?.0
+                    };
+                    let t = self.scene.texture(src_id).cloned().ok_or("texture not found")?;
+                    let nid = if crate::textures::decode(&t.source).map(|i| crate::textures::looks_like_normal_map(&i)).unwrap_or(false) {
+                        t.id
+                    } else {
+                        let invert = low.contains("invert");
+                        let png = crate::textures::normal_map_png(&t.source, 8.0, invert)?;
+                        self.scene.add_texture(&format!("{} normal", t.name), crate::textures::TexSource::Image { data: png })
+                    };
+                    if let Some(o) = self.scene.get_mut(*id) {
+                        o.material.normal_tex = nid;
+                        if let Some(s) = strength {
+                            o.material.normal_strength = s;
+                        }
+                    }
+                    made.push(self.scene.texture(nid).map(|t| t.name.clone()).unwrap_or_default());
+                }
+                if self.shading == Shading::Solid {
+                    self.shading = Shading::Material;
+                }
+                made.dedup();
+                Ok(format!("Normal map {} on {}", made.join(", "), self.names(&ids)))
+            }
+            "roughness_map" | "set_roughness_map" => {
+                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                if ids.is_empty() {
+                    return Err("no mesh object for a roughness map".into());
+                }
+                let spec = c.name.clone().or(c.primitive.clone()).unwrap_or_default();
+                let low = spec.trim().to_lowercase();
+                let rid = if matches!(low.as_str(), "none" | "remove" | "off" | "clear") {
+                    0
+                } else {
+                    let src = if low.is_empty() || low == "auto" || low == "texture" {
+                        let b = self.scene.get(ids[0]).map(|o| o.material.texture).unwrap_or(0);
+                        if b == 0 {
+                            return Err("give a pattern or image for the roughness map".into());
+                        }
+                        b
+                    } else {
+                        self.resolve_texture(&spec)?.0
+                    };
+                    let t = self.scene.texture(src).cloned().ok_or("texture not found")?;
+                    match &t.source {
+                        // a pattern: rough in the grooves (mortar, grout), shinier on top
+                        crate::textures::TexSource::Procedural { .. } => {
+                            let png = crate::textures::roughness_map_png(&t.source)?;
+                            self.scene.add_texture(&format!("{} roughness", t.name), crate::textures::TexSource::Image { data: png })
+                        }
+                        _ => t.id,
+                    }
+                };
+                for id in &ids {
+                    if let Some(o) = self.scene.get_mut(*id) {
+                        o.material.rough_tex = rid;
+                        if rid != 0 {
+                            if let Some(r) = c.number {
+                                o.material.roughness = (r as f32).clamp(0.0, 1.0);
+                            } else if o.material.roughness < 0.6 {
+                                o.material.roughness = 0.8;
+                            }
+                        }
+                    }
+                }
+                Ok(if rid == 0 { format!("Removed the roughness map from {}", self.names(&ids)) } else { format!("Roughness map on {}", self.names(&ids)) })
+            }
             "set_texture" | "texture" => {
                 let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
                 if ids.is_empty() {
                     return Err("no mesh object to texture".into());
                 }
                 let spec = c.name.clone().or(c.primitive.clone()).unwrap_or_default();
-                let spec_t = spec.trim();
-                let low = spec_t.to_lowercase();
-                let (tex_id, label) = if low.is_empty() || matches!(low.as_str(), "none" | "remove" | "off" | "clear") {
-                    (0, "no texture".to_string())
-                } else if std::path::Path::new(spec_t).is_file() {
-                    let data = std::fs::read(spec_t).map_err(|e| format!("can't read {spec_t}: {e}"))?;
-                    crate::textures::decode(&crate::textures::TexSource::Image { data: data.clone() })?;
-                    let name = std::path::Path::new(spec_t).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("Image".into());
-                    (self.scene.add_texture(&name, crate::textures::TexSource::Image { data }), format!("image {name}"))
-                } else if let Some(t) = self.scene.textures.iter().find(|t| t.name.eq_ignore_ascii_case(spec_t)) {
-                    (t.id, t.name.clone())
-                } else if let Some(p) = crate::textures::match_pattern(spec_t) {
-                    let (a, b) = crate::textures::procedural_defaults(p).unwrap();
-                    (self.scene.add_texture(p, crate::textures::TexSource::Procedural { pattern: p.into(), color_a: a, color_b: b }), format!("{p} texture"))
-                } else {
-                    let list: Vec<&str> = crate::textures::PROCEDURAL.iter().map(|p| p.0).collect();
-                    return Err(format!("unknown texture '{spec_t}' (use an image path or one of: {})", list.join(", ")));
-                };
+                let (tex_id, label) = self.resolve_texture(&spec)?;
                 let tint = c.color.as_ref().and_then(parse_color);
                 for id in &ids {
                     if let Some(o) = self.scene.get_mut(*id) {
@@ -1161,6 +1541,7 @@ impl Editor {
             .unwrap_or(0);
         self.select_only(id);
         self.sculpt = None;
+        self.pose = None;
         self.edit = Some(EditState {
             obj: id,
             mode: SelectMode::Vertex,
@@ -1172,6 +1553,26 @@ impl Editor {
     pub fn exit_edit(&mut self) {
         self.edit = None;
         self.sculpt = None;
+        self.pose = None;
+    }
+
+    /// Enter / leave Pose Mode on the active armature.
+    pub fn toggle_pose(&mut self) -> Result<String, String> {
+        if self.pose.take().is_some() {
+            return Ok("Object mode".into());
+        }
+        let id = self
+            .active
+            .filter(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some()))
+            .or_else(|| self.selection.iter().copied().find(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some())))
+            .or_else(|| self.scene.objects.iter().find(|o| o.armature.is_some()).map(|o| o.id))
+            .ok_or("no armature in the scene (add one with Add ▸ Armature, or ask to rig a mesh)")?;
+        self.edit = None;
+        self.sculpt = None;
+        self.select_only(id);
+        self.pose = Some(id);
+        self.active_bone = 0;
+        Ok(format!("Pose mode: \"{}\"", self.scene.get(id).unwrap().name))
     }
 
     /// Enter sculpt mode on a mesh object (converting it to an editable mesh and adding detail
@@ -1195,6 +1596,9 @@ impl Editor {
     }
 
     pub fn toggle_edit(&mut self) -> Result<String, String> {
+        if self.pose.take().is_some() {
+            return Ok("Object mode".into());
+        }
         if self.sculpt.is_some() {
             self.sculpt = None;
             return Ok("Object mode".into());
@@ -1464,6 +1868,7 @@ impl Editor {
 enum Special {
     Light(crate::scene::LightType),
     Camera,
+    Armature,
 }
 
 fn parse_special(s: &str) -> Option<Special> {
@@ -1476,6 +1881,7 @@ fn parse_special(s: &str) -> Option<Special> {
         }
         "spot" | "spotlight" | "spotlamp" => Special::Light(LightType::Spot),
         "camera" | "cam" => Special::Camera,
+        "armature" | "bone" | "bones" | "skeleton" | "rig" => Special::Armature,
         _ => return None,
     })
 }
@@ -1618,6 +2024,9 @@ pub struct Command {
     pub alpha: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modifier: Option<String>,
+    /// The other object of a two-object operation (boolean cutter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
     /// Parent object name (for add / parent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -1943,5 +2352,73 @@ mod tests {
         // deleting the parent leaves no dangling link
         e.execute(&[cmd(r#"{"action":"parent","target":"Wheel","parent":"Car"}"#), cmd(r#"{"action":"delete","target":"Car"}"#)]);
         assert_eq!(e.scene.get(wheel).unwrap().parent, None);
+    }
+    #[test]
+    fn bump_and_roughness_maps() {
+        let mut ed = Editor::default();
+        ed.execute(&[Command { action: "add".into(), primitive: Some("cube".into()), ..Default::default() }]);
+        let name = ed.scene.objects.last().unwrap().name.clone();
+        let t = || Some(name.clone());
+        let log = ed.execute(&[Command { action: "bump".into(), target: t(), name: Some("auto".into()), ..Default::default() }]);
+        assert!(log[0].starts_with('✖'), "no texture yet: {log:?}");
+        ed.execute(&[Command { action: "set_texture".into(), target: t(), name: Some("bricks".into()), ..Default::default() }]);
+        let log = ed.execute(&[
+            Command { action: "bump".into(), target: t(), name: Some("auto".into()), number: Some(2.0), ..Default::default() },
+            Command { action: "roughness_map".into(), target: t(), name: Some("auto".into()), ..Default::default() },
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let m = ed.scene.objects.last().unwrap().material;
+        assert!(m.normal_tex != 0 && m.rough_tex != 0 && m.normal_strength == 2.0 && m.roughness >= 0.6);
+        assert_eq!(ed.scene.texture(m.normal_tex).unwrap().name, "bricks normal");
+        // using an existing normal map as-is (no re-generation)
+        let n0 = ed.scene.textures.len();
+        ed.execute(&[Command { action: "bump".into(), target: t(), name: Some("bricks normal".into()), ..Default::default() }]);
+        assert_eq!(ed.scene.textures.len(), n0);
+        assert_eq!(ed.scene.objects.last().unwrap().material.normal_tex, m.normal_tex);
+        // glTF round trip keeps both maps
+        let (glb, _) = crate::gltf::export_glb(&ed.scene, &mut crate::scene::MeshCache::default());
+        let mut sc = crate::scene::Scene::default();
+        crate::gltf_import::import_bytes(&mut sc, &glb, None).unwrap();
+        let o = sc.objects.iter().find(|o| o.name == name).unwrap();
+        assert!(o.material.normal_tex != 0 && o.material.rough_tex != 0 && (o.material.normal_strength - 2.0).abs() < 1e-5, "{:?}", o.material);
+        ed.execute(&[Command { action: "bump".into(), target: t(), name: Some("none".into()), ..Default::default() }]);
+        assert_eq!(ed.scene.objects.last().unwrap().material.normal_tex, 0);
+    }
+    #[test]
+    fn rig_pose_keyframes() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"add","primitive":"cylinder","name":"Tube","location":[0,0,1.5],"scale":[0.4,0.4,1.5]}"#),
+            cmd(r#"{"action":"rig","target":"Tube","number":3}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let tube = ed.scene.find_by_name("Tube").unwrap();
+        let rig = ed.scene.find_by_name("Tube Rig").unwrap();
+        assert_eq!(ed.scene.get(tube).unwrap().parent, Some(rig));
+        let top = |ed: &Editor| {
+            let o = ed.scene.get(tube).unwrap();
+            let m = o.transform.matrix();
+            o.posed.as_ref().unwrap().verts.iter().map(|v| m.transform_point3(*v)).fold(Vec3::splat(-9.0), |a, b| a.max(b))
+        };
+        let rest = top(&ed);
+        assert!((rest.z - 3.0).abs() < 1e-3, "{rest}");
+        // bend, keyframe, animate
+        ed.set_frame(1);
+        ed.execute(&[cmd(r#"{"action":"keyframe","target":"Tube Rig"}"#)]);
+        ed.set_frame(20);
+        let log = ed.execute(&[cmd(r#"{"action":"pose_bone","target":"Tube","name":"bone 2","rotation":[60,0,0]}"#), cmd(r#"{"action":"keyframe","target":"Tube Rig"}"#)]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let bent = top(&ed);
+        assert!(bent.z < 2.9 && bent.y > 0.3, "the top bends towards +y: {bent}");
+        ed.set_frame(1);
+        assert!((top(&ed).z - 3.0).abs() < 1e-3, "frame 1 is straight again");
+        // moving the armature carries the mesh
+        ed.execute(&[cmd(r#"{"action":"move","target":"Tube Rig","vector":[2,0,0]}"#)]);
+        assert!((top(&ed).x - (rest.x + 2.0)).abs() < 1e-3);
+        // undo / save round trip keeps the rig
+        let json = serde_json::to_string(&ed.scene).unwrap();
+        let back: crate::scene::Scene = serde_json::from_str(&json).unwrap();
+        assert!(back.get(tube).unwrap().skin.is_some() && back.get(rig).unwrap().armature.as_ref().unwrap().bones[1].keys.len() == 2);
+        assert!(ed.toggle_pose().is_ok() && ed.pose == Some(rig));
     }
 }

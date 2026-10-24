@@ -377,6 +377,7 @@ pub fn command_schema() -> Value {
                         "view": {"type": "string"},
                         "power": {"type": "number"},
                         "parent": {"type": "string"},
+                        "object": {"type": "string"},
                         "collection": {"type": "string"},
                         "segments": {"type": "number"},
                         "look_at": {"type": "string"}
@@ -421,7 +422,15 @@ pub const ACTIONS: &[&str] = &[
     "camera_view",
     "render",
     "set_texture",
+    "bump",
+    "roughness_map",
+    "rig",
+    "pose_mode",
+    "pose_bone",
+    "reset_pose",
     "subsurf",
+    "boolean",
+    "unwrap",
     "parent",
     "clear_parent",
     "move_to_collection",
@@ -482,10 +491,25 @@ Each command is an object with "action" plus only the fields it needs:
   collection = a group name (created if needed). parent: target, parent (name). clear_parent: target.
   move_to_collection: target, collection. hide_collection / show_collection: collection. For multi-part
   things (a car, a robot, a lamp) add the main body first and give the other parts parent = the body.
+- boolean: target = object to change, object = the cutter, name = difference|union|intersect (difference cuts
+  the cutter's shape out: doors, windows, holes). Add the cutter first (e.g. a cube overlapping the wall), then
+  boolean; the cutter is hidden afterwards.
 - subsurf: target, number = levels 1-3 (Catmull-Clark smooth subdivision; 0 removes). Use it for organic or
   rounded shapes (a cube with subsurf 2 becomes a rounded blob). auto_smooth: target, number = angle (30).
+- unwrap: target, name = smart|cube|sphere|cylinder (UV unwrap so textures don't stretch; use after
+  modelling, before set_texture).
 - set_texture: target, name = checker|bricks|wood|marble|tiles|grid|noise|stripes|concrete|grass (or an
   image file path), number = repeats (e.g. 6 for a big floor), optional color = tint; name "none" removes it.
+- bump: target, name = "auto" (bumps from the object's texture), a pattern / image / normal-map path, or
+  "none"; number = strength (1 normal, 2-3 deep). Add "invert" to the name when light parts should be low.
+  Use for "make the bricks bumpy", "rough stone surface", "add a normal map".
+- ARMATURES: rig: target = mesh, number = bones (2-8; adds an armature fitted along the mesh and binds it
+  with automatic weights, e.g. a snake 6, a tail 3, a tree trunk 4). add primitive "armature" (number = bones)
+  adds a bone chain; parent a mesh to an armature to bind it. pose_bone: target = armature (or the rigged
+  mesh), name = bone ("Bone.001", or "bone 2"), rotation = [x,y,z] degrees in the bone's axes (x bends
+  forward/back). reset_pose. Animate a pose: set_frame, pose_bone…, keyframe (target = armature), repeat.
+- roughness_map: target, name = "auto" (from its texture) | pattern | image path | "none"; number = base
+  roughness. Makes the grooves matte and the tops shinier in renders.
 - MESH EDITING (Blender edit mode, works on the vertices/faces of one mesh object):
   edit_mode (target) -> select_faces (vector = face direction, e.g. [0,0,1] = top faces; name "extend" to add)
   -> extrude (number = distance along the face normal) / inset (number 0-1) / bevel (number = width,
@@ -941,6 +965,17 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         "shade auto smooth" | "auto smooth" => {
             return Some(vec![Command { action: "auto_smooth".into(), number: Some(30.0), ..Default::default() }]);
         }
+        "pose mode" | "enter pose mode" => return single("pose_mode"),
+        "reset pose" | "reset the pose" | "rest pose" | "clear pose" => return single("reset_pose"),
+        "rig it" | "rig this" | "add a rig" | "add an armature" | "add armature" | "auto rig" => {
+            return Some(vec![Command { action: "rig".into(), number: Some(4.0), ..Default::default() }]);
+        }
+        "make it bumpy" | "add bumps" | "bumpy" | "add a normal map" | "add normal map" | "add bump" | "add bump map" | "make the texture bumpy" => {
+            return Some(vec![Command { action: "bump".into(), name: Some("auto".into()), number: Some(1.0), ..Default::default() }]);
+        }
+        "make it smooth again" | "remove the bumps" | "remove bumps" | "remove the normal map" | "no bumps" => {
+            return Some(vec![Command { action: "bump".into(), name: Some("none".into()), ..Default::default() }]);
+        }
         "remove the texture" | "remove texture" | "no texture" => {
             return Some(vec![Command { action: "set_texture".into(), name: Some("none".into()), ..Default::default() }]);
         }
@@ -1341,6 +1376,8 @@ mod tests {
         assert_eq!(parse_simple("render the scene").unwrap()[0].action, "render");
         assert_eq!(parse_simple("make it wood").unwrap()[0].name.as_deref(), Some("wood"));
         assert_eq!(parse_simple("add a brick texture").unwrap()[0].action, "set_texture");
+        assert_eq!(parse_simple("make it bumpy").unwrap()[0].action, "bump");
+        assert_eq!(parse_simple("rig it").unwrap()[0].action, "rig");
         assert_eq!(parse_simple("add a cube").unwrap()[0].action, "add");
     }
     #[test]

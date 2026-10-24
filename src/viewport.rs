@@ -210,6 +210,9 @@ pub struct Viewport {
     pub flash: Option<(String, Instant)>,
     inset_amount: f32,
     pub sculpt_ui: sculpt::SculptUi,
+    pose_ui: pose::PoseUi,
+    /// (armature in pose mode, active bone) while building the frame
+    pose_draw: Option<(u64, usize)>,
     /// Proportional editing (O) and its radius in world units (mouse wheel during G/R/S).
     pub proportional: bool,
     pub prop_radius: f32,
@@ -236,7 +239,8 @@ pub struct Viewport {
     pub mesh_cache: MeshCache,
     pub tex_cache: crate::textures::TextureCache,
     /// Scene texture ids in `raster.textures` order for the current frame.
-    frame_tex: Vec<u32>,
+    /// textures used this frame: (base texture, normal map) ids
+    frame_tex: Vec<(u32, u32)>,
     prims: Vec<RPrim>,
     raster: Raster,
     id_map: Vec<u64>,
@@ -284,6 +288,8 @@ impl Default for Viewport {
             inset_amount: 0.0,
             proportional: false,
             sculpt_ui: Default::default(),
+            pose_ui: Default::default(),
+            pose_draw: None,
             prop_radius: 1.0,
             bevel_width: 0.0,
             bevel_segments: 1,
@@ -326,6 +332,7 @@ impl Default for Viewport {
 
 mod edit;
 mod sculpt;
+mod pose;
 
 /// Triangle ids at or above this value encode a face index of the mesh in edit mode.
 pub const FACE_BASE: u32 = 1 << 24;
@@ -682,6 +689,7 @@ impl Viewport {
     pub fn ui(&mut self, ui: &mut Ui, ed: &mut Editor) {
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         self.rect = rect;
+        ed.scene.update_skins();
         self.handle_view_requests(ed);
         self.animate_camera(ui);
         if let Some(cid) = self.camera_view {
@@ -1032,6 +1040,7 @@ impl Viewport {
                     }
                 }
             }
+            ObjectKind::Armature => self.draw_bones(o, pid, col, view),
             ObjectKind::Camera(cd) => {
                 let s = o.transform.scale.x.abs().max(0.01);
                 let d = 1.0 * s;
@@ -1103,6 +1112,7 @@ impl Viewport {
         self.raster.textures.clear();
         self.frame_tex.clear();
         self.edit_obj = if self.render_mode { None } else { ed.edit.as_ref().map(|s| s.obj) };
+        self.pose_draw = ed.pose.map(|id| (id, ed.active_bone));
         self.edit_draw = None;
         let view = self.cam.view();
         let eye = self.cam.eye();
@@ -1230,7 +1240,7 @@ impl Viewport {
             let base = lin(o.material.color);
             let mat = o.material;
             // image / procedural texture (Material Preview and F12 renders)
-            let tex = if mat.texture != 0 && (shading == Shading::Material) { self.texture_slot(ed, mat.texture) } else { 0 };
+            let tex = if (mat.texture != 0 || mat.normal_tex != 0) && (shading == Shading::Material) { self.texture_slot(ed, &mat) } else { 0 };
             let tsc = mat.tex_scale.max(1e-3);
             let tri_uv = |fi: usize| -> [[f32; 2]; 3] { mesh.tri_uv.get(fi).map(|t| t.map(|u| [u[0] * tsc, u[1] * tsc])).unwrap_or([[0.0; 2]; 3]) };
             let alpha = if self.overlays.xray { 0.4 } else { mat.alpha };
@@ -1643,14 +1653,20 @@ impl Viewport {
     }
 
     /// Raster slot (index + 1) for a scene texture this frame; 0 if it can't be decoded.
-    fn texture_slot(&mut self, ed: &Editor, id: u32) -> u32 {
-        if let Some(i) = self.frame_tex.iter().position(|t| *t == id) {
+    fn texture_slot(&mut self, ed: &Editor, mat: &crate::scene::Material) -> u32 {
+        let normal = ed.scene.texture(mat.normal_tex).filter(|_| mat.normal_strength > 0.0);
+        let key = (mat.texture, normal.map(|t| t.id).unwrap_or(0));
+        if let Some(i) = self.frame_tex.iter().position(|t| *t == key) {
             return i as u32 + 1;
         }
-        let Some(img) = ed.scene.texture(id).and_then(|t| self.tex_cache.get(t)) else {
-            return 0;
+        let base = ed.scene.texture(mat.texture);
+        let img = match normal {
+            // raster renderers shade per vertex: bake the bumps' shading into the texture
+            Some(n) => self.tex_cache.baked(base, n, mat.normal_strength),
+            None => base.and_then(|t| self.tex_cache.get(t)),
         };
-        self.frame_tex.push(id);
+        let Some(img) = img else { return 0 };
+        self.frame_tex.push(key);
         self.raster.textures.push(img);
         self.frame_tex.len() as u32
     }
@@ -1813,10 +1829,17 @@ impl Viewport {
                 {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
-                    for id in &self.frame_tex {
-                        id.hash(&mut h);
-                        if let Some(t) = ed.scene.texture(*id) {
-                            crate::textures::signature(&t.source).hash(&mut h);
+                    for (id, nid) in &self.frame_tex {
+                        (id, nid).hash(&mut h);
+                        for i in [id, nid] {
+                            if let Some(t) = ed.scene.texture(*i) {
+                                crate::textures::signature(&t.source).hash(&mut h);
+                            }
+                        }
+                    }
+                    for o in &ed.scene.objects {
+                        if o.material.normal_tex != 0 {
+                            o.material.normal_strength.to_bits().hash(&mut h);
                         }
                     }
                     h.finish()
@@ -2300,10 +2323,14 @@ impl Viewport {
                 ui.horizontal(|ui| {
                     let editing = ed.editing();
                     let sculpting = ed.sculpt.is_some();
+                    let posing = ed.pose.is_some();
+                    let arm_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.armature.is_some());
                     let label = if editing {
                         "✎ Edit Mode"
                     } else if sculpting {
                         "🖌 Sculpt Mode"
+                    } else if posing {
+                        "🏃 Pose Mode"
                     } else {
                         "▣ Object Mode"
                     };
@@ -2312,20 +2339,29 @@ impl Viewport {
                         .selected_text(egui::RichText::new(label).size(12.5).color(if editing { Color32::from_rgb(255, 170, 90) } else if sculpting { Color32::from_rgb(140, 200, 255) } else { theme::TEXT }))
                         .width(118.0)
                         .show_ui(ui, |ui| {
-                            if ui.selectable_label(!editing && !sculpting, "▣ Object Mode").clicked() {
+                            if ui.selectable_label(!editing && !sculpting && !posing, "▣ Object Mode").clicked() {
                                 pick = Some(0);
                             }
                             if ui.selectable_label(editing, "✎ Edit Mode   Tab").clicked() {
                                 pick = Some(1);
                             }
-                            if ui.selectable_label(sculpting, "🖌 Sculpt Mode   Ctrl+Tab").clicked() {
+                            if arm_active || posing {
+                                if ui.selectable_label(posing, "🏃 Pose Mode   Ctrl+Tab").clicked() {
+                                    pick = Some(3);
+                                }
+                            } else if ui.selectable_label(sculpting, "🖌 Sculpt Mode   Ctrl+Tab").clicked() {
                                 pick = Some(2);
                             }
                         });
                     match pick {
                         Some(0) => ed.exit_edit(),
+                        Some(3) if !posing => {
+                            let r = ed.toggle_pose();
+                            self.report(r);
+                        }
                         Some(1) if !editing => {
                             ed.sculpt = None;
+                            ed.pose = None;
                             let r = ed.toggle_edit();
                             self.report(r);
                         }
@@ -2344,6 +2380,10 @@ impl Viewport {
                     if sculpting {
                         ui.separator();
                         self.sculpt_header(ui);
+                    }
+                    if posing {
+                        ui.separator();
+                        self.pose_header(ui, ed);
                     }
                     if let Some(st) = ed.edit.as_mut() {
                         ui.separator();
@@ -2898,6 +2938,14 @@ impl Viewport {
             }
             if scroll.x.abs() > 0.0 {
                 self.cam.yaw -= scroll.x * 0.2;
+            }
+        }
+
+        // ---------- pose mode: bones ----------
+        if ed.pose.is_some() {
+            self.gizmo_hover = None;
+            if self.pose_input(&ctx, resp, ed, mouse) {
+                return;
             }
         }
 

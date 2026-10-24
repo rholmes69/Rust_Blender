@@ -294,7 +294,10 @@ pub fn signature(src: &TexSource) -> u64 {
 #[derive(Default)]
 pub struct TextureCache {
     map: HashMap<u32, (TexSource, Arc<TexImage>)>,
+    baked_more: Vec<(BakeKey, Arc<TexImage>)>,
 }
+
+type BakeKey = (Option<(u32, u64)>, u32, u64, u32);
 
 impl TextureCache {
     pub fn get(&mut self, t: &Texture) -> Option<Arc<TexImage>> {
@@ -305,6 +308,150 @@ impl TextureCache {
         }
         let img = Arc::new(decode(&t.source).ok()?);
         self.map.insert(t.id, (t.source.clone(), img.clone()));
+        Some(img)
+    }
+}
+
+// ---- normal / bump maps ----------------------------------------------------------------------
+
+/// Tangent-space normal from a normal-map texel (OpenGL / glTF convention: +Y = image up),
+/// with the bumps scaled by `strength`.
+#[inline]
+pub fn texel_normal(c: [f32; 4], strength: f32) -> glam::Vec3 {
+    let x = (c[0] * 2.0 - 1.0) * strength;
+    let y = (c[1] * 2.0 - 1.0) * strength;
+    let z = (c[2] * 2.0 - 1.0).max(0.05);
+    glam::Vec3::new(x, y, z).normalize_or(glam::Vec3::Z)
+}
+
+/// Height (0..1) per pixel: procedural patterns use their own mask (mortar / grout low),
+/// images their luminance.
+pub fn height_of(src: &TexSource) -> Result<TexImage, String> {
+    match src {
+        TexSource::Procedural { pattern, .. } => Ok(procedural(pattern, [1.0; 3], [0.0; 3], 512)),
+        TexSource::Image { .. } => {
+            let img = decode(src)?;
+            let s = 1024.0 / img.w.max(img.h) as f32;
+            let img = if s < 1.0 { img.resized(((img.w as f32 * s) as usize).max(1), ((img.h as f32 * s) as usize).max(1)) } else { img };
+            let rgba = img
+                .rgba
+                .iter()
+                .map(|p| {
+                    let l = (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) as u8;
+                    [l, l, l, 255]
+                })
+                .collect();
+            Ok(TexImage { w: img.w, h: img.h, rgba })
+        }
+    }
+}
+
+/// Tileable normal map from a height map (red channel). `depth` is the bump height in pixels.
+pub fn height_to_normal(h: &TexImage, depth: f32, invert: bool) -> TexImage {
+    let (w, hh) = (h.w, h.h);
+    // soften hard steps (mortar lines) into bevels a few pixels wide, so the bumps read at
+    // render size: two passes of a tileable box blur
+    let mut f: Vec<f32> = h.rgba.iter().map(|p| { let v = p[0] as f32 / 255.0; if invert { 1.0 - v } else { v } }).collect();
+    let r = (w.max(hh) / 170).max(1) as i64;
+    for _ in 0..2 {
+        let mut t = vec![0.0; f.len()];
+        for y in 0..hh {
+            for x in 0..w as i64 {
+                t[y * w + x as usize] = (-r..=r).map(|k| f[y * w + (x + k).rem_euclid(w as i64) as usize]).sum::<f32>() / (2 * r + 1) as f32;
+            }
+        }
+        for y in 0..hh as i64 {
+            for x in 0..w {
+                f[y as usize * w + x] = (-r..=r).map(|k| t[(y + k).rem_euclid(hh as i64) as usize * w + x]).sum::<f32>() / (2 * r + 1) as f32;
+            }
+        }
+    }
+    let at = |x: i64, y: i64| -> f32 { f[(y.rem_euclid(hh as i64) as usize) * w + x.rem_euclid(w as i64) as usize] };
+    let mut rgba = Vec::with_capacity(w * hh);
+    for y in 0..hh as i64 {
+        for x in 0..w as i64 {
+            // Sobel gradient
+            let dx = (at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2.0 * at(x - 1, y) + at(x - 1, y + 1));
+            let dy = (at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2.0 * at(x, y - 1) + at(x + 1, y - 1));
+            // image y runs down; tangent-space +Y is up
+            let n = glam::Vec3::new(-dx * depth / 8.0, dy * depth / 8.0, 1.0).normalize();
+            let q = |c: f32| ((c * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+            rgba.push([q(n.x), q(n.y), q(n.z), 255]);
+        }
+    }
+    TexImage { w, h: hh, rgba }
+}
+
+/// Generate a normal map (PNG bytes) for a texture: "make it bumpy".
+pub fn normal_map_png(src: &TexSource, depth: f32, invert: bool) -> Result<Vec<u8>, String> {
+    let n = height_to_normal(&height_of(src)?, depth, invert);
+    let flat: Vec<u8> = n.rgba.iter().flatten().copied().collect();
+    encode_png(n.w, n.h, &flat)
+}
+
+/// Normal maps are mostly blue-violet: x, y around the middle and z high.
+pub fn looks_like_normal_map(img: &TexImage) -> bool {
+    let n = img.rgba.len().max(1) as f32;
+    let step = (img.rgba.len() / 4096).max(1);
+    let (mut r, mut g, mut b, mut k) = (0.0, 0.0, 0.0, 0.0);
+    for p in img.rgba.iter().step_by(step) {
+        r += p[0] as f32;
+        g += p[1] as f32;
+        b += p[2] as f32;
+        k += 1.0;
+    }
+    let _ = n;
+    let (r, g, b) = (r / k / 255.0, g / k / 255.0, b / k / 255.0);
+    (r - 0.5).abs() < 0.12 && (g - 0.5).abs() < 0.12 && b > 0.75
+}
+
+/// Roughness/metallic map (glTF layout) from a pattern: rough in the low parts.
+pub fn roughness_map_png(src: &TexSource) -> Result<Vec<u8>, String> {
+    let h = height_of(src)?;
+    let flat: Vec<u8> = h.rgba.iter().flat_map(|p| [255, (255.0 * (1.0 - 0.45 * p[0] as f32 / 255.0)) as u8, 255, 255]).collect();
+    encode_png(h.w, h.h, &flat)
+}
+
+/// Bake the look of a normal map into a colour texture for the raster renderers (which shade
+/// per vertex): base × lighting of the bumps by a soft key light from the upper left.
+pub fn bake_bumps(base: Option<&TexImage>, normal: &TexImage, strength: f32) -> TexImage {
+    let (w, h) = match base {
+        Some(b) => (b.w.max(normal.w).min(1024), b.h.max(normal.h).min(1024)),
+        None => (normal.w, normal.h),
+    };
+    let l = glam::Vec3::new(-0.4, 0.45, 0.8).normalize();
+    let flat = 0.45 + 0.55 * l.z;
+    let mut rgba = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let (u, v) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+            let n = texel_normal(normal.sample(u, v), strength);
+            let k = (0.45 + 0.55 * n.dot(l).max(0.0)) / flat;
+            let c = base.map(|b| b.sample(u, v)).unwrap_or([1.0; 4]);
+            let q = |c: f32| (c * k * 255.0).round().clamp(0.0, 255.0) as u8;
+            rgba.push([q(c[0]), q(c[1]), q(c[2]), (c[3] * 255.0) as u8]);
+        }
+    }
+    TexImage { w, h, rgba }
+}
+
+impl TextureCache {
+    /// Base texture with a normal map's shading baked in (cached).
+    pub fn baked(&mut self, base: Option<&Texture>, normal: &Texture, strength: f32) -> Option<Arc<TexImage>> {
+        let key = (base.map(|b| (b.id, signature(&b.source))), normal.id, signature(&normal.source), strength.to_bits());
+        if let Some((_, img)) = self.baked_more.iter().find(|(k, _)| *k == key) {
+            return Some(img.clone());
+        }
+        let b = match base {
+            Some(t) => Some(self.get(t)?),
+            None => None,
+        };
+        let n = self.get(normal)?;
+        let img = Arc::new(bake_bumps(b.as_deref(), &n, strength));
+        self.baked_more.push((key, img.clone()));
+        if self.baked_more.len() > 16 {
+            self.baked_more.remove(0);
+        }
         Some(img)
     }
 }
@@ -343,5 +490,28 @@ mod tests {
         let img = decode(&back.source).unwrap();
         assert_eq!((img.w, img.h), (2, 1));
         assert_eq!(img.rgba[0], [255, 0, 0, 255]);
+    }
+    #[test]
+    fn normal_maps() {
+        // a height ramp rising to the right tilts normals to the left (-x)
+        let w = 32;
+        let rgba = (0..w * w).map(|i| { let l = ((i % w) * 255 / (w - 1)) as u8; [l, l, l, 255] }).collect();
+        let n = height_to_normal(&TexImage { w, h: w, rgba }, 4.0, false);
+        let c = n.rgba[w * 10 + 10];
+        assert!(c[0] < 120 && (c[1] as i32 - 128).abs() < 3 && c[2] > 200, "{c:?}");
+        assert!(looks_like_normal_map(&n));
+        assert!(!looks_like_normal_map(&procedural("bricks", [0.6, 0.2, 0.1], [0.8; 3], 64)));
+        let t = texel_normal([c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0], 1.0);
+        assert!(t.x < -0.1 && t.z > 0.5);
+        // bricks: generated map decodes, baked shading darkens one side of the mortar lines
+        let src = TexSource::Procedural { pattern: "bricks".into(), color_a: [0.6, 0.2, 0.1], color_b: [0.8; 3] };
+        let png = normal_map_png(&src, 8.0, false).unwrap();
+        let nm = decode(&TexSource::Image { data: png }).unwrap();
+        assert!(looks_like_normal_map(&nm));
+        let baked = bake_bumps(None, &nm, 1.0);
+        let (lo, hi) = baked.rgba.iter().fold((255u8, 0u8), |(l, h), p| (l.min(p[0]), h.max(p[0])));
+        assert!(lo < 200 && hi > 240, "{lo} {hi}");
+        let r = decode(&TexSource::Image { data: roughness_map_png(&src).unwrap() }).unwrap();
+        assert!(r.rgba.iter().any(|p| p[1] > 250) && r.rgba.iter().any(|p| p[1] < 160));
     }
 }

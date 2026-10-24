@@ -4,9 +4,11 @@
 )]
 
 mod agent;
+mod armature;
 mod ai;
 mod app;
 mod editmesh;
+mod csg;
 mod editor;
 mod gltf;
 mod gltf_import;
@@ -20,6 +22,7 @@ mod router;
 mod scene;
 mod sculpt;
 mod textures;
+mod uv;
 mod theme;
 mod viewport;
 mod voice;

@@ -21,6 +21,9 @@ struct PtMat {
     /// 1 = opaque, < 1 = glass-like transmission
     alpha: f32,
     tex: Option<u16>,
+    normal_tex: Option<u16>,
+    normal_strength: f32,
+    rough_tex: Option<u16>,
 }
 
 struct Light {
@@ -41,6 +44,8 @@ pub struct PtScene {
     /// per triangle: corner normals, corner UVs, material index
     normals: Vec<[Vec3; 3]>,
     uvs: Vec<[[f32; 2]; 3]>,
+    /// per triangle: UV tangent frame (dP/du, -dP/dv), for normal maps
+    tangents: Vec<[Vec3; 2]>,
     mat_of: Vec<u16>,
     mats: Vec<PtMat>,
     textures: Vec<Arc<TexImage>>,
@@ -53,6 +58,21 @@ pub struct PtScene {
     pub tris: usize,
 }
 
+/// Tangent and bitangent of a triangle's UV mapping: directions of +u and of image-up (−v).
+fn uv_frame(p: &[Vec3; 3], uv: &[[f32; 2]; 3]) -> [Vec3; 2] {
+    let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
+    let (du1, dv1) = (uv[1][0] - uv[0][0], uv[1][1] - uv[0][1]);
+    let (du2, dv2) = (uv[2][0] - uv[0][0], uv[2][1] - uv[0][1]);
+    let det = du1 * dv2 - du2 * dv1;
+    if det.abs() < 1e-12 {
+        return [Vec3::ZERO; 2];
+    }
+    let r = 1.0 / det;
+    let t = (e1 * dv2 - e2 * dv1) * r;
+    let b = (e2 * du1 - e1 * du2) * r;
+    [t, -b]
+}
+
 fn lin(c: [f32; 3]) -> Vec3 {
     Vec3::new(c[0].powf(2.2), c[1].powf(2.2), c[2].powf(2.2))
 }
@@ -62,6 +82,7 @@ impl PtScene {
         let mut tris = vec![];
         let mut normals = vec![];
         let mut uvs = vec![];
+        let mut tangents = vec![];
         let mut mat_of = vec![];
         let mut mats = vec![];
         let mut textures: Vec<Arc<TexImage>> = vec![];
@@ -70,21 +91,33 @@ impl PtScene {
         for o in scene.objects.iter().filter(|o| o.visible && o.is_mesh()) {
             let mesh = cache.for_object(o);
             let m = o.material;
-            let tex = if m.texture != 0 {
-                match tex_slot.iter().find(|(id, _)| *id == m.texture) {
+            let mut slot = |id: u32| -> Option<u16> {
+                if id == 0 {
+                    return None;
+                }
+                match tex_slot.iter().find(|(i, _)| *i == id) {
                     Some((_, s)) => Some(*s),
-                    None => scene.texture(m.texture).and_then(|t| tex_cache.get(t)).map(|img| {
+                    None => scene.texture(id).and_then(|t| tex_cache.get(t)).map(|img| {
                         textures.push(img);
                         let s = (textures.len() - 1) as u16;
-                        tex_slot.push((m.texture, s));
+                        tex_slot.push((id, s));
                         s
                     }),
                 }
-            } else {
-                None
             };
+            let (tex, normal_tex, rough_tex) = (slot(m.texture), slot(m.normal_tex), slot(m.rough_tex));
             let base = lin(m.color);
-            mats.push(PtMat { albedo: base, metallic: m.metallic.clamp(0.0, 1.0), roughness: m.roughness.clamp(0.02, 1.0), emission: base * m.emission, alpha: m.alpha.clamp(0.0, 1.0), tex });
+            mats.push(PtMat {
+                albedo: base,
+                metallic: m.metallic.clamp(0.0, 1.0),
+                roughness: m.roughness.clamp(0.02, 1.0),
+                emission: base * m.emission,
+                alpha: m.alpha.clamp(0.0, 1.0),
+                tex,
+                normal_tex,
+                normal_strength: m.normal_strength.clamp(0.0, 10.0),
+                rough_tex,
+            });
             let mi = (mats.len() - 1) as u16;
             let tsc = m.tex_scale;
             for inst in o.instance_matrices() {
@@ -97,7 +130,9 @@ impl PtScene {
                     let fnrm = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
                     let cn = mesh.corner_normals.get(ti).copied().unwrap_or([fnrm; 3]);
                     normals.push(if mesh.smooth { cn.map(|n| (nm * n).normalize_or_zero() * if flip { -1.0 } else { 1.0 }) } else { [fnrm * if flip { -1.0 } else { 1.0 }; 3] });
-                    uvs.push(mesh.tri_uv.get(ti).map(|u| u.map(|c| [c[0] * tsc, c[1] * tsc])).unwrap_or([[0.0; 2]; 3]));
+                    let uv = mesh.tri_uv.get(ti).map(|u| u.map(|c| [c[0] * tsc, c[1] * tsc])).unwrap_or([[0.0; 2]; 3]);
+                    tangents.push(if normal_tex.is_some() { uv_frame(&tri, &uv) } else { [Vec3::ZERO; 2] });
+                    uvs.push(uv);
                     mat_of.push(mi);
                     if m.alpha > 0.5 {
                         opaque.push(tri);
@@ -132,6 +167,7 @@ impl PtScene {
             shadow_bvh: Bvh::new(opaque),
             normals,
             uvs,
+            tangents,
             mat_of,
             mats,
             textures,
@@ -209,11 +245,18 @@ fn fresnel_dielectric(cos_i: f32, eta: f32) -> f32 {
 }
 
 impl PtScene {
-    fn trace(&self, mut o: Vec3, mut d: Vec3, r: &mut Rng) -> Vec3 {
+    fn trace(&self, mut o: Vec3, mut d: Vec3, r: &mut Rng, aux: &mut Option<(Vec3, Vec3)>) -> Vec3 {
         let mut through = Vec3::ONE;
         let mut out = Vec3::ZERO;
+        // denoiser guides come from the first non-mirror, non-glass surface (seen through
+        // reflections/refractions), like production denoisers do
+        let mut aux_tint = Vec3::ONE;
+        let mut aux_pending = true;
         for bounce in 0..8 {
             let Some(h) = self.bvh.intersect(o, d, 1e6) else {
+                if aux_pending {
+                    *aux = Some((aux_tint.max(Vec3::splat(0.02)), Vec3::ZERO));
+                }
                 // camera rays see the viewport-style background; bounces see the sky
                 out += through * if bounce == 0 { self.bg_bot.lerp(self.bg_top, (d.z * 0.5 + 0.5).clamp(0.0, 1.0)) } else { self.env(d) };
                 break;
@@ -223,16 +266,49 @@ impl PtScene {
             let w0 = 1.0 - h.u - h.v;
             let ns = self.normals[ti];
             let mut n = (ns[0] * w0 + ns[1] * h.u + ns[2] * h.v).normalize_or_zero();
-            let m = self.mats[self.mat_of[ti] as usize];
+            let mut m = self.mats[self.mat_of[ti] as usize];
             let mut albedo = m.albedo;
             let mut alpha = m.alpha;
-            if let Some(t) = m.tex {
+            if m.tex.is_some() || m.normal_tex.is_some() || m.rough_tex.is_some() {
                 let uv = self.uvs[ti];
                 let tu = uv[0][0] * w0 + uv[1][0] * h.u + uv[2][0] * h.v;
                 let tv = uv[0][1] * w0 + uv[1][1] * h.u + uv[2][1] * h.v;
-                let c = self.textures[t as usize].sample(tu, tv);
-                albedo *= Vec3::new(c[0].powf(2.2), c[1].powf(2.2), c[2].powf(2.2));
-                alpha *= c[3];
+                if let Some(t) = m.tex {
+                    let c = self.textures[t as usize].sample(tu, tv);
+                    albedo *= Vec3::new(c[0].powf(2.2), c[1].powf(2.2), c[2].powf(2.2));
+                    alpha *= c[3];
+                }
+                if let Some(t) = m.rough_tex {
+                    // linear data: G = roughness, B = metallic
+                    let c = self.textures[t as usize].sample(tu, tv);
+                    m.roughness = (m.roughness * c[1]).clamp(0.02, 1.0);
+                    m.metallic = (m.metallic * c[2]).clamp(0.0, 1.0);
+                }
+                if let Some(t) = m.normal_tex {
+                    let [tt, bb] = self.tangents[ti];
+                    let tn = crate::textures::texel_normal(self.textures[t as usize].sample(tu, tv), m.normal_strength);
+                    // Gram–Schmidt against the shading normal; keep the bitangent's handedness
+                    let t1 = (tt - n * n.dot(tt)).normalize_or_zero();
+                    let b1 = (bb - n * n.dot(bb) - t1 * t1.dot(bb)).normalize_or_zero();
+                    if t1 != Vec3::ZERO && b1 != Vec3::ZERO {
+                        let pn = (t1 * tn.x + b1 * tn.y + n * tn.z).normalize_or_zero();
+                        // never tilt past the view direction (black speckles)
+                        let side = n.dot(d).signum();
+                        n = if pn.dot(d).signum() == side { pn } else { (pn - d * (pn.dot(d) - side * 0.01)).normalize_or(n) };
+                    }
+                }
+            }
+            let glassy = alpha < 0.999;
+            let mirror = m.metallic > 0.5 && m.roughness < 0.3;
+            if aux_pending && bounce < 4 {
+                if glassy {
+                    aux_tint *= albedo.lerp(Vec3::ONE, 0.6);
+                } else if mirror {
+                    aux_tint *= albedo;
+                } else {
+                    *aux = Some(((albedo * aux_tint).max(Vec3::splat(0.02)), n));
+                    aux_pending = false;
+                }
             }
             // emitters aren't light-sampled, so they always count when hit
             out += through * m.emission;
@@ -331,8 +407,8 @@ impl PtScene {
         if mx > 12.0 { out * (12.0 / mx) } else { out }
     }
 
-    /// Render `samples` passes into `acc` (linear radiance sums).
-    fn pass(&self, w: usize, h: usize, acc: &mut [Vec3], pass_idx: u32) {
+    /// One sample per pixel, added to `acc`.
+    fn pass(&self, w: usize, h: usize, acc: &mut [Px], pass_idx: u32) {
         let aspect = w as f32 / h as f32;
         let cam = &self.cam;
         let (eye, fwd, right, up) = (cam.eye(), cam.forward(), cam.right(), cam.up());
@@ -340,7 +416,7 @@ impl PtScene {
         let ortho_h = cam.half_height();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 32);
         let rows_per = h.div_ceil(threads * 4).max(1);
-        let chunks: Vec<(usize, &mut [Vec3])> = acc.chunks_mut(rows_per * w).enumerate().collect();
+        let chunks: Vec<(usize, &mut [Px])> = acc.chunks_mut(rows_per * w).enumerate().collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let chunks = std::sync::Mutex::new(chunks.into_iter().map(Some).collect::<Vec<_>>());
         std::thread::scope(|s| {
@@ -367,7 +443,11 @@ impl PtScene {
                         } else {
                             (eye, (fwd + right * (nx * th * aspect) + up * (ny * th)).normalize())
                         };
-                        *px += self.trace(o, d, &mut r);
+                        let mut aux = None;
+                        px.c += self.trace(o, d, &mut r, &mut aux);
+                        let (a, n) = aux.unwrap_or((Vec3::ONE, Vec3::ZERO));
+                        px.a += a;
+                        px.n += n;
                     }
                 });
             }
@@ -381,12 +461,83 @@ fn aces(x: f32) -> u8 {
     (y.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0 + 0.5) as u8
 }
 
-/// Tone-map accumulated radiance to RGBA8.
-pub fn develop(acc: &[Vec3], n: u32) -> Vec<u8> {
+/// Accumulated samples of one pixel: radiance, first-hit albedo and normal (denoiser guides).
+#[derive(Clone, Copy, Default)]
+pub struct Px {
+    c: Vec3,
+    a: Vec3,
+    n: Vec3,
+}
+
+/// Edge-aware à-trous wavelet denoiser on demodulated illumination, guided by albedo and normals.
+pub fn denoise(acc: &[Px], w: usize, h: usize, n: u32) -> Vec<Vec3> {
     let inv = 1.0 / n.max(1) as f32;
+    let alb: Vec<Vec3> = acc.iter().map(|p| p.a * inv).collect();
+    let nrm: Vec<Vec3> = acc.iter().map(|p| p.n.normalize_or_zero()).collect();
+    let mut ill: Vec<Vec3> = acc.iter().zip(&alb).map(|(p, a)| p.c * inv / a.max(Vec3::splat(0.02))).collect();
+    let lum = |c: Vec3| c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    let kern = [1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0];
+    // fewer samples → stronger filtering
+    let sigma_l = (4.0 / (n as f32).sqrt()).clamp(0.08, 2.0);
+    let iters = if n >= 256 { 3 } else { 5 };
+    for it in 0..iters {
+        let step = 1i32 << it;
+        let src = ill.clone();
+        let rows: Vec<usize> = (0..h).collect();
+        let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4).clamp(1, 32);
+        let chunk = h.div_ceil(threads).max(1);
+        let mut out = vec![Vec3::ZERO; w * h];
+        std::thread::scope(|s| {
+            for (rows, dst) in rows.chunks(chunk).zip(out.chunks_mut(chunk * w)) {
+                let (src, alb, nrm) = (&src, &alb, &nrm);
+                s.spawn(move || {
+                    for (ri, &y) in rows.iter().enumerate() {
+                        for x in 0..w {
+                            let i = y * w + x;
+                            let (cp, np, ap) = (src[i], nrm[i], alb[i]);
+                            let lp = lum(cp);
+                            let (mut sum, mut wsum) = (Vec3::ZERO, 0.0f32);
+                            for (ky, kvy) in kern.iter().enumerate() {
+                                let yy = y as i32 + (ky as i32 - 2) * step;
+                                if yy < 0 || yy >= h as i32 {
+                                    continue;
+                                }
+                                for (kx, kvx) in kern.iter().enumerate() {
+                                    let xx = x as i32 + (kx as i32 - 2) * step;
+                                    if xx < 0 || xx >= w as i32 {
+                                        continue;
+                                    }
+                                    let j = yy as usize * w + xx as usize;
+                                    let wn = if np == Vec3::ZERO || nrm[j] == Vec3::ZERO {
+                                        if np == nrm[j] { 1.0 } else { 0.0 }
+                                    } else {
+                                        np.dot(nrm[j]).max(0.0).powi(32)
+                                    };
+                                    let da = ap - alb[j];
+                                    let wa = (-da.length_squared() * 60.0).exp();
+                                    let wl = (-(lp - lum(src[j])).abs() / (sigma_l * (lp + 0.05) * step as f32 * 0.5 + 1e-4)).exp();
+                                    let wt = kvy * kvx * wn * wa * wl;
+                                    sum += src[j] * wt;
+                                    wsum += wt;
+                                }
+                            }
+                            dst[ri * w + x] = if wsum > 1e-8 { sum / wsum } else { cp };
+                        }
+                    }
+                });
+            }
+        });
+        ill = out;
+    }
+    ill.iter().zip(&alb).map(|(l, a)| *l * a.max(Vec3::splat(0.02))).collect()
+}
+
+/// Tone-map accumulated radiance to RGBA8 (optionally denoised).
+pub fn develop(acc: &[Px], w: usize, h: usize, n: u32, denoised: bool) -> Vec<u8> {
+    let inv = 1.0 / n.max(1) as f32;
+    let cols: Vec<Vec3> = if denoised && n >= 2 { denoise(acc, w, h, n) } else { acc.iter().map(|p| p.c * inv).collect() };
     let mut out = Vec::with_capacity(acc.len() * 4);
-    for c in acc {
-        let c = *c * inv;
+    for c in cols {
         out.extend_from_slice(&[aces(c.x), aces(c.y), aces(c.z), 255]);
     }
     out
@@ -420,7 +571,7 @@ impl Drop for PtJob {
 }
 
 /// Start rendering in the background; an update is sent after each refinement step.
-pub fn start(scene: PtScene, w: usize, h: usize, samples: u32, repaint: impl Fn() + Send + 'static) -> PtJob {
+pub fn start(scene: PtScene, w: usize, h: usize, samples: u32, denoised: bool, repaint: impl Fn() + Send + 'static) -> PtJob {
     let (tx, rx) = unbounded();
     let cancel = Arc::new(AtomicBool::new(false));
     let c2 = cancel.clone();
@@ -428,8 +579,9 @@ pub fn start(scene: PtScene, w: usize, h: usize, samples: u32, repaint: impl Fn(
         .name("pathtrace".into())
         .spawn(move || {
             let t0 = std::time::Instant::now();
-            let mut acc = vec![Vec3::ZERO; w * h];
+            let mut acc = vec![Px::default(); w * h];
             let total = samples.max(1);
+            let mut last_denoise = std::time::Instant::now();
             let mut done = 0;
             let mut last_send = std::time::Instant::now();
             while done < total {
@@ -441,7 +593,12 @@ pub fn start(scene: PtScene, w: usize, h: usize, samples: u32, repaint: impl Fn(
                 // stream often at first, then about twice a second
                 if done <= 4 || done == total || last_send.elapsed().as_secs_f32() > 0.5 {
                     last_send = std::time::Instant::now();
-                    if tx.send(PtUpdate { rgba: develop(&acc, done), width: w, height: h, samples: done, total, secs: t0.elapsed().as_secs_f32() }).is_err() {
+                    // denoise the final image and, while refining, every couple of seconds
+                    let dn = denoised && (done == total || last_denoise.elapsed().as_secs_f32() > 2.0 || done == 4);
+                    if dn {
+                        last_denoise = std::time::Instant::now();
+                    }
+                    if tx.send(PtUpdate { rgba: develop(&acc, w, h, done, dn), width: w, height: h, samples: done, total, secs: t0.elapsed().as_secs_f32() }).is_err() {
                         return;
                     }
                     repaint();
@@ -453,12 +610,12 @@ pub fn start(scene: PtScene, w: usize, h: usize, samples: u32, repaint: impl Fn(
 }
 
 /// Blocking render (for MCP / tests).
-pub fn render_blocking(scene: &PtScene, w: usize, h: usize, samples: u32) -> Vec<u8> {
-    let mut acc = vec![Vec3::ZERO; w * h];
+pub fn render_blocking(scene: &PtScene, w: usize, h: usize, samples: u32, denoised: bool) -> Vec<u8> {
+    let mut acc = vec![Px::default(); w * h];
     for s in 0..samples.max(1) {
         scene.pass(w, h, &mut acc, s);
     }
-    develop(&acc, samples.max(1))
+    develop(&acc, w, h, samples.max(1), denoised)
 }
 
 #[cfg(test)]
@@ -471,7 +628,7 @@ mod tests {
         let (cam, _) = vp.render_view(&ed, 16.0 / 9.0);
         let sc = PtScene::gather(&ed.scene, &mut MeshCache::default(), &mut TextureCache::default(), cam);
         assert_eq!(sc.tris, 12);
-        let img = render_blocking(&sc, 64, 36, 4);
+        let img = render_blocking(&sc, 64, 36, 4, true);
         let px = |x: usize, y: usize| &img[(y * 64 + x) * 4..(y * 64 + x) * 4 + 3];
         // the cube in the centre is lit, the corner is background
         assert_ne!(px(32, 18), px(1, 1));

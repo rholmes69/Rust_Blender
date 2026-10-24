@@ -138,6 +138,18 @@ impl Primitive {
 }
 
 impl PolyMesh {
+    /// Polygon area (Newell vector length / 2).
+    pub fn face_area(&self, f: usize) -> f32 {
+        let face = &self.faces[f];
+        let mut n = Vec3::ZERO;
+        for i in 0..face.len() {
+            let a = self.verts[face[i] as usize];
+            let b = self.verts[face[(i + 1) % face.len()] as usize];
+            n += a.cross(b);
+        }
+        n.length() * 0.5
+    }
+
     pub fn face_normal(&self, f: usize) -> Vec3 {
         // Newell's method (robust for n-gons)
         let face = &self.faces[f];

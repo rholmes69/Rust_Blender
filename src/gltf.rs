@@ -170,11 +170,14 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 let (mut pos, mut nrm, mut idx) = (vec![], vec![], vec![]);
                 let mut uvs: Vec<[f32; 2]> = vec![];
                 let tex = scene.texture(o.material.texture);
+                let ntex = scene.texture(o.material.normal_tex);
+                let rtex = scene.texture(o.material.rough_tex);
+                let textured = tex.is_some() || ntex.is_some() || rtex.is_some();
                 for inst in o.instance_matrices() {
                     let nm = Mat3::from_mat4(inst).inverse().transpose();
                     let flip = inst.determinant() < 0.0;
                     let base = pos.len() as u32;
-                    if tex.is_some() || mesh.split_normals {
+                    if textured || mesh.split_normals {
                         // per-corner vertices so UV seams and auto-smooth hard edges survive
                         let s = o.material.tex_scale;
                         for (ti, tri) in mesh.tris.iter().enumerate() {
@@ -245,19 +248,27 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 if m.alpha < 0.999 {
                     mat["alphaMode"] = json!("BLEND");
                 }
-                if let (Some(t), Some(_)) = (tex, ua) {
-                    let ti = match tex_map.get(&t.id) {
-                        Some(i) => Some(*i),
-                        None => texture_bytes(t).map(|(bytes, mime)| {
-                            let view = bin.view(&bytes, None);
-                            images.push(json!({"name": t.name, "bufferView": view, "mimeType": mime}));
-                            gl_textures.push(json!({"sampler": 0, "source": images.len() - 1}));
-                            tex_map.insert(t.id, gl_textures.len() - 1);
-                            gl_textures.len() - 1
-                        }),
+                if ua.is_some() {
+                    let mut add = |t: &crate::textures::Texture| -> Option<usize> {
+                        match tex_map.get(&t.id) {
+                            Some(i) => Some(*i),
+                            None => texture_bytes(t).map(|(bytes, mime)| {
+                                let view = bin.view(&bytes, None);
+                                images.push(json!({"name": t.name, "bufferView": view, "mimeType": mime}));
+                                gl_textures.push(json!({"sampler": 0, "source": images.len() - 1}));
+                                tex_map.insert(t.id, gl_textures.len() - 1);
+                                gl_textures.len() - 1
+                            }),
+                        }
                     };
-                    if let Some(ti) = ti {
+                    if let Some(ti) = tex.and_then(&mut add) {
                         mat["pbrMetallicRoughness"]["baseColorTexture"] = json!({"index": ti});
+                    }
+                    if let Some(ti) = ntex.and_then(&mut add) {
+                        mat["normalTexture"] = json!({"index": ti, "scale": m.normal_strength});
+                    }
+                    if let Some(ti) = rtex.and_then(&mut add) {
+                        mat["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({"index": ti});
                     }
                 }
                 materials.push(mat);
@@ -287,6 +298,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 lights.push(lj);
                 node["extensions"] = json!({"KHR_lights_punctual": {"light": lights.len() - 1}});
             }
+            ObjectKind::Armature => {}
             ObjectKind::Camera(cd) => {
                 cameras.push(json!({"name": o.name, "type": "perspective", "perspective": {"yfov": cd.fov_deg.to_radians(), "aspectRatio": 16.0 / 9.0, "znear": 0.1, "zfar": 1000.0}}));
                 node["camera"] = json!(cameras.len() - 1);

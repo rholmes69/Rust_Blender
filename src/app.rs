@@ -227,6 +227,10 @@ pub struct App {
     /// Autosave every couple of minutes; offer recovery after a crash.
     last_autosave: Instant,
     recovery: Option<std::path::PathBuf>,
+    /// UV editor window + cached background texture (texture id, signature, handle).
+    show_uv: bool,
+    uv_bg: Option<(u32, u64, egui::TextureHandle)>,
+    uv_drag: Option<Vec<Vec<[f32; 2]>>>,
     outliner_collapsed: std::collections::HashSet<u64>,
     outliner_collapsed_cols: std::collections::HashSet<u32>,
     /// "Move to collection" popup (M)
@@ -353,6 +357,9 @@ impl App {
             assistant_rect: egui::Rect::NOTHING,
             ctx_handle: cc.egui_ctx.clone(),
             last_autosave: Instant::now(),
+            show_uv: false,
+            uv_bg: None,
+            uv_drag: None,
             recovery: {
                 // a lock file left behind means the last session didn't exit cleanly
                 let (lock, auto) = (autosave_dir().join("session.lock"), autosave_dir().join("autosave.rblend"));
@@ -1196,7 +1203,15 @@ impl App {
                     names(&self.ed.selection).join(", "),
                     self.ed.active.map(|a| names(&[a]).join("")).unwrap_or_else(|| "none".into()),
                     self.ed.frame,
-                    if self.ed.edit.is_some() { "edit" } else { "object" }
+                    if self.ed.edit.is_some() {
+                        "edit"
+                    } else if self.ed.sculpt.is_some() {
+                        "sculpt"
+                    } else if self.ed.pose.is_some() {
+                        "pose"
+                    } else {
+                        "object"
+                    }
                 );
                 if self.ed.scene.objects.is_empty() {
                     s = format!("The scene is empty.\n{s}");
@@ -1266,7 +1281,7 @@ impl App {
                     let samples = args["samples"].as_u64().unwrap_or(16).clamp(1, 256) as u32;
                     let (cam, cam_name) = self.vp.render_view(&self.ed, w as f32 / h as f32);
                     let sc = crate::pathtrace::PtScene::gather(&self.ed.scene, &mut self.vp.mesh_cache, &mut self.vp.tex_cache, cam);
-                    let rgba = crate::pathtrace::render_blocking(&sc, w, h, samples);
+                    let rgba = crate::pathtrace::render_blocking(&sc, w, h, samples, args["denoise"].as_bool().unwrap_or(true));
                     crate::viewport::RenderResult { width: w, height: h, rgba, camera: cam_name, ms: t0.elapsed().as_secs_f32() * 1000.0 }
                 } else {
                     self.vp.render_image(&self.ed, w, h, transparent)
@@ -1373,6 +1388,155 @@ impl App {
         }
     }
 
+    /// UV Editor: shows the active mesh's UV layout over its texture; drag moves the selected
+    /// faces' UVs (all faces outside edit mode), the wheel scales them.
+    fn uv_window(&mut self, ctx: &egui::Context) {
+        if !self.show_uv {
+            return;
+        }
+        let mut open = true;
+        let id = self.ed.edit.as_ref().map(|s| s.obj).or(self.ed.active);
+        let mut cmd: Option<Command> = None;
+        let mut apply: Option<Vec<Vec<[f32; 2]>>> = None;
+        let mut begin_drag = false;
+        let mut end_drag = false;
+        egui::Window::new("UV Editor").open(&mut open).default_size(vec2(460.0, 520.0)).resizable(true).show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (l, m) in [("Smart UV Project", "smart"), ("Cube", "cube"), ("Sphere", "sphere"), ("Cylinder", "cylinder")] {
+                    if ui.button(l).on_hover_text("Unwrap the selected faces (edit mode) or the whole mesh").clicked() {
+                        cmd = Some(Command { action: "unwrap".into(), name: Some(m.into()), ..Default::default() });
+                    }
+                }
+                if ui.button("Checker texture").on_hover_text("Apply a checker texture to see stretching").clicked() {
+                    cmd = Some(Command { action: "set_texture".into(), name: Some("checker".into()), ..Default::default() });
+                }
+            });
+            let Some(o) = id.and_then(|i| self.ed.scene.get(i)).filter(|o| o.is_mesh()) else {
+                ui.label(RichText::new("Select a mesh object").color(theme::TEXT_DIM));
+                return;
+            };
+            let pm = o.mesh.clone().unwrap_or_else(|| o.poly());
+            let uvs: Vec<Vec<[f32; 2]>> = if pm.has_uvs() { pm.uvs.clone() } else { (0..pm.faces.len()).map(|f| crate::mesh::box_uv(&pm.verts, &pm.faces[f])).collect() };
+            let sel_faces: Vec<usize> = match &self.ed.edit {
+                Some(st) if st.obj == o.id => crate::editmesh::selected_faces(&pm, &st.sel),
+                _ => vec![],
+            };
+            ui.label(RichText::new(format!("{} · {} faces{}{}", o.name, pm.faces.len(), if pm.has_uvs() { format!(" · {} UV islands", crate::uv::islands(&pm)) } else { " · generated UVs (unwrap to edit)".into() }, if sel_faces.is_empty() { " · dragging moves all UVs" } else { "" })).small().color(theme::TEXT_DIM));
+            // background texture
+            let tex = self.ed.scene.texture(o.material.texture);
+            if let Some(t) = tex {
+                let sig = crate::textures::signature(&t.source);
+                if self.uv_bg.as_ref().is_none_or(|(i, s, _)| *i != t.id || *s != sig) {
+                    if let Some(img) = self.vp.tex_cache.get(t) {
+                        let small = if img.w > 1024 || img.h > 1024 { img.resized(1024, 1024) } else { crate::textures::TexImage { w: img.w, h: img.h, rgba: img.rgba.clone() } };
+                        let raw: Vec<u8> = small.rgba.iter().flatten().copied().collect();
+                        let h = ctx.load_texture("uv-bg", egui::ColorImage::from_rgba_unmultiplied([small.w, small.h], &raw), egui::TextureOptions::LINEAR);
+                        self.uv_bg = Some((t.id, sig, h));
+                    }
+                }
+            }
+            let side = ui.available_width().min(ui.available_height() - 4.0).max(120.0);
+            let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click_and_drag());
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 0.0, Color32::from_gray(38));
+            match (&self.uv_bg, tex) {
+                (Some((tid, _, h)), Some(t)) if *tid == t.id => {
+                    p.image(h.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha(170));
+                }
+                _ => {
+                    for k in 0..=8 {
+                        let t = k as f32 / 8.0;
+                        let c = Color32::from_gray(if k % 4 == 0 { 80 } else { 55 });
+                        p.line_segment([rect.lerp_inside(vec2(t, 0.0)), rect.lerp_inside(vec2(t, 1.0))], Stroke::new(1.0, c));
+                        p.line_segment([rect.lerp_inside(vec2(0.0, t)), rect.lerp_inside(vec2(1.0, t))], Stroke::new(1.0, c));
+                    }
+                }
+            }
+            let to_px = |q: [f32; 2]| rect.lerp_inside(vec2(q[0], q[1]));
+            let sel: std::collections::HashSet<usize> = sel_faces.iter().copied().collect();
+            for (fi, f) in uvs.iter().enumerate() {
+                let pts: Vec<egui::Pos2> = f.iter().map(|q| to_px(*q)).collect();
+                if sel.contains(&fi) {
+                    p.add(egui::Shape::convex_polygon(pts.clone(), Color32::from_rgba_unmultiplied(255, 150, 40, 60), Stroke::NONE));
+                }
+                let col = if sel.contains(&fi) { Color32::from_rgb(255, 170, 70) } else { Color32::from_white_alpha(150) };
+                let mut closed = pts.clone();
+                closed.push(pts[0]);
+                p.add(egui::Shape::line(closed, Stroke::new(1.0, col)));
+            }
+            p.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(120)), egui::StrokeKind::Inside);
+            // interaction: move / scale the selected (or all) UVs
+            let movable: Vec<usize> = if sel_faces.is_empty() { (0..uvs.len()).collect() } else { sel_faces.clone() };
+            if resp.drag_started() {
+                begin_drag = true;
+                self.uv_drag = Some(uvs.clone());
+            }
+            if let Some(base) = &self.uv_drag {
+                if resp.dragged() {
+                    let d = resp.drag_delta() / side;
+                    let mut nu = uvs.clone();
+                    let _ = base;
+                    for &f in &movable {
+                        for q in &mut nu[f] {
+                            q[0] += d.x;
+                            q[1] += d.y;
+                        }
+                    }
+                    apply = Some(nu);
+                }
+            }
+            if resp.drag_stopped() {
+                end_drag = true;
+            }
+            let scroll = if resp.hovered() { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
+            if scroll != 0.0 {
+                let f = (1.0 + scroll * 0.002).clamp(0.8, 1.25);
+                let pts: Vec<[f32; 2]> = movable.iter().flat_map(|&f| uvs[f].iter().copied()).collect();
+                let c = pts.iter().fold([0.0, 0.0], |a, b| [a[0] + b[0], a[1] + b[1]]);
+                let c = [c[0] / pts.len().max(1) as f32, c[1] / pts.len().max(1) as f32];
+                let mut nu = uvs.clone();
+                for &fi in &movable {
+                    for q in &mut nu[fi] {
+                        q[0] = c[0] + (q[0] - c[0]) * f;
+                        q[1] = c[1] + (q[1] - c[1]) * f;
+                    }
+                }
+                apply = Some(nu);
+                if !self.prop_snapshotted {
+                    begin_drag = true;
+                }
+            }
+            ui.label(RichText::new("Drag to move · wheel to scale · in edit mode only the selected faces change").small().color(theme::TEXT_DIM));
+        });
+        if let Some(c) = cmd {
+            let log = self.ed.execute(&[c]);
+            if let Some(l) = log.first() {
+                self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+            }
+        }
+        if begin_drag && !self.prop_snapshotted {
+            self.ed.snapshot();
+            self.prop_snapshotted = true;
+        }
+        if let (Some(nu), Some(id)) = (apply, id) {
+            if let Some(o) = self.ed.scene.get_mut(id) {
+                let mut pm = o.mesh.clone().unwrap_or_else(|| o.poly());
+                if nu.len() == pm.faces.len() {
+                    pm.uvs = nu;
+                    o.mesh = Some(pm);
+                    self.ed.dirty = true;
+                }
+            }
+        }
+        if end_drag {
+            self.uv_drag = None;
+            self.prop_snapshotted = false;
+        }
+        if !open {
+            self.show_uv = false;
+        }
+    }
+
     fn start_path_trace(&mut self, ctx: &egui::Context) {
         let out = self.ed.scene.output;
         let (w, h) = ((out.width as usize).clamp(16, 8192), (out.height as usize).clamp(16, 8192));
@@ -1380,7 +1544,7 @@ impl App {
         let t0 = Instant::now();
         let sc = crate::pathtrace::PtScene::gather(&self.ed.scene, &mut self.vp.mesh_cache, &mut self.vp.tex_cache, cam);
         let c = ctx.clone();
-        let job = crate::pathtrace::start(sc, w, h, out.samples.clamp(1, 4096), move || c.request_repaint());
+        let job = crate::pathtrace::start(sc, w, h, out.samples.clamp(1, 4096), out.denoise, move || c.request_repaint());
         let blank = vec![0u8; w * h * 4];
         let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &blank);
         let tex = ctx.load_texture("f12-render", img, egui::TextureOptions::LINEAR);
@@ -1477,6 +1641,7 @@ impl App {
                     if out.engine == crate::scene::Engine::PathTraced {
                         ui.label("Samples");
                         ui.add(egui::DragValue::new(&mut out.samples).range(1..=4096));
+                        ui.checkbox(&mut out.denoise, "Denoise").on_hover_text("Edge-aware denoiser guided by surface colour and normals: clean images from few samples");
                         let running = self.render.as_ref().is_some_and(|r| r.job.is_some());
                         if running && ui.button("⏹ Stop").clicked() {
                             if let Some(rv) = self.render.as_mut() {
@@ -1631,9 +1796,12 @@ impl App {
             .is_some_and(|p| self.vp.rect().contains(p));
         if !typing && over_vp && c(M::COMMAND, Key::Tab) {
             ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+            let arm_active = self.ed.active.and_then(|id| self.ed.scene.get(id)).is_some_and(|o| o.armature.is_some());
             let r = if self.ed.sculpt.is_some() {
                 self.ed.sculpt = None;
                 Ok("Object mode".to_string())
+            } else if self.ed.pose.is_some() || arm_active {
+                self.ed.toggle_pose()
             } else {
                 let log = self.ed.execute(&[Command::new("sculpt_mode")]);
                 let l = log.first().cloned().unwrap_or_default();
@@ -1880,6 +2048,17 @@ impl App {
                                 if ui.button("Bevel Edges   Ctrl+B").clicked() {
                                     tool = Some("bevel");
                                 }
+                                ui.menu_button("UV Unwrap   U", |ui| {
+                                    for (l, m) in [("Smart UV Project", "smart"), ("Cube Projection", "cube"), ("Sphere Projection", "sphere"), ("Cylinder Projection", "cylinder")] {
+                                        if ui.button(l).clicked() {
+                                            self.ed.execute(&[Command { action: "unwrap".into(), name: Some(m.into()), ..Default::default() }]);
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                                if ui.button("UV Editor…").clicked() {
+                                    self.show_uv = true;
+                                }
                                 if ui.button("Loop Cut   Ctrl+R").clicked() {
                                     tool = Some("loopcut");
                                 }
@@ -1964,6 +2143,39 @@ impl App {
                             if ui.button("Shade Flat").clicked() {
                                 self.ed.execute(&[Command::new("flat")]);
                             }
+                            if ui.button("Shade Auto Smooth").clicked() {
+                                self.ed.execute(&[Command::new("auto_smooth")]);
+                            }
+                            if ui.button("UV Editor…").clicked() {
+                                self.show_uv = true;
+                            }
+                            if ui.button("Smart UV Project").clicked() {
+                                self.ed.execute(&[Command { action: "unwrap".into(), name: Some("smart".into()), ..Default::default() }]);
+                            }
+                            ui.separator();
+                            ui.menu_button("Rig", |ui| {
+                                for n in [2usize, 3, 4, 6, 8] {
+                                    if ui.button(format!("Auto Rig · {n} bones")).on_hover_text("Add an armature fitted to the active mesh and bind it with automatic weights").clicked() {
+                                        let log = self.ed.execute(&[Command { action: "rig".into(), number: Some(n as f64), ..Default::default() }]);
+                                        if let Some(l) = log.first() {
+                                            self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                ui.label(RichText::new("Or select meshes, then the armature, and Ctrl+P (automatic weights). Ctrl+Tab on the armature for Pose Mode.").small().color(theme::TEXT_DIM));
+                            });
+                            ui.menu_button("Boolean (active ◂ selected)", |ui| {
+                                for (label, op) in [("Difference (cut out)", "difference"), ("Union (join)", "union"), ("Intersect", "intersect")] {
+                                    if ui.button(label).on_hover_text("Changes the active object using the other selected objects, which are then hidden in a \"Cutters\" collection").clicked() {
+                                        let log = self.ed.execute(&[Command { action: "boolean".into(), name: Some(op.into()), ..Default::default() }]);
+                                        if let Some(l) = log.first() {
+                                            self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                            });
                             ui.separator();
                             if ui.button("Insert Keyframe   I").clicked() {
                                 self.ed.insert_keyframes();
@@ -2148,6 +2360,18 @@ impl App {
                 self.add_special(kind);
                 ui.close();
             }
+        }
+        ui.separator();
+        ui.label(RichText::new("Armature").color(theme::TEXT_DIM).small());
+        if ui.button("🏃  Single Bone").clicked() {
+            let at = self.vp.cursor;
+            self.ed.execute(&[Command { action: "add".into(), primitive: Some("armature".into()), location: Some(serde_json::json!([at.x, at.y, at.z])), ..Default::default() }]);
+            ui.close();
+        }
+        if ui.button("🏃  Bone Chain (4)").clicked() {
+            let at = self.vp.cursor;
+            self.ed.execute(&[Command { action: "add".into(), primitive: Some("armature".into()), number: Some(4.0), location: Some(serde_json::json!([at.x, at.y, at.z])), ..Default::default() }]);
+            ui.close();
         }
     }
 
@@ -3226,6 +3450,7 @@ impl App {
                         crate::scene::ObjectKind::Camera(_) => {
                             ("🎥", Color32::from_rgb(140, 200, 255))
                         }
+                        crate::scene::ObjectKind::Armature => ("🏃", Color32::from_rgb(170, 220, 170)),
                     };
                     p.text(
                         rect.left_center() + vec2(14.0, 0.0),
@@ -3453,16 +3678,21 @@ impl App {
                         _ => {}
                     }
                     if let Some(spec) = tex_action {
-                        let spec = if spec == "<load>" {
-                            match rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file() {
-                                Some(p) => p.display().to_string(),
-                                None => String::new(),
-                            }
-                        } else {
-                            spec
+                        let pick = || match rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file() {
+                            Some(p) => p.display().to_string(),
+                            None => String::new(),
+                        };
+                        let (cmd, spec) = match spec.as_str() {
+                            "<load>" => ("set_texture", pick()),
+                            "<load-normal>" => ("bump", pick()),
+                            "<load-rough>" => ("roughness_map", pick()),
+                            "<bump>" => ("bump", "auto".into()),
+                            "<bump-invert>" => ("bump", "invert".into()),
+                            "<rough>" => ("roughness_map", "auto".into()),
+                            _ => ("set_texture", spec),
                         };
                         if !spec.is_empty() {
-                            let log = self.ed.execute(&[Command { action: "set_texture".into(), target: Some(o.name.clone()), name: Some(spec), ..Default::default() }]);
+                            let log = self.ed.execute(&[Command { action: cmd.into(), target: Some(o.name.clone()), name: Some(spec), ..Default::default() }]);
                             if let Some(l) = log.first() {
                                 self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::ERR });
                             }
@@ -4483,6 +4713,7 @@ fn object_props(ui: &mut Ui, o: &mut crate::scene::Object) {
             });
         }
         crate::scene::ObjectKind::Mesh => {}
+        crate::scene::ObjectKind::Armature => armature_props(ui, o),
     }
     if o.is_mesh() {
         section(ui, "Mesh", |ui| {
@@ -4717,7 +4948,84 @@ fn material_props(ui: &mut Ui, o: &mut crate::scene::Object, textures: &[crate::
             ui.label(RichText::new("The base colour tints the texture (white = original colours). Seen in Material Preview and F12 renders.").small().color(theme::TEXT_DIM));
         }
     });
+    section(ui, "Surface Detail", |ui| {
+        let name_of = |id: u32| textures.iter().find(|t| t.id == id).map(|t| t.name.clone()).unwrap_or_else(|| "None".into());
+        ui.horizontal(|ui| {
+            ui.label("Normal");
+            egui::ComboBox::from_id_salt("normal_pick").selected_text(name_of(o.material.normal_tex)).show_ui(ui, |ui| {
+                ui.selectable_value(&mut o.material.normal_tex, 0, "None");
+                for t in textures {
+                    ui.selectable_value(&mut o.material.normal_tex, t.id, &t.name);
+                }
+            });
+            if ui.button("Load…").on_hover_text("Load a normal map image (or any picture: a bump map is made from it)").clicked() {
+                action = Some("<load-normal>".to_string());
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.add_enabled(o.material.texture != 0, egui::Button::new("Bumps from texture")).on_hover_text("Generate a normal map from the colour texture (dark = low)").clicked() {
+                action = Some("<bump>".to_string());
+            }
+            if ui.add_enabled(o.material.texture != 0, egui::Button::new("Inverted")).on_hover_text("Generate it with light = low").clicked() {
+                action = Some("<bump-invert>".to_string());
+            }
+        });
+        if o.material.normal_tex != 0 {
+            ui.add(egui::Slider::new(&mut o.material.normal_strength, 0.0..=4.0).text("Strength"));
+        }
+        ui.horizontal(|ui| {
+            ui.label("Roughness");
+            egui::ComboBox::from_id_salt("rough_pick").selected_text(name_of(o.material.rough_tex)).show_ui(ui, |ui| {
+                ui.selectable_value(&mut o.material.rough_tex, 0, "None");
+                for t in textures {
+                    ui.selectable_value(&mut o.material.rough_tex, t.id, &t.name);
+                }
+            });
+            if ui.button("Load…").on_hover_text("Load a roughness map (grey) or a glTF metallic-roughness map").clicked() {
+                action = Some("<load-rough>".to_string());
+            }
+        });
+        if o.material.texture != 0 && ui.button("Roughness from texture").on_hover_text("Rough in the grooves, shinier on top").clicked() {
+            action = Some("<rough>".to_string());
+        }
+        ui.label(RichText::new("Normal maps show in Material Preview; roughness maps in path-traced renders.").small().color(theme::TEXT_DIM));
+    });
     action
+}
+
+fn armature_props(ui: &mut Ui, o: &mut crate::scene::Object) {
+    let Some(arm) = o.armature.as_mut() else { return };
+    section(ui, "Armature", |ui| {
+        ui.checkbox(&mut arm.rest_position, "Rest Position");
+        if ui.button("Reset Pose").clicked() {
+            arm.reset_pose();
+        }
+        let keyed = arm.bones.iter().filter(|b| !b.keys.is_empty()).count();
+        ui.label(RichText::new(format!("{} bones{}", arm.bones.len(), if keyed > 0 { format!(", {keyed} animated") } else { String::new() })).small().color(theme::TEXT_DIM));
+    });
+    section(ui, "Bones (pose)", |ui| {
+        egui::ScrollArea::vertical().max_height(260.0).id_salt("bones").show(ui, |ui| {
+            for b in arm.bones.iter_mut() {
+                let mut e = b.pose.euler_deg();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&b.name).small()).on_hover_text("Rotation in the bone's own axes (°)");
+                });
+                ui.horizontal(|ui| {
+                    let mut ch = false;
+                    for (k, l) in ["X", "Y", "Z"].iter().enumerate() {
+                        ch |= ui.add(egui::DragValue::new(&mut e[k]).speed(0.5).prefix(format!("{l} ")).suffix("°").max_decimals(1)).changed();
+                    }
+                    if ch {
+                        b.pose.set_euler_deg(e);
+                    }
+                    if ui.small_button("⟲").on_hover_text("Clear").clicked() {
+                        b.pose = Default::default();
+                    }
+                });
+            }
+        });
+        ui.label(RichText::new("Pose Mode (Ctrl+Tab): click a bone, R rotate, G move, I keyframe.").small().color(theme::TEXT_DIM));
+    });
 }
 
 fn short_model(m: &str) -> &str {
@@ -4787,6 +5095,7 @@ impl eframe::App for App {
             self.render_now(&ctx);
         }
         self.render_window(&ctx);
+        self.uv_window(&ctx);
 
         let title = format!(
             "Rust Blender{}{}",

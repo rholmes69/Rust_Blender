@@ -64,6 +64,16 @@ pub struct Material {
     /// UV repeats of the texture.
     #[serde(default = "one")]
     pub tex_scale: f32,
+    /// Tangent-space normal map (texture id; 0 = none), same UVs and repeats as `texture`.
+    #[serde(default)]
+    pub normal_tex: u32,
+    /// Bump strength of the normal map.
+    #[serde(default = "one")]
+    pub normal_strength: f32,
+    /// Roughness / metallic map (glTF layout: G = roughness, B = metallic; a grey image works
+    /// as a roughness map), multiplied with `roughness` and `metallic`.
+    #[serde(default)]
+    pub rough_tex: u32,
 }
 
 fn one() -> f32 {
@@ -80,6 +90,9 @@ impl Default for Material {
             alpha: 1.0,
             texture: 0,
             tex_scale: 1.0,
+            normal_tex: 0,
+            normal_strength: 1.0,
+            rough_tex: 0,
         }
     }
 }
@@ -166,6 +179,8 @@ pub enum ObjectKind {
     Mesh,
     Light(Light),
     Camera(CameraData),
+    /// Bones live in `Object::armature`.
+    Armature,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -199,6 +214,17 @@ pub struct Object {
     /// Collection id (0 = the Scene Collection itself).
     #[serde(default)]
     pub collection: u32,
+    /// Bones (armature objects only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armature: Option<crate::armature::Armature>,
+    /// Skin weights: the mesh is deformed by an armature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skin: Option<crate::armature::Skin>,
+    /// Deformed mesh for the current pose (derived, see `Scene::update_skins`).
+    #[serde(skip)]
+    pub posed: Option<std::sync::Arc<crate::mesh::PolyMesh>>,
+    #[serde(skip)]
+    pub posed_key: u64,
 }
 
 /// A named group of objects (like Blender's collections), shown as a folder in the outliner.
@@ -264,6 +290,7 @@ impl Object {
             ObjectKind::Mesh => self.primitive.label().to_string(),
             ObjectKind::Light(l) => format!("{} Light", l.light_type.label()),
             ObjectKind::Camera(_) => "Camera".into(),
+            ObjectKind::Armature => format!("Armature, {} bones", self.armature.as_ref().map(|a| a.bones.len()).unwrap_or(0)),
         }
     }
 
@@ -315,9 +342,15 @@ impl Object {
         if let Some(t) = sample_keys(&self.keyframes, frame) {
             self.transform = t;
         }
+        if let Some(a) = self.armature.as_mut() {
+            a.evaluate(frame as f32);
+        }
     }
 
     pub fn insert_keyframe(&mut self, frame: i32) {
+        if let Some(a) = self.armature.as_mut() {
+            a.insert_keys(frame);
+        }
         self.keyframes.retain(|k| k.frame != frame);
         self.keyframes.push(Keyframe {
             frame,
@@ -398,6 +431,8 @@ pub struct Output {
     pub engine: Engine,
     /// Path tracer samples per pixel.
     pub samples: u32,
+    /// Denoise path traced renders.
+    pub denoise: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -412,7 +447,7 @@ pub enum Engine {
 
 impl Default for Output {
     fn default() -> Self {
-        Self { width: 1920, height: 1080, transparent: false, engine: Engine::Fast, samples: 64 }
+        Self { width: 1920, height: 1080, transparent: false, engine: Engine::Fast, samples: 32, denoise: true }
     }
 }
 
@@ -566,8 +601,64 @@ impl Scene {
             auto_smooth: 0.0,
             parent: None,
             collection: 0,
+            armature: None,
+            skin: None,
+            posed: None,
+            posed_key: 0,
         });
         id
+    }
+
+    pub fn add_armature(&mut self, arm: crate::armature::Armature, name: Option<&str>) -> u64 {
+        let id = self.add(Primitive::Cube, Some(name.unwrap_or("Armature")));
+        let o = self.get_mut(id).unwrap();
+        o.kind = ObjectKind::Armature;
+        o.armature = Some(arm);
+        id
+    }
+
+    /// Recompute the deformed meshes of skinned objects whose armature pose (or transforms)
+    /// changed. Cheap when nothing moved.
+    pub fn update_skins(&mut self) {
+        use std::hash::{Hash, Hasher};
+        if !self.objects.iter().any(|o| o.skin.is_some()) {
+            return;
+        }
+        let arms: Vec<(u64, Mat4, crate::armature::Armature)> =
+            self.objects.iter().filter_map(|o| o.armature.as_ref().map(|a| (o.id, o.transform.matrix(), a.clone()))).collect();
+        for o in self.objects.iter_mut().filter(|o| o.skin.is_some()) {
+            let skin = o.skin.as_ref().unwrap();
+            let Some((_, aw, arm)) = arms.iter().find(|(id, _, _)| *id == skin.armature) else {
+                o.posed = None;
+                continue;
+            };
+            let Some(pm) = o.mesh.as_ref() else {
+                o.posed = None;
+                continue;
+            };
+            if !skin.valid_for(pm, arm) {
+                // topology changed (edit mode) or bones changed: the weights no longer apply
+                o.posed = None;
+                continue;
+            }
+            let om = o.transform.matrix();
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for m in arm.pose_globals().iter().chain([aw, &om]) {
+                for f in m.to_cols_array() {
+                    f.to_bits().hash(&mut h);
+                }
+            }
+            pm.verts.len().hash(&mut h);
+            for v in pm.verts.iter().step_by((pm.verts.len() / 64).max(1)) {
+                (v.x.to_bits(), v.y.to_bits(), v.z.to_bits()).hash(&mut h);
+            }
+            let key = h.finish();
+            if o.posed.is_some() && o.posed_key == key {
+                continue;
+            }
+            o.posed = Some(std::sync::Arc::new(crate::armature::deform(pm, skin, arm, *aw, om)));
+            o.posed_key = key;
+        }
     }
 
     pub fn add_light(&mut self, t: LightType, name: Option<&str>) -> u64 {
@@ -672,6 +763,18 @@ impl Scene {
                     if let Some(c) = self.collections.iter().find(|c| c.id == o.collection) {
                         x += &format!(" collection=\"{}\"", c.name);
                     }
+                    if let Some(sk) = &o.skin {
+                        if let Some(a) = self.get(sk.armature) {
+                            x += &format!(" rigged_to=\"{}\"", a.name);
+                        }
+                    }
+                    if let Some(a) = &o.armature {
+                        let names: Vec<&str> = a.bones.iter().take(16).map(|b| b.name.as_str()).collect();
+                        x += &format!(" bones=[{}{}]", names.join(", "), if a.bones.len() > 16 { ", …" } else { "" });
+                        if a.has_keys() {
+                            x += " (animated)";
+                        }
+                    }
                     x
                 },
                 if o.keyframes.is_empty() {
@@ -719,7 +822,7 @@ impl Scene {
 pub struct MeshCache {
     map: HashMap<(Primitive, u32, bool), Mesh>,
     /// object id (and whether it's the cage) -> (source mesh, smooth, subsurf levels, auto smooth, result)
-    custom: HashMap<(u64, bool), (Option<crate::mesh::PolyMesh>, (Primitive, u32), bool, u32, u32, Mesh)>,
+    custom: HashMap<(u64, bool), (Option<crate::mesh::PolyMesh>, (Primitive, u32), bool, u32, u32, u64, Mesh)>,
 }
 
 impl MeshCache {
@@ -744,19 +847,23 @@ impl MeshCache {
         let smooth = o.smooth();
         let levels = if cage { 0 } else { o.subsurf_levels() };
         let auto = (o.auto_smooth * 100.0).round() as u32;
-        if o.mesh.is_none() && levels == 0 && auto == 0 {
+        if o.mesh.is_none() && levels == 0 && auto == 0 && o.posed.is_none() {
             return self.get(o.primitive, o.detail, smooth).clone();
         }
         let prim = (o.primitive, o.detail);
-        if let Some((src, p, s, l, a, m)) = self.custom.get(&(o.id, cage)) {
-            if *src == o.mesh && *p == prim && *s == smooth && *l == levels && *a == auto {
+        let key2 = if !cage && o.posed.is_some() { o.posed_key } else { 0 };
+        if let Some((src, p, s, l, a, k, m)) = self.custom.get(&(o.id, cage)) {
+            if *src == o.mesh && *p == prim && *s == smooth && *l == levels && *a == auto && *k == key2 {
                 return m.clone();
             }
         }
-        let base = o.poly();
+        let base = match (&o.posed, cage) {
+            (Some(p), false) => (**p).clone(),
+            _ => o.poly(),
+        };
         let pm = if levels > 0 { crate::editmesh::subdivide_surface(&base, levels) } else { base };
         let m = pm.to_mesh_opts(smooth, o.auto_smooth);
-        self.custom.insert((o.id, cage), (o.mesh.clone(), prim, smooth, levels, auto, m.clone()));
+        self.custom.insert((o.id, cage), (o.mesh.clone(), prim, smooth, levels, auto, key2, m.clone()));
         m
     }
 }

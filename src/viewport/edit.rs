@@ -342,6 +342,9 @@ impl Viewport {
             self.begin_inset(ed, mouse);
         } else if c(M::COMMAND, Key::R) {
             self.loopcut = Some(1);
+        } else if c(M::NONE, Key::U) {
+            self.report(ed.execute(&[crate::editor::Command { action: "unwrap".into(), name: Some("smart".into()), ..Default::default() }]).first().cloned().map(|l| if l.starts_with('✔') { Ok(l) } else { Err(l) }).unwrap_or(Ok(String::new())));
+            self.flash = Some(("Smart UV Project".into(), std::time::Instant::now()));
         } else if c(M::COMMAND, Key::B) {
             self.begin_bevel(ed, mouse);
         } else if c(M::NONE, Key::O) {

@@ -21,6 +21,8 @@ pub struct ImportStats {
     pub triangles: usize,
     /// Things that were skipped (animations, skins, unsupported primitives …).
     pub notes: Vec<String>,
+    /// Imported animation summary.
+    pub animation: Option<String>,
 }
 
 impl ImportStats {
@@ -34,6 +36,9 @@ impl ImportStats {
         }
         if self.cameras > 0 {
             s += &format!(", {} camera(s)", self.cameras);
+        }
+        if let Some(a) = &self.animation {
+            s += &format!(", {a}");
         }
         if !self.notes.is_empty() {
             s += &format!(" (skipped: {})", self.notes.join("; "));
@@ -293,7 +298,12 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
             let e: Vec<f32> = e.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
             let strength = m["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"].as_f64().unwrap_or(1.0) as f32;
             let mx = e.iter().copied().fold(0.0, f32::max);
-            if mx > 0.0 {
+            if m["emissiveTexture"].is_object() {
+                // emission maps aren't supported: a uniform glow would wash the whole object out
+                if !stats.notes.iter().any(|n| n == "emission textures") {
+                    stats.notes.push("emission textures".into());
+                }
+            } else if mx > 0.0 {
                 mat.emission = mx * strength;
                 if f[..3].iter().all(|c| *c > 0.99) {
                     mat.color = [srgb(e[0] / mx), srgb(e[1] / mx), srgb(e[2] / mx)];
@@ -311,6 +321,18 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
                 }
             } else {
                 stats.notes.push("textures on a second UV set".into());
+            }
+        }
+        let tc0 = |t: &serde_json::Value| t["texCoord"].as_u64().unwrap_or(0) == 0;
+        if let Some(ti) = m["normalTexture"]["index"].as_u64().filter(|_| tc0(&m["normalTexture"])) {
+            if let Some(id) = texture(scene, &mut stats, ti as usize) {
+                mat.normal_tex = id;
+                mat.normal_strength = m["normalTexture"]["scale"].as_f64().unwrap_or(1.0) as f32;
+            }
+        }
+        if let Some(ti) = pbr["metallicRoughnessTexture"]["index"].as_u64().filter(|_| tc0(&pbr["metallicRoughnessTexture"])) {
+            if let Some(id) = texture(scene, &mut stats, ti as usize) {
+                mat.rough_tex = id;
             }
         }
         materials.push(mat);
@@ -339,6 +361,8 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
     let mut stack: Vec<(usize, Mat4, usize, Option<u64>)> = roots.into_iter().map(|r| (r, Mat4::IDENTITY, 0, None)).collect();
     let fix_inv = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2).inverse();
     let mut seen = 0usize;
+    let mut node_ids: HashMap<usize, Vec<u64>> = HashMap::new();
+    let mut pending_skins: Vec<(u64, usize, Vec<([u16; 4], [f32; 4])>)> = vec![];
     while let Some((ni, parent, depth, parent_obj)) = stack.pop() {
         let mut node_obj: Option<u64> = None;
         let first_new = new_ids.len();
@@ -401,7 +425,28 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
                     dev / (tris.len().min(2000) * 3) as f32 > 0.002
                 });
                 let (lo, hi) = pm.verts.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(*v), h.max(*v)));
-                pm.weld(((hi - lo).max_element() * 1e-5).max(1e-7));
+                let eps = ((hi - lo).max_element() * 1e-5).max(1e-7);
+                // skin weights per position (welding keeps the first vertex at each position)
+                let skin_of_node = n["skin"].as_u64().map(|x| x as usize);
+                let mut vweights: Option<HashMap<(i64, i64, i64), ([u16; 4], [f32; 4])>> = None;
+                if skin_of_node.is_some() {
+                    if let (Some(ja), Some(wa)) = (p["attributes"]["JOINTS_0"].as_u64(), p["attributes"]["WEIGHTS_0"].as_u64()) {
+                        let (jv, _) = doc.floats(ja as usize)?;
+                        let (wv, _) = doc.floats(wa as usize)?;
+                        let q = |f: f32| (f / eps).round() as i64;
+                        let mut map = HashMap::new();
+                        for (i, v) in pm.verts.iter().enumerate() {
+                            if jv.len() < i * 4 + 4 || wv.len() < i * 4 + 4 {
+                                break;
+                            }
+                            let j = [0, 1, 2, 3].map(|k| jv[i * 4 + k] as u16);
+                            let w = [0, 1, 2, 3].map(|k| wv[i * 4 + k]);
+                            map.entry((q(v.x), q(v.y), q(v.z))).or_insert((j, w));
+                        }
+                        vweights = Some(map);
+                    }
+                }
+                pm.weld(eps);
                 merge_quads(&mut pm);
                 stats.triangles += tris.len();
                 let id = scene.add(crate::mesh::Primitive::Cube, Some(&base_name));
@@ -416,6 +461,13 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
                 o.transform.location = icv(t);
                 o.transform.set_quat(icq(r));
                 o.transform.scale = ics(s);
+                if let (Some(si), Some(map)) = (skin_of_node, vweights) {
+                    // skinned meshes are placed by their joints, not by their node
+                    o.transform = crate::scene::Transform::default();
+                    let q = |f: f32| (f / eps).round() as i64;
+                    let jw: Vec<([u16; 4], [f32; 4])> = pm_verts_of(o).iter().map(|v| map.get(&(q(v.x), q(v.y), q(v.z))).copied().unwrap_or(([0; 4], [0.0; 4]))).collect();
+                    pending_skins.push((id, si, jw));
+                }
                 stats.meshes += 1;
                 new_ids.push(id);
             }
@@ -472,6 +524,7 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
                 o.parent = p;
             }
         }
+        node_ids.insert(ni, new_ids[first_new..].to_vec());
         let carry = node_obj.or(parent_obj);
         for c in n["children"].as_array().into_iter().flatten().rev() {
             if let Some(c) = c.as_u64() {
@@ -479,18 +532,368 @@ pub fn import_bytes(scene: &mut Scene, bytes: &[u8], base: Option<&Path>) -> Res
             }
         }
     }
-    if j["animations"].as_array().is_some_and(|a| !a.is_empty()) {
-        stats.notes.push("animations".into());
-    }
-    if j["skins"].as_array().is_some_and(|a| !a.is_empty()) {
-        stats.notes.push("skinning (imported in rest pose)".into());
-    }
+    let fps = scene.fps.max(1) as f32;
+    skins_and_animation(scene, &doc, &nodes, &node_ids, pending_skins, &mut new_ids, &mut stats, fps, fix_inv)?;
     stats.notes.sort();
     stats.notes.dedup();
     if new_ids.is_empty() {
         return Err("the file contains no meshes, lights or cameras".into());
     }
     Ok((stats, new_ids))
+}
+
+fn pm_verts_of(o: &crate::scene::Object) -> Vec<Vec3> {
+    o.mesh.as_ref().map(|m| m.verts.clone()).unwrap_or_default()
+}
+
+/// TRS of a node (from its matrix if it has one).
+fn node_trs(n: &Value) -> (Vec3, Quat, Vec3) {
+    let (s, r, t) = local_matrix(n).to_scale_rotation_translation();
+    (t, r, s)
+}
+
+/// Sample an animation sampler at time `t` (LINEAR / STEP / CUBICSPLINE).
+fn sample_channel(times: &[f32], vals: &[f32], ncomp: usize, interp: &str, t: f32) -> Vec<f32> {
+    let cubic = interp == "CUBICSPLINE";
+    let stride = if cubic { ncomp * 3 } else { ncomp };
+    let at = |k: usize| -> Vec<f32> {
+        let o = k * stride + if cubic { ncomp } else { 0 };
+        (0..ncomp).map(|c| vals.get(o + c).copied().unwrap_or(0.0)).collect()
+    };
+    if times.is_empty() {
+        return vec![0.0; ncomp];
+    }
+    if t <= times[0] {
+        return at(0);
+    }
+    let last = times.len() - 1;
+    if t >= times[last] {
+        return at(last);
+    }
+    let k = times.partition_point(|x| *x <= t).saturating_sub(1).min(last - 1);
+    let (t0, t1) = (times[k], times[k + 1]);
+    let dt = (t1 - t0).max(1e-6);
+    let u = ((t - t0) / dt).clamp(0.0, 1.0);
+    let (a, b) = (at(k), at(k + 1));
+    match interp {
+        "STEP" => a,
+        "CUBICSPLINE" => {
+            let out_t = |k: usize| -> Vec<f32> { (0..ncomp).map(|c| vals.get(k * stride + 2 * ncomp + c).copied().unwrap_or(0.0) * dt).collect() };
+            let in_t = |k: usize| -> Vec<f32> { (0..ncomp).map(|c| vals.get(k * stride + c).copied().unwrap_or(0.0) * dt).collect() };
+            let (m0, m1) = (out_t(k), in_t(k + 1));
+            let (u2, u3) = (u * u, u * u * u);
+            (0..ncomp)
+                .map(|c| (2.0 * u3 - 3.0 * u2 + 1.0) * a[c] + (u3 - 2.0 * u2 + u) * m0[c] + (-2.0 * u3 + 3.0 * u2) * b[c] + (u3 - u2) * m1[c])
+                .collect()
+        }
+        _ => {
+            if ncomp == 4 {
+                let qa = Quat::from_xyzw(a[0], a[1], a[2], a[3]).normalize();
+                let qb = Quat::from_xyzw(b[0], b[1], b[2], b[3]).normalize();
+                let q = qa.slerp(qb, u);
+                vec![q.x, q.y, q.z, q.w]
+            } else {
+                (0..ncomp).map(|c| a[c] + (b[c] - a[c]) * u).collect()
+            }
+        }
+    }
+}
+
+/// Skins → armature objects with bound meshes; the first animation → object keyframes and
+/// bone keys, baked per frame.
+#[allow(clippy::too_many_arguments)]
+fn skins_and_animation(
+    scene: &mut Scene,
+    doc: &Doc,
+    nodes: &[Value],
+    node_ids: &HashMap<usize, Vec<u64>>,
+    pending_skins: Vec<(u64, usize, Vec<([u16; 4], [f32; 4])>)>,
+    new_ids: &mut Vec<u64>,
+    stats: &mut ImportStats,
+    fps: f32,
+    fix_inv: Quat,
+) -> Result<(), String> {
+    use crate::armature::{Armature, Bone, BoneKey, BonePose, Skin};
+    let j = &doc.json;
+    let nn = nodes.len();
+    let mut parent_of: Vec<Option<usize>> = vec![None; nn];
+    for (i, n) in nodes.iter().enumerate() {
+        for c in n["children"].as_array().into_iter().flatten() {
+            if let Some(c) = c.as_u64().map(|c| c as usize).filter(|c| *c < nn) {
+                parent_of[c] = Some(i);
+            }
+        }
+    }
+    let world = |locals: &[Mat4], i: usize| -> Mat4 {
+        let mut m = locals[i];
+        let mut p = parent_of[i];
+        let mut guard = 0;
+        while let Some(pi) = p {
+            m = locals[pi] * m;
+            p = parent_of[pi];
+            guard += 1;
+            if guard > 128 {
+                break;
+            }
+        }
+        m
+    };
+    let conv = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let cv = |m: Mat4| conv * m * conv.inverse();
+    let static_locals: Vec<Mat4> = nodes.iter().map(local_matrix).collect();
+
+    // ---- skins → armatures ----
+    // per skin: (armature object, joint nodes in bone order, bone index of each skin joint)
+    let mut arms: Vec<Option<(u64, Vec<usize>, Vec<usize>)>> = vec![];
+    let used: std::collections::HashSet<usize> = pending_skins.iter().map(|p| p.1).collect();
+    for (si, sk) in j["skins"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+        if !used.contains(&si) {
+            arms.push(None);
+            continue;
+        }
+        let joints: Vec<usize> = sk["joints"].as_array().into_iter().flatten().filter_map(|v| v.as_u64().map(|x| x as usize)).filter(|x| *x < nn).collect();
+        if joints.is_empty() || joints.len() > 1024 {
+            arms.push(None);
+            continue;
+        }
+        let ibm: Vec<Mat4> = match sk["inverseBindMatrices"].as_u64() {
+            Some(a) => {
+                let (f, _) = doc.floats(a as usize)?;
+                f.chunks_exact(16).map(Mat4::from_cols_slice).collect()
+            }
+            None => vec![Mat4::IDENTITY; joints.len()],
+        };
+        let depth = |mut i: usize| {
+            let mut d = 0;
+            while let Some(p) = parent_of[i] {
+                i = p;
+                d += 1;
+                if d > 128 {
+                    break;
+                }
+            }
+            d
+        };
+        let mut order: Vec<usize> = (0..joints.len()).collect();
+        order.sort_by_key(|k| depth(joints[*k]));
+        let bone_nodes: Vec<usize> = order.iter().map(|k| joints[*k]).collect();
+        let mut bone_of_skin_joint = vec![0usize; joints.len()];
+        for (bi, k) in order.iter().enumerate() {
+            bone_of_skin_joint[*k] = bi;
+        }
+        let parent_joint = |n: usize| -> Option<usize> {
+            let mut p = parent_of[n];
+            while let Some(pi) = p {
+                if let Some(b) = bone_nodes.iter().position(|x| *x == pi) {
+                    return Some(b);
+                }
+                p = parent_of[pi];
+            }
+            None
+        };
+        let gw: Vec<Mat4> = bone_nodes.iter().map(|n| cv(world(&static_locals, *n))).collect();
+        let mut bones: Vec<Bone> = vec![];
+        for (bi, &n) in bone_nodes.iter().enumerate() {
+            let parent = parent_joint(n);
+            let local = match parent {
+                Some(p) => gw[p].inverse() * gw[bi],
+                None => gw[bi],
+            };
+            bones.push(Bone {
+                name: nodes[n]["name"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| format!("Bone.{bi:03}")),
+                parent,
+                rest: BonePose::from_matrix(local),
+                length: 0.0,
+                tail: None,
+                pose: BonePose::default(),
+                keys: vec![],
+            });
+        }
+        // tails: towards the (first) child joint; leaf bones continue their parent's direction
+        let size = gw.iter().map(|m| m.w_axis.truncate()).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), p| (l.min(p), h.max(p)));
+        let span = (size.1 - size.0).max_element().max(1e-3);
+        for bi in 0..bones.len() {
+            let kids: Vec<usize> = (0..bones.len()).filter(|k| bones[*k].parent == Some(bi)).collect();
+            let inv = gw[bi].inverse();
+            let tail = if let Some(&k) = kids.first() {
+                let t = inv.transform_point3(gw[k].w_axis.truncate());
+                (t.length() > span * 1e-3).then_some(t)
+            } else {
+                None
+            };
+            let tail = tail.unwrap_or_else(|| {
+                let dir = match bones[bi].parent {
+                    Some(p) => inv.transform_vector3(gw[bi].w_axis.truncate() - gw[p].w_axis.truncate()),
+                    None => Vec3::Y,
+                };
+                let len = bones[bi].parent.and_then(|p| bones.get(p)).map(|p| p.length * 0.6).filter(|l| *l > 0.0).unwrap_or(span * 0.1);
+                dir.normalize_or(Vec3::Y) * len
+            });
+            bones[bi].length = tail.length();
+            bones[bi].tail = Some(tail);
+        }
+        let name = sk["name"].as_str().filter(|s| !s.is_empty()).unwrap_or("Armature").to_string();
+        let arm = Armature { bones, rest_position: false };
+        let aid = scene.add_armature(arm, Some(&name));
+        new_ids.push(aid);
+        // inverse bind matrices in our space, in bone order
+        let ibm_conv: Vec<Mat4> = order.iter().map(|k| cv(ibm.get(*k).copied().unwrap_or(Mat4::IDENTITY))).collect();
+        arms.push(Some((aid, bone_nodes, bone_of_skin_joint)));
+        // bind the meshes of this skin
+        for (oid, _, jw) in pending_skins.iter().filter(|p| p.1 == si) {
+            let (_, _, map) = arms[si].as_ref().unwrap();
+            let joints: Vec<[u16; 4]> = jw.iter().map(|(j, _)| j.map(|k| map.get(k as usize).copied().unwrap_or(0) as u16)).collect();
+            let weights: Vec<[f32; 4]> = jw.iter().map(|(_, w)| { let s: f32 = w.iter().sum(); if s > 1e-6 { w.map(|x| x / s) } else { [1.0, 0.0, 0.0, 0.0] } }).collect();
+            // the mesh sits where its main joint's rest × inverse bind puts it (often the
+            // armature's or mesh node's world matrix), so it keeps its place when edited
+            let mut wsum = vec![0.0f32; ibm_conv.len()];
+            for (j4, w4) in joints.iter().zip(&weights) {
+                for k in 0..4 {
+                    if let Some(x) = wsum.get_mut(j4[k] as usize) {
+                        *x += w4[k];
+                    }
+                }
+            }
+            let main = (0..wsum.len()).max_by(|a, b| wsum[*a].partial_cmp(&wsum[*b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
+            let rest = scene.get(aid).and_then(|a| a.armature.as_ref()).map(|a| a.rest_globals()).unwrap_or_default();
+            let place = rest.get(main).map(|g| *g * ibm_conv[main]).unwrap_or(Mat4::IDENTITY);
+            if let Some(o) = scene.get_mut(*oid) {
+                o.transform = crate::scene::Transform::from_matrix(place);
+                o.skin = Some(Skin { armature: aid, joints, weights, inverse_bind: ibm_conv.clone() });
+                o.parent = Some(aid);
+            }
+        }
+    }
+
+    // ---- animation (the first one; baked per frame) ----
+    let anims = j["animations"].as_array().cloned().unwrap_or_default();
+    if anims.len() > 1 {
+        stats.notes.push(format!("{} more animation(s)", anims.len() - 1));
+    }
+    let Some(anim) = anims.first() else { return Ok(()) };
+    struct Ch {
+        node: usize,
+        path: String,
+        times: Vec<f32>,
+        vals: Vec<f32>,
+        interp: String,
+    }
+    let mut chans = vec![];
+    for c in anim["channels"].as_array().into_iter().flatten() {
+        let (Some(node), Some(path)) = (c["target"]["node"].as_u64().map(|x| x as usize), c["target"]["path"].as_str()) else { continue };
+        if node >= nn || !matches!(path, "translation" | "rotation" | "scale") {
+            if path == "weights" && !stats.notes.iter().any(|n| n == "morph targets") {
+                stats.notes.push("morph targets".into());
+            }
+            continue;
+        }
+        let smp = &anim["samplers"][c["sampler"].as_u64().unwrap_or(0) as usize];
+        let (Some(ia), Some(oa)) = (smp["input"].as_u64(), smp["output"].as_u64()) else { continue };
+        let (times, _) = doc.floats(ia as usize)?;
+        let (vals, _) = doc.floats(oa as usize)?;
+        chans.push(Ch { node, path: path.to_string(), times, vals, interp: smp["interpolation"].as_str().unwrap_or("LINEAR").to_string() });
+    }
+    if chans.is_empty() {
+        return Ok(());
+    }
+    let tmax = chans.iter().filter_map(|c| c.times.last().copied()).fold(0.0, f32::max);
+    let nframes = ((tmax * fps).round() as usize + 1).clamp(1, 5000);
+    let base_trs: Vec<(Vec3, Quat, Vec3)> = nodes.iter().map(node_trs).collect();
+    // objects to key: those whose node or an ancestor is animated (not skinned meshes)
+    let animated: std::collections::HashSet<usize> = chans.iter().map(|c| c.node).collect();
+    let moved = |mut i: usize| -> bool {
+        loop {
+            if animated.contains(&i) {
+                return true;
+            }
+            match parent_of[i] {
+                Some(p) => i = p,
+                None => return false,
+            }
+        }
+    };
+    let keyed_nodes: Vec<usize> = node_ids.keys().copied().filter(|n| moved(*n)).collect();
+    let mut obj_keys: HashMap<u64, Vec<crate::scene::Keyframe>> = HashMap::new();
+    for f in 0..nframes {
+        let t = f as f32 / fps;
+        let mut trs = base_trs.clone();
+        for c in &chans {
+            let nc = if c.path == "rotation" { 4 } else { 3 };
+            let v = sample_channel(&c.times, &c.vals, nc, &c.interp, t);
+            match c.path.as_str() {
+                "translation" => trs[c.node].0 = Vec3::new(v[0], v[1], v[2]),
+                "rotation" => trs[c.node].1 = Quat::from_xyzw(v[0], v[1], v[2], v[3]).normalize(),
+                _ => trs[c.node].2 = Vec3::new(v[0], v[1], v[2]),
+            }
+        }
+        let locals: Vec<Mat4> = trs.iter().map(|(t, r, s)| Mat4::from_scale_rotation_translation(*s, *r, *t)).collect();
+        let frame = 1 + f as i32;
+        // bones
+        for (aid, bone_nodes, _) in arms.iter().flatten() {
+            let gw: Vec<Mat4> = bone_nodes.iter().map(|n| cv(world(&locals, *n))).collect();
+            if let Some(arm) = scene.get_mut(*aid).and_then(|o| o.armature.as_mut()) {
+                for (bi, b) in arm.bones.iter_mut().enumerate() {
+                    let local = match b.parent {
+                        Some(p) => gw[p].inverse() * gw[bi],
+                        None => gw[bi],
+                    };
+                    let pose = BonePose::from_matrix(b.rest.matrix().inverse() * local);
+                    b.keys.push(BoneKey { frame, pose });
+                }
+            }
+        }
+        // objects
+        for n in &keyed_nodes {
+            let (s, r, tr) = world(&locals, *n).to_scale_rotation_translation();
+            for oid in &node_ids[n] {
+                let Some(o) = scene.get(*oid) else { continue };
+                if o.skin.is_some() {
+                    continue;
+                }
+                let special = !o.is_mesh();
+                let mut tf = crate::scene::Transform { location: icv(tr), rotation: Vec3::ZERO, scale: if special { o.transform.scale } else { ics(s) } };
+                tf.set_quat(if special { icq(r * fix_inv) } else { icq(r) });
+                obj_keys.entry(*oid).or_default().push(crate::scene::Keyframe { frame, transform: tf });
+            }
+        }
+    }
+    let mut keyed = 0;
+    for (oid, keys) in obj_keys {
+        let constant = keys.windows(2).all(|w| w[0].transform == w[1].transform);
+        if constant {
+            continue;
+        }
+        if let Some(o) = scene.get_mut(oid) {
+            o.keyframes = keys;
+            o.evaluate(1);
+            keyed += 1;
+        }
+    }
+    let mut bones_keyed = 0;
+    for (aid, _, _) in arms.iter().flatten() {
+        if let Some(a) = scene.get_mut(*aid).and_then(|o| o.armature.as_mut()) {
+            // drop bones that never move
+            for b in &mut a.bones {
+                if b.keys.windows(2).all(|w| w[0].pose == w[1].pose) {
+                    b.keys.clear();
+                } else {
+                    bones_keyed += 1;
+                }
+            }
+            a.evaluate(1.0);
+        }
+    }
+    if keyed + bones_keyed > 0 {
+        scene.frame_end = (nframes as i32).max(2);
+        stats.animation = Some(format!(
+            "animation \"{}\": {} frames{}{}",
+            anim["name"].as_str().unwrap_or("Action"),
+            nframes,
+            if keyed > 0 { format!(", {keyed} object(s)") } else { String::new() },
+            if bones_keyed > 0 { format!(", {bones_keyed} bone(s)") } else { String::new() }
+        ));
+    }
+    Ok(())
 }
 
 /// Merge pairs of coplanar triangles that form a convex quad (nicer editing and wireframes).
@@ -658,5 +1061,50 @@ mod tests {
         // glTF +Y up becomes +Z up
         assert!((o.transform.location - Vec3::new(0.0, 0.0, 5.0)).length() < 1e-6);
         assert!(import_bytes(&mut scene, b"hello", None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod anim_tests {
+    /// Khronos sample models from $RB_MODELS (skipped when unset).
+    #[test]
+    fn skins_and_animations() {
+        let Ok(dir) = std::env::var("RB_MODELS") else { return };
+        for (name, want_arm) in [("RiggedSimple", true), ("CesiumMan", true), ("Fox", true), ("RiggedFigure", true), ("BoxAnimated", false)] {
+            let mut sc = crate::scene::Scene::default();
+            sc.objects.clear();
+            let (st, _) = super::import_file(&mut sc, &std::path::Path::new(&dir).join(format!("{name}.glb"))).unwrap();
+            println!("{name}: {}", st.summary());
+            assert!(st.animation.is_some(), "{name} has an animation");
+            let arms = sc.objects.iter().filter(|o| o.armature.is_some()).count();
+            assert_eq!(arms > 0, want_arm, "{name}");
+            // bind pose consistency: rest position reproduces the mesh
+            for o in sc.objects.iter_mut().filter_map(|o| o.armature.as_mut()) {
+                o.rest_position = true;
+            }
+            sc.update_skins();
+            for o in sc.objects.iter().filter(|o| o.skin.is_some()) {
+                let p = o.posed.as_ref().expect("posed");
+                let pm = o.mesh.as_ref().unwrap();
+                let size = pm.verts.iter().fold(0.0f32, |m, v| m.max(v.length()));
+                let err = p.verts.iter().zip(&pm.verts).map(|(a, b)| a.distance(*b)).fold(0.0, f32::max);
+                println!("  {} rest error {err:.5} (size {size:.2})", o.name);
+                assert!(err < size * 0.01, "{name}: bind pose mismatch {err}");
+            }
+            for o in sc.objects.iter_mut().filter_map(|o| o.armature.as_mut()) {
+                o.rest_position = false;
+            }
+            // animation moves things
+            let snap = |sc: &mut crate::scene::Scene, f: i32| -> Vec<glam::Vec3> {
+                sc.evaluate(f);
+                sc.update_skins();
+                sc.objects.iter().flat_map(|o| o.posed.as_ref().map(|p| p.verts.clone()).unwrap_or_else(|| vec![o.transform.location])).collect()
+            };
+            let a = snap(&mut sc, 1);
+            let b = snap(&mut sc, 12);
+            let d = a.iter().zip(&b).map(|(x, y)| x.distance(*y)).fold(0.0, f32::max);
+            println!("  max motion f1→f12 {d:.3}, frames {}", sc.frame_end);
+            assert!(d > 1e-3, "{name} animates");
+        }
     }
 }

@@ -29,14 +29,16 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub text: String,
     pub is_error: bool,
+    /// Optional PNG returned as MCP image content (render_image).
+    pub image_png: Option<Vec<u8>>,
 }
 
 impl ToolResult {
     pub fn ok(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: false }
+        Self { text: text.into(), is_error: false, image_png: None }
     }
     pub fn err(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true }
+        Self { text: text.into(), is_error: true, image_png: None }
     }
 }
 
@@ -75,6 +77,11 @@ pub fn tools() -> Value {
             "name": "ask_copilot",
             "description": "Send a natural-language request to Rust Blender's own local AI Copilot (Ollama: decision model + builder). Returns immediately; the build appears live in the app.",
             "inputSchema": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}
+        },
+        {
+            "name": "render_image",
+            "description": "Render the scene through its camera (Material Preview shading with the scene lights, anti-aliased, no overlays) and return the image so you can see the result. Optional: width/height in pixels (default 960 wide at the scene's aspect), transparent background, and an absolute path to also save a PNG.",
+            "inputSchema": {"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}, "transparent": {"type": "boolean"}, "path": {"type": "string"}}}
         },
         {
             "name": "export_gltf",
@@ -120,7 +127,13 @@ pub fn handle_message(msg: &Value, client: &str, calls: &Sender<ToolCall>, wake:
             }
             wake();
             match rx.recv_timeout(Duration::from_secs(60)) {
-                Ok(r) => rpc_result(&id, json!({"content": [{"type": "text", "text": r.text}], "isError": r.is_error})),
+                Ok(r) => {
+                    let mut content = vec![json!({"type": "text", "text": r.text})];
+                    if let Some(png) = &r.image_png {
+                        content.push(json!({"type": "image", "data": base64(png), "mimeType": "image/png"}));
+                    }
+                    rpc_result(&id, json!({"content": content, "isError": r.is_error}))
+                }
                 Err(_) => rpc_error(&id, -32603, "Rust Blender did not answer in time (is a modal dialog open?)"),
             }
         }
@@ -128,6 +141,20 @@ pub fn handle_message(msg: &Value, client: &str, calls: &Sender<ToolCall>, wake:
         "prompts/list" => rpc_result(&id, json!({"prompts": []})),
         _ => rpc_error(&id, -32601, &format!("method not found: {method}")),
     })
+}
+
+/// Standard base64 (RFC 4648, padded).
+pub fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 /// Reject browser pages on other origins (DNS-rebinding protection, as the MCP spec requires).
@@ -251,7 +278,10 @@ mod tests {
         assert!(handle_message(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), "t", &tx, &|| {}).is_none());
         let list = handle_message(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}), "t", &tx, &|| {}).unwrap();
         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["run_commands", "get_scene", "check_scene", "ask_copilot", "export_gltf"]);
+        assert_eq!(names, vec!["run_commands", "get_scene", "check_scene", "ask_copilot", "render_image", "export_gltf"]);
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"M"), "TQ==");
         // tools/call is forwarded to the "UI thread"
         let h = std::thread::spawn(move || {
             let c = rx.recv().unwrap();

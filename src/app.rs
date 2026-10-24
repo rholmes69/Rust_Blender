@@ -208,6 +208,15 @@ pub struct App {
     mcp: Option<crate::mcp::McpServer>,
     mcp_status: String,
     mcp_calls: u32,
+    /// Last F12 render and whether its window is open.
+    render: Option<RenderView>,
+    show_render: bool,
+}
+
+struct RenderView {
+    result: crate::viewport::RenderResult,
+    tex: egui::TextureHandle,
+    saved: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -293,6 +302,8 @@ impl App {
             mcp,
             mcp_status,
             mcp_calls: 0,
+            render: None,
+            show_render: false,
         }
     }
 
@@ -909,7 +920,158 @@ impl App {
                     Err(e) => ToolResult::err(format!("could not write {path}: {e}")),
                 }
             }
+            "render_image" => {
+                let out = self.ed.scene.output;
+                let w = args["width"].as_u64().map(|v| v as usize).unwrap_or(if args["path"].is_string() { out.width as usize } else { 960 });
+                let h = args["height"].as_u64().map(|v| v as usize).unwrap_or(w * out.height as usize / out.width.max(1) as usize);
+                let transparent = args["transparent"].as_bool().unwrap_or(out.transparent);
+                let r = self.vp.render_image(&self.ed, w, h, transparent);
+                let png = match encode_png(r.width, r.height, &r.rgba) {
+                    Ok(b) => b,
+                    Err(e) => return ToolResult::err(e),
+                };
+                let mut text = format!(
+                    "Rendered {}×{} {} in {:.0} ms.",
+                    r.width,
+                    r.height,
+                    r.camera.as_ref().map(|c| format!("through camera \"{c}\"")).unwrap_or_else(|| "from the current viewport view (the scene has no camera)".into()),
+                    r.ms
+                );
+                if let Some(path) = args["path"].as_str().filter(|p| !p.is_empty()) {
+                    if let Err(e) = std::fs::write(path, &png) {
+                        return ToolResult::err(format!("could not write {path}: {e}"));
+                    }
+                    text += &format!(" Saved to {path}.");
+                }
+                self.chat.push(ChatEntry::new(Role::System, format!("⚙ MCP ({client_short}): rendered {}×{}", r.width, r.height)));
+                ToolResult { image_png: Some(png), ..ToolResult::ok(text) }
+            }
             other => ToolResult::err(format!("unknown tool: {other}")),
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // F12 render
+    // ------------------------------------------------------------------------------------------
+    fn render_now(&mut self, ctx: &egui::Context) {
+        let out = self.ed.scene.output;
+        let res = self.vp.render_image(&self.ed, out.width as usize, out.height as usize, out.transparent);
+        let img = egui::ColorImage::from_rgba_unmultiplied([res.width, res.height], &res.rgba);
+        let tex = ctx.load_texture("f12-render", img, egui::TextureOptions::LINEAR);
+        self.toast(
+            format!(
+                "Rendered {}×{} {} in {:.0} ms",
+                res.width,
+                res.height,
+                res.camera.as_ref().map(|c| format!("through \"{c}\"")).unwrap_or_else(|| "from the current view (no camera)".into()),
+                res.ms
+            ),
+            theme::OK,
+        );
+        self.render = Some(RenderView { result: res, tex, saved: None });
+        self.show_render = true;
+    }
+
+    fn save_render(&mut self) {
+        let Some(rv) = &self.render else { return };
+        let name = self
+            .ed
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| format!("{}.png", s.to_string_lossy()))
+            .unwrap_or_else(|| "render.png".into());
+        if let Some(p) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name(name).save_file() {
+            let r = &rv.result;
+            match encode_png(r.width, r.height, &r.rgba).and_then(|b| std::fs::write(&p, b).map_err(|e| e.to_string())) {
+                Ok(_) => {
+                    self.toast(format!("Saved {}", p.display()), theme::OK);
+                    if let Some(rv) = &mut self.render {
+                        rv.saved = Some(p);
+                    }
+                }
+                Err(e) => self.toast(format!("Save failed: {e}"), theme::ERR),
+            }
+        }
+    }
+
+    fn render_window(&mut self, ctx: &egui::Context) {
+        if !self.show_render {
+            return;
+        }
+        let mut open = true;
+        let (mut rerender, mut save) = (false, false);
+        let mut out = self.ed.scene.output;
+        egui::Window::new("Render")
+            .open(&mut open)
+            .default_width(820.0)
+            .resizable(true)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("📷 Render  F12").clicked() {
+                        rerender = true;
+                    }
+                    if ui.add_enabled(self.render.is_some(), egui::Button::new("💾 Save PNG…")).clicked() {
+                        save = true;
+                    }
+                    ui.separator();
+                    for (l, w, h) in [("720p", 1280, 720), ("1080p", 1920, 1080), ("4K", 3840, 2160), ("Square", 1080, 1080)] {
+                        if ui.selectable_label(out.width == w && out.height == h, l).clicked() {
+                            out.width = w;
+                            out.height = h;
+                            rerender = true;
+                        }
+                    }
+                    if ui.checkbox(&mut out.transparent, "Transparent").changed() {
+                        rerender = true;
+                    }
+                });
+                if let Some(rv) = &self.render {
+                    let r = &rv.result;
+                    ui.label(
+                        RichText::new(format!(
+                            "{}×{} · {} · {:.0} ms{}",
+                            r.width,
+                            r.height,
+                            r.camera.as_deref().unwrap_or("current view (add a camera for framed renders)"),
+                            r.ms,
+                            rv.saved.as_ref().map(|p| format!(" · saved to {}", p.display())).unwrap_or_default()
+                        ))
+                        .small()
+                        .color(theme::TEXT_DIM),
+                    );
+                    let avail = ui.available_width().max(200.0);
+                    let size = vec2(avail, avail * r.height as f32 / r.width as f32);
+                    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                    if self.ed.scene.output.transparent {
+                        // checkerboard behind transparent renders
+                        let p = ui.painter_at(rect);
+                        let cs = 12.0;
+                        let (nx, ny) = ((rect.width() / cs).ceil() as i32, (rect.height() / cs).ceil() as i32);
+                        for y in 0..ny {
+                            for x in 0..nx {
+                                let c = if (x + y) % 2 == 0 { Color32::from_gray(90) } else { Color32::from_gray(60) };
+                                let r = egui::Rect::from_min_size(rect.min + vec2(x as f32 * cs, y as f32 * cs), vec2(cs, cs)).intersect(rect);
+                                p.rect_filled(r, 0.0, c);
+                            }
+                        }
+                    }
+                    ui.painter_at(rect).image(rv.tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                }
+            });
+        if out != self.ed.scene.output {
+            self.ed.scene.output = out;
+            self.ed.dirty = true;
+        }
+        if rerender {
+            self.render_now(ctx);
+        }
+        if save {
+            self.save_render();
+        }
+        if !open {
+            self.show_render = false;
         }
     }
 
@@ -986,6 +1148,15 @@ impl App {
         }
         if c(M::COMMAND, Key::N) {
             self.new_scene();
+        }
+        if c(M::NONE, Key::F12) {
+            self.render_now(ctx);
+        }
+        if c(M::NONE, Key::F11) {
+            self.show_render = !self.show_render || self.render.is_none();
+            if self.render.is_none() {
+                self.render_now(ctx);
+            }
         }
         if c(M::NONE, Key::F3) || c(M::COMMAND, Key::K) {
             self.palette = Some(String::new());
@@ -1295,6 +1466,17 @@ impl App {
                             if ui.button("Apply UI scale").clicked() {
                                 ui.ctx().set_zoom_factor(self.settings.ui_scale);
                                 self.settings.save();
+                            }
+                        });
+                        ui.menu_button("Render", |ui| {
+                            if ui.button("Render Image   F12").clicked() {
+                                self.ed.render_request = true;
+                            }
+                            if ui.add_enabled(self.render.is_some(), egui::Button::new("View Render   F11")).clicked() {
+                                self.show_render = true;
+                            }
+                            if ui.add_enabled(self.render.is_some(), egui::Button::new("Save Render as PNG…")).clicked() {
+                                self.save_render();
                             }
                         });
                         ui.menu_button("Help", |ui| {
@@ -2560,6 +2742,19 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.ed.scene.fps).range(1..=240));
             });
         });
+        section(ui, "Output", |ui| {
+            let o = &mut self.ed.scene.output;
+            ui.horizontal(|ui| {
+                ui.label("Resolution");
+                ui.add(egui::DragValue::new(&mut o.width).range(16..=8192).suffix(" px"));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut o.height).range(16..=8192).suffix(" px"));
+            });
+            ui.checkbox(&mut o.transparent, "Transparent background");
+            if ui.button("📷 Render Image  F12").clicked() {
+                self.ed.render_request = true;
+            }
+        });
         section(ui, "Statistics", |ui| {
             let (o, v, t) = self.vp.stats;
             ui.label(format!("{o} objects · {v} vertices · {t} triangles"));
@@ -3205,6 +3400,10 @@ fn palette_items() -> Vec<(String, PaletteAction)> {
             PaletteAction::ExportGltf,
         ),
         (
+            "Render ▸ Render Image (F12)".into(),
+            PaletteAction::Cmd(Command::new("render")),
+        ),
+        (
             "Tool ▸ Select Box".into(),
             PaletteAction::Tool(Tool::Select),
         ),
@@ -3301,6 +3500,7 @@ const HELP: &[(&str, &str)] = &[
     ("Space", "Play / pause"),
     ("← → / Shift+← →", "Step frame / jump to start-end"),
     ("F3 / Ctrl+K", "Command search (falls back to AI)"),
+    ("F12 / F11", "Render image through the camera / show the last render"),
     ("Ctrl+Space or `", "Voice: start / stop listening"),
     ("/ or Ctrl+L", "Focus the AI prompt"),
     ("N", "Toggle the AI Copilot panel"),
@@ -3698,6 +3898,10 @@ impl eframe::App for App {
             self.vp.ui(ui, &mut self.ed);
         });
         self.popups(&ctx);
+        if std::mem::take(&mut self.ed.render_request) {
+            self.render_now(&ctx);
+        }
+        self.render_window(&ctx);
 
         let title = format!(
             "Rust Blender{}{}",
@@ -3718,4 +3922,17 @@ impl eframe::App for App {
         self.settings.gpu_renderer = self.vp.use_gpu;
         self.settings.save();
     }
+}
+
+/// Encode straight RGBA8 as PNG.
+pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut buf, w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().map_err(|e| e.to_string())?;
+        wr.write_image_data(rgba).map_err(|e| e.to_string())?;
+    }
+    Ok(buf)
 }

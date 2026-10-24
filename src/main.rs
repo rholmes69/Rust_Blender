@@ -11,6 +11,7 @@ mod editor;
 mod gltf;
 mod gpu;
 mod mcp;
+mod raytrace;
 mod mesh;
 mod render;
 mod router;

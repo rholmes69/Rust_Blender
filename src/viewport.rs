@@ -235,6 +235,18 @@ pub struct Viewport {
     pub add_menu_at: Option<Pos2>,
     gizmo_hover: Option<GizmoHandle>,
     last_frame_time: f64,
+    /// Final-render mode: no overlays, gizmos, selection or edit-mode drawing.
+    render_mode: bool,
+}
+
+/// A finished F12 render (straight RGBA, row-major, top row first).
+pub struct RenderResult {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
+    /// Name of the camera rendered through (None = current viewport view).
+    pub camera: Option<String>,
+    pub ms: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -282,6 +294,7 @@ impl Default for Viewport {
             add_menu_at: None,
             gizmo_hover: None,
             last_frame_time: 0.0,
+            render_mode: false,
         }
     }
 }
@@ -374,6 +387,30 @@ fn srgb4(c: Vec3, a: f32) -> [f32; 4] {
     };
     [t(c.x), t(c.y), t(c.z), a.clamp(0.0, 1.0)]
 }
+/// ACES filmic tone curve (Narkowicz fit) + gamma, used by the F12 render.
+fn aces4(c: Vec3, a: f32) -> [f32; 4] {
+    let t = |x: f32| {
+        let x = (x * 0.8).max(0.0);
+        let y = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+        y.clamp(0.0, 1.0).powf(1.0 / 2.2)
+    };
+    [t(c.x), t(c.y), t(c.z), a]
+}
+
+/// All visible, mostly opaque mesh triangles in world space (with modifiers) for ray tracing.
+fn scene_bvh(ed: &Editor, cache: &mut MeshCache) -> crate::raytrace::Bvh {
+    let mut tris = vec![];
+    for o in ed.scene.objects.iter().filter(|o| o.visible && o.is_mesh() && o.material.alpha > 0.5) {
+        let mesh = cache.for_object(o);
+        for inst in o.instance_matrices() {
+            let m = o.transform.matrix() * inst;
+            let wp: Vec<Vec3> = mesh.positions.iter().map(|p| m.transform_point3(*p)).collect();
+            tris.extend(mesh.tris.iter().map(|t| t.map(|i| wp[i as usize])));
+        }
+    }
+    crate::raytrace::Bvh::new(tris)
+}
+
 fn lin(c: [f32; 3]) -> Vec3 {
     Vec3::new(c[0].powf(2.2), c[1].powf(2.2), c[2].powf(2.2))
 }
@@ -1030,7 +1067,7 @@ impl Viewport {
     fn build_scene(&mut self, ed: &Editor) {
         self.prims.clear();
         self.id_map.clear();
-        self.edit_obj = ed.edit.as_ref().map(|s| s.obj);
+        self.edit_obj = if self.render_mode { None } else { ed.edit.as_ref().map(|s| s.obj) };
         self.edit_draw = None;
         let view = self.cam.view();
         let eye = self.cam.eye();
@@ -1132,16 +1169,21 @@ impl Viewport {
         let studio_key = (self.cam.right() * -0.35 + self.cam.up() * 0.75 - fwd * 0.55).normalize();
         let studio_fill = (self.cam.right() * 0.7 - self.cam.up() * 0.2 - fwd * 0.4).normalize();
         let ortho = self.cam.ortho;
-        let shading = ed.shading;
+        let shading = if self.render_mode { Shading::Material } else { ed.shading };
         let scene_lights = SceneLight::gather(&ed.scene);
+        let rmode = self.render_mode;
+        // F12 render: ray-traced shadows + ambient occlusion against the whole scene
+        let bvh = rmode.then(|| scene_bvh(ed, &mut self.mesh_cache));
+        let occluded = |p: Vec3, d: Vec3, tmax: f32| bvh.as_ref().is_some_and(|b| b.occluded(p, d, tmax));
+        let tone = |c: Vec3, a: f32| if rmode { aces4(c, a) } else { srgb4(c, a) };
         for o in ed.scene.objects.iter().filter(|o| o.visible) {
             nobj += 1;
             self.id_map.push(o.id);
             let pid = self.id_map.len() as u32;
-            let selected = ed.selection.contains(&o.id);
-            let active = ed.active == Some(o.id);
+            let selected = !self.render_mode && ed.selection.contains(&o.id);
+            let active = !self.render_mode && ed.active == Some(o.id);
             if !o.is_mesh() {
-                if self.camera_view != Some(o.id) {
+                if !self.render_mode && self.camera_view != Some(o.id) {
                     self.draw_object_gizmo(o, pid, selected, active, &view);
                 }
                 continue;
@@ -1169,7 +1211,18 @@ impl Viewport {
                     _ => {
                         let sky = Vec3::new(0.55, 0.65, 0.85);
                         let ground = Vec3::new(0.25, 0.22, 0.2);
-                        let hemi = ground.lerp(sky, 0.5 + 0.5 * n.z) * world.ambient * 1.6;
+                        let mut hemi = ground.lerp(sky, 0.5 + 0.5 * n.z) * world.ambient * 1.6;
+                        let origin = p + n * 0.004;
+                        if bvh.is_some() {
+                            let t = if n.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+                            let bx = t.cross(n).normalize();
+                            let by = n.cross(bx);
+                            let hits = crate::raytrace::AO_DIRS
+                                .iter()
+                                .filter(|d| occluded(origin, (bx * d[0] + by * d[1] + n * d[2]).normalize(), 0.9))
+                                .count();
+                            hemi *= 1.0 - 0.8 * hits as f32 / crate::raytrace::AO_DIRS.len() as f32;
+                        }
                         let rough = mat.roughness.clamp(0.04, 1.0);
                         let shin = 2.0 / (rough * rough) + 2.0;
                         let f0 = Vec3::splat(0.04).lerp(base, mat.metallic);
@@ -1183,6 +1236,15 @@ impl Viewport {
                             if ndl <= 0.0 || rad == Vec3::ZERO {
                                 continue;
                             }
+                            if bvh.is_some() {
+                                let tmax = match sl.kind {
+                                    crate::scene::LightType::Sun => 1.0e4,
+                                    _ => (sl.pos - origin).length() - 0.05,
+                                };
+                                if occluded(origin, l, tmax) {
+                                    continue;
+                                }
+                            }
                             let h = (l + v).normalize();
                             diffuse_light += rad * ndl;
                             spec += fres * rad * n.dot(h).max(0.0).powf(shin) * (shin + 8.0) / 25.0
@@ -1195,7 +1257,7 @@ impl Viewport {
                     }
                 }
             };
-            let editing_this = ed.edit.as_ref().filter(|s| s.obj == o.id);
+            let editing_this = ed.edit.as_ref().filter(|s| s.obj == o.id && !self.render_mode);
             let face_sel: Vec<bool> = match (editing_this, &o.mesh) {
                 (Some(st), Some(pm)) => (0..pm.faces.len())
                     .map(|f| crate::editmesh::face_selected(pm, &st.sel, f))
@@ -1240,7 +1302,94 @@ impl Viewport {
                     })
                     .collect();
 
-                if shading != Shading::Wireframe {
+                if rmode && shading != Shading::Wireframe {
+                    // F12: tessellate by screen size so lighting and shadows are near per-pixel
+                    for (fi, t) in mesh.tris.iter().enumerate() {
+                        if !blend && !facing[fi] {
+                            continue;
+                        }
+                        let ix = t.map(|i| i as usize);
+                        let sign = if facing[fi] { 1.0 } else { -1.0 };
+                        let px: Vec<Option<(f32, f32)>> = ix
+                            .iter()
+                            .map(|&i| {
+                                let v = vpos[i];
+                                (ortho || v.z < -0.05).then(|| {
+                                    let (sp, _) = self.vproj(&self.proj, v);
+                                    self.to_px(sp)
+                                })
+                            })
+                            .collect();
+                        let edge_px = if px.iter().all(|q| q.is_some()) {
+                            let q: Vec<(f32, f32)> = px.iter().map(|q| q.unwrap()).collect();
+                            (0..3)
+                                .map(|k| {
+                                    let (a, b) = (q[k], q[(k + 1) % 3]);
+                                    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+                                })
+                                .fold(0.0, f32::max)
+                        } else {
+                            400.0
+                        };
+                        let k = ((edge_px / 14.0).ceil() as usize).clamp(1, 64);
+                        let (a, b, c) = (wp[ix[0]], wp[ix[1]], wp[ix[2]]);
+                        let (na, nb, nc) = if smooth {
+                            (wn[ix[0]] * sign, wn[ix[1]] * sign, wn[ix[2]] * sign)
+                        } else {
+                            let f = face_n[fi] * sign;
+                            (f, f, f)
+                        };
+                        // grid of points (i, j), i + j <= k
+                        let mut pts: Vec<(Vec3, Vec3, [f32; 4])> = Vec::with_capacity((k + 1) * (k + 2) / 2);
+                        for j in 0..=k {
+                            for i in 0..=(k - j) {
+                                let (u, v) = (i as f32 / k as f32, j as f32 / k as f32);
+                                let w = 1.0 - u - v;
+                                let p = a * w + b * u + c * v;
+                                let n = (na * w + nb * u + nc * v).normalize_or_zero();
+                                pts.push((p, n, tone(shade(p, n), alpha)));
+                            }
+                        }
+                        let start = |j: usize| -> usize { (0..j).map(|r| k + 1 - r).sum() };
+                        for j in 0..k {
+                            let (r0, r1) = (start(j), start(j + 1));
+                            for i in 0..(k - j) {
+                                let (p00, p10, p01) = (r0 + i, r0 + i + 1, r1 + i);
+                                let mut quads = vec![[p00, p10, p01]];
+                                if i + 1 < k - j {
+                                    quads.push([p10, r1 + i + 1, p01]);
+                                }
+                                // refine where the shading changes sharply (shadow edges, highlights)
+                                let mut stack: Vec<([(Vec3, Vec3, [f32; 4]); 3], u8)> =
+                                    quads.iter().map(|q| (q.map(|x| pts[x]), 0)).collect();
+                                while let Some((tv, depth)) = stack.pop() {
+                                    let diff = (0..3)
+                                        .map(|e| {
+                                            let (c0, c1) = (tv[e].2, tv[(e + 1) % 3].2);
+                                            (c0[0] - c1[0]).abs().max((c0[1] - c1[1]).abs()).max((c0[2] - c1[2]).abs())
+                                        })
+                                        .fold(0.0f32, f32::max);
+                                    if depth < 3 && diff > 0.05 {
+                                        let mid = |a: &(Vec3, Vec3, [f32; 4]), b: &(Vec3, Vec3, [f32; 4])| {
+                                            let p = (a.0 + b.0) * 0.5;
+                                            let n = (a.1 + b.1).normalize_or_zero();
+                                            (p, n, tone(shade(p, n), alpha))
+                                        };
+                                        let (m01, m12, m20) = (mid(&tv[0], &tv[1]), mid(&tv[1], &tv[2]), mid(&tv[2], &tv[0]));
+                                        let d = depth + 1;
+                                        stack.push(([tv[0], m01, m20], d));
+                                        stack.push(([m01, tv[1], m12], d));
+                                        stack.push(([m20, m12, tv[2]], d));
+                                        stack.push(([m01, m12, m20], d));
+                                    } else {
+                                        self.push_tri(tv.map(|v| view.transform_point3(v.0)), tv.map(|v| v.2), pid, blend);
+                                    }
+                                }
+                            }
+                        }
+                        ntris += k * k;
+                    }
+                } else if shading != Shading::Wireframe {
                     let vcol: Vec<[f32; 4]> = if smooth {
                         (0..wp.len())
                             .map(|i| srgb4(shade(wp[i], wn[i]), alpha))
@@ -1410,15 +1559,18 @@ impl Viewport {
         }
     }
 
-    fn flush(&mut self, ui: &Ui, painter: &egui::Painter, ed: &Editor) {
+    fn background(ed: &Editor) -> ([f32; 3], [f32; 3]) {
         let bg = ed.scene.world.background;
         let top = [
             (bg[0] * 1.12).min(1.0),
             (bg[1] * 1.12).min(1.0),
             (bg[2] * 1.12).min(1.0),
         ];
-        let bot = [bg[0] * 0.82, bg[1] * 0.82, bg[2] * 0.82];
-        // blended prims: draw far-to-near
+        (top, [bg[0] * 0.82, bg[1] * 0.82, bg[2] * 0.82])
+    }
+
+    /// Opaque first, then blended prims far-to-near.
+    fn sort_prims(&mut self) {
         let key = |p: &RPrim| p.p[0][2] + p.p[1][2] + p.p[2][2];
         let (mut opaque, mut blended): (Vec<RPrim>, Vec<RPrim>) =
             self.prims.drain(..).partition(|p| !p.blend);
@@ -1429,6 +1581,117 @@ impl Viewport {
         });
         opaque.append(&mut blended);
         self.prims = opaque;
+    }
+
+    /// The camera a final render looks through: the active object if it is a camera,
+    /// otherwise the first camera in the scene.
+    pub fn render_camera(ed: &Editor) -> Option<&crate::scene::Object> {
+        let is_cam = |o: &&crate::scene::Object| matches!(o.kind, crate::scene::ObjectKind::Camera(_));
+        ed.active
+            .and_then(|a| ed.scene.get(a))
+            .filter(is_cam)
+            .or_else(|| ed.scene.objects.iter().find(is_cam))
+    }
+
+    /// Final render (F12): through the scene camera (or the current view when there is none),
+    /// Material Preview shading with the scene lights, no overlays, 2x2 supersampled.
+    pub fn render_image(&mut self, ed: &Editor, width: usize, height: usize, transparent: bool) -> RenderResult {
+        let t0 = Instant::now();
+        let (width, height) = (width.clamp(16, 8192), height.clamp(16, 8192));
+        let ss = if width * height <= 4_200_000 { 2 } else { 1 };
+        let (rw, rh) = (width * ss, height * ss);
+        let aspect = width as f32 / height as f32;
+        let cam_obj = Self::render_camera(ed);
+        let cam = match cam_obj {
+            Some(o) => {
+                let f = o.forward();
+                let off = -f;
+                let fov = match o.kind {
+                    crate::scene::ObjectKind::Camera(c) => c.fov_deg,
+                    _ => 40.0,
+                };
+                // the camera's FOV is the vertical FOV of a 16:9 frame; keep its width for other aspects
+                let half_w = (fov.to_radians() * 0.5).tan() * 16.0 / 9.0;
+                let vfov = 2.0 * (half_w / aspect).atan();
+                Camera {
+                    target: o.transform.location + f * 10.0,
+                    yaw: off.x.atan2(-off.y).to_degrees(),
+                    pitch: off.z.clamp(-1.0, 1.0).asin().to_degrees(),
+                    dist: 10.0,
+                    ortho: false,
+                    fov_deg: vfov.to_degrees(),
+                }
+            }
+            None => self.cam,
+        };
+        let mut r = Viewport {
+            render_mode: true,
+            overlays: Overlays { grid: false, wire_overlay: false, stats: false, xray: false },
+            cam,
+            rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(rw as f32, rh as f32)),
+            px_scale: 1.0,
+            ..Default::default()
+        };
+        std::mem::swap(&mut r.mesh_cache, &mut self.mesh_cache);
+        r.proj = cam.proj(aspect);
+        r.vp = r.proj * cam.view();
+        r.raster.resize(rw, rh);
+        r.build_scene(ed);
+        r.sort_prims();
+        let (top, bot) = Self::background(ed);
+        r.raster.render(top, bot, &r.prims, None);
+        std::mem::swap(&mut r.mesh_cache, &mut self.mesh_cache);
+
+        // box-filter downsample; with transparency, alpha = object coverage
+        let mut rgba = vec![0u8; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let (mut acc, mut cov, mut all) = ([0u32; 3], 0u32, [0u32; 3]);
+                for sy in 0..ss {
+                    for sx in 0..ss {
+                        let i = (y * ss + sy) * rw + x * ss + sx;
+                        let c = r.raster.color[i];
+                        let c3 = [c.r() as u32, c.g() as u32, c.b() as u32];
+                        for k in 0..3 {
+                            all[k] += c3[k];
+                        }
+                        if r.raster.id[i] != 0 {
+                            cov += 1;
+                            for k in 0..3 {
+                                acc[k] += c3[k];
+                            }
+                        }
+                    }
+                }
+                let n = (ss * ss) as u32;
+                let o = (y * width + x) * 4;
+                if transparent {
+                    if cov > 0 {
+                        for k in 0..3 {
+                            rgba[o + k] = (acc[k] / cov) as u8;
+                        }
+                    }
+                    rgba[o + 3] = (cov * 255 / n) as u8;
+                } else {
+                    for k in 0..3 {
+                        rgba[o + k] = (all[k] / n) as u8;
+                    }
+                    rgba[o + 3] = 255;
+                }
+            }
+        }
+        RenderResult {
+            width,
+            height,
+            rgba,
+            camera: cam_obj.map(|o| o.name.clone()),
+            ms: t0.elapsed().as_secs_f32() * 1000.0,
+        }
+    }
+
+    fn flush(&mut self, ui: &Ui, painter: &egui::Painter, ed: &Editor) {
+        let (top, bot) = Self::background(ed);
+        self.sort_prims();
         let mut sel = vec![0u8; self.id_map.len() + 1];
         if ed.shading != Shading::Wireframe {
             for (i, id) in self.id_map.iter().enumerate() {
@@ -2721,5 +2984,21 @@ mod tests {
         assert_eq!(v.pick(pos2(5.0, 5.0)), None);
         let (o, d) = v.ray(pos2(400.0, 300.0));
         assert!((d - v.cam.forward()).length() < 1e-3, "{o} {d}");
+    }
+
+    #[test]
+    fn f12_render_through_camera() {
+        let ed = Editor::default(); // cube + light + camera
+        let mut v = Viewport::default();
+        let r = v.render_image(&ed, 320, 180, false);
+        assert_eq!((r.width, r.height, r.rgba.len()), (320, 180, 320 * 180 * 4));
+        assert_eq!(r.camera.as_deref(), Some("Camera"));
+        // the cube sits in the middle of the default camera's frame
+        let px = |x: usize, y: usize| &r.rgba[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+        let bg = px(2, 2).to_vec();
+        assert_ne!(px(160, 90), &bg[..], "cube should cover the centre");
+        let t = v.render_image(&ed, 320, 180, true);
+        assert_eq!(t.rgba[3], 0, "corner is transparent");
+        assert_eq!(t.rgba[(90 * 320 + 160) * 4 + 3], 255, "cube is opaque");
     }
 }

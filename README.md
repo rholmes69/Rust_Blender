@@ -4,6 +4,8 @@ A Blender-style 3D editor written in Rust. You can drive it with the mouse and k
 
 ![layout](docs/layout.png)
 
+![F12 render](docs/render.png)
+
 ## Features
 
 | Area | What you get |
@@ -15,6 +17,7 @@ A Blender-style 3D editor written in Rust. You can drive it with the mouse and k
 | **Animation** | Keyframes with eased interpolation, a timeline, auto-keying and playback. |
 | **AI Copilot** | **Streams** replies from Ollama: the text appears live, and each command is applied the moment it finishes generating. There's a Stop button, and the whole answer is a single undo step. Simple commands run instantly without the LLM. The app auto-picks the best installed model and can download models from inside the app. The AI can also edit meshes (select faces, extrude, inset, loop cut and so on). |
 | **Voice** | Local Whisper (tiny, base, small or distil) with hands-free auto-stop and a level meter. Replies can optionally be read aloud. |
+| **Render (F12)** | Renders a final image through the scene camera: shadows from every light are ray-traced against the real geometry, plus ambient occlusion, ACES filmic tone mapping and 2×2 supersampled anti-aliasing. Choose 720p, 1080p, 4K or square, optionally with a transparent background, then save as PNG. You can trigger it by voice or the AI ("render it") or over MCP. |
 | **Files** | Save and open `.rblend`. Export **glTF 2.0 (.glb)** with meshes (modifiers applied), PBR materials, emissive strength, lights (`KHR_lights_punctual`), cameras and baked animation; the output passes the Khronos glTF-Validator with 0 errors and 0 warnings. Also exports Wavefront `.obj`. |
 
 ## Recommended Ollama model
@@ -61,6 +64,7 @@ Rust Blender runs a **Model Context Protocol** server, so external agents such a
 | `get_scene` | Lists objects with type, transform and world bounding boxes, plus the selection, frame and mode |
 | `check_scene` | Runs the agent-loop geometry checks (floating, sunken, hidden, duplicates) on the whole scene |
 | `ask_copilot` | Hands a plain-English request to the app's own Ollama Copilot |
+| `render_image` | Renders through the camera and returns the PNG as an image, so the agent can see its work (optionally also saves it) |
 | `export_gltf` | Writes the scene to a `.glb` file |
 
 **Claude Code** (HTTP):
@@ -127,6 +131,7 @@ Follow-ups work because the AI sees the current scene and the conversation histo
 | E, I, Ctrl+R (edit) | extrude, inset, loop cut |
 | M, X, Alt+N (edit) | merge, delete, flip normals |
 | Numpad 0, Ctrl+Alt+0 | look through the camera, align the camera to the view |
+| F12 / F11 | render image / show the last render |
 
 ## Architecture
 
@@ -136,6 +141,7 @@ src/
   app.rs       layout, menus, Copilot chat, voice UX, outliner, properties, timeline, palette
   viewport.rs  camera, scene → primitives, navigation, modal transforms, gizmos, HUD
   viewport/edit.rs  edit-mode drawing, component picking, extrude / inset / loop-cut tools
+  raytrace.rs  triangle BVH for F12 shadows and ambient occlusion
   gpu.rs       wgpu renderer: MSAA colour pass, ID/depth pass + async readback, outline composite
   render.rs    multithreaded software z-buffer rasterizer (fallback), ID buffer, selection outline
   editmesh.rs  mesh operators (extrude, inset, loop cut, subdivide, merge, delete …)

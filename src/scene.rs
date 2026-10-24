@@ -330,7 +330,26 @@ pub struct Scene {
     pub frame_start: i32,
     pub frame_end: i32,
     pub fps: u32,
+    /// Render output settings (F12).
+    #[serde(default)]
+    pub output: Output,
     next_id: u64,
+}
+
+/// Render output settings, saved with the scene like Blender's Output properties.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Output {
+    pub width: u32,
+    pub height: u32,
+    /// Transparent background (alpha) instead of the world colour.
+    pub transparent: bool,
+}
+
+impl Default for Output {
+    fn default() -> Self {
+        Self { width: 1920, height: 1080, transparent: false }
+    }
 }
 
 impl Default for Scene {
@@ -342,6 +361,7 @@ impl Default for Scene {
             frame_start: 1,
             frame_end: 120,
             fps: 24,
+            output: Output::default(),
             next_id: 1,
         };
         s.add(Primitive::Cube, None);

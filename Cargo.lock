@@ -3732,6 +3732,7 @@ dependencies = [
  "eframe",
  "egui",
  "glam",
+ "png",
  "pollster 1.0.1",
  "rand",
  "rfd",

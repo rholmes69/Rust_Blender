@@ -336,6 +336,7 @@ pub const ACTIONS: &[&str] = &[
     "set_light",
     "look_at",
     "camera_view",
+    "render",
     "edit_mode",
     "object_mode",
     "select_faces",
@@ -371,7 +372,7 @@ Each command is an object with "action" plus only the fields it needs:
   or "x,y,z"), color (light color), power (watts for point/spot e.g. 1000, strength for sun e.g. 3).
   Lights/cameras point along their local -Z axis; prefer look_at over rotation for aiming them.
 - set_light: target, color, power, number (spot cone angle in degrees).   look_at: target, look_at.
-- camera_view: look through the scene camera (or view = camera).
+- camera_view: look through the scene camera (or view = camera).   render: render a final image through the camera (F12).
 - delete / select / hide / show / focus / smooth / flat: target
 - move: target, vector [dx,dy,dz] (relative).   rotate: target, vector [deg x,y,z] (relative).
 - scale: target, vector [fx,fy,fz] (multiplicative).   set_transform: target + absolute location/rotation/scale.
@@ -810,6 +811,9 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         "camera view" | "look through camera" | "look through the camera" | "view camera" => {
             return single("camera_view");
         }
+        "render" | "render image" | "render it" | "render the scene" | "f12" | "take a picture" | "take a render" => {
+            return single("render");
+        }
         "edit mode" | "enter edit mode" | "tab" => return single("edit_mode"),
         "object mode" | "exit edit mode" => return single("object_mode"),
         "subdivide" | "subdivide it" => return single("subdivide"),
@@ -1203,6 +1207,7 @@ mod tests {
             parse_simple("camera view").unwrap()[0].action,
             "camera_view"
         );
+        assert_eq!(parse_simple("render the scene").unwrap()[0].action, "render");
     }
     #[test]
     fn parse_model_output() {

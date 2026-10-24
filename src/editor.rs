@@ -55,6 +55,8 @@ pub struct Editor {
     pub auto_key: bool,
     /// Edit mode (component editing of one mesh object).
     pub edit: Option<EditState>,
+    /// Set by the `render` command; the app renders an image (F12) and clears it.
+    pub render_request: bool,
     /// True while a command batch runs (the batch owns the undo step).
     in_batch: bool,
 }
@@ -77,6 +79,7 @@ impl Default for Editor {
             file_path: None,
             auto_key: false,
             edit: None,
+            render_request: false,
             in_batch: false,
         }
     }
@@ -590,6 +593,10 @@ impl Editor {
                     p.y,
                     p.z
                 ))
+            }
+            "render" | "render_image" => {
+                self.render_request = true;
+                Ok("Rendering an image (F12)".into())
             }
             "camera_view" | "look_through_camera" => {
                 self.view_requests.push(ViewRequest::Camera);

@@ -19,6 +19,7 @@ mod scene;
 mod theme;
 mod viewport;
 mod voice;
+mod voiceflow;
 
 fn main() -> eframe::Result<()> {
     // Headless helper: `rust_blender --export-demo out.glb` builds a demo scene and exports it.

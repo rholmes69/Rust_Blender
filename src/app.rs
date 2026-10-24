@@ -39,6 +39,13 @@ pub struct Settings {
     /// MCP server for external agents (Claude Desktop, Claude Code, Cursor …).
     pub mcp_enabled: bool,
     pub mcp_port: u16,
+    /// Speak a short confirmation after each voice request.
+    pub voice_confirm: bool,
+    /// Keep the mic open for a follow-up after each spoken reply.
+    pub conversation: bool,
+    /// Listen in the background for the wake phrase.
+    pub wake_word: bool,
+    pub wake_phrase: String,
 }
 
 impl Default for Settings {
@@ -70,6 +77,10 @@ impl Default for Settings {
             gpu_renderer: true,
             mcp_enabled: true,
             mcp_port: crate::mcp::DEFAULT_PORT,
+            voice_confirm: true,
+            conversation: true,
+            wake_word: false,
+            wake_phrase: "blender".into(),
         }
     }
 }
@@ -211,6 +222,25 @@ pub struct App {
     /// Last F12 render and whether its window is open.
     render: Option<RenderView>,
     show_render: bool,
+    /// Hands-free voice session.
+    speaker: crate::voiceflow::Speaker,
+    /// Chat index where the voice request currently being handled starts.
+    voice_turn: Option<usize>,
+    /// Re-open the mic for a follow-up once the spoken reply has finished.
+    relisten: bool,
+    /// What the current recording / transcription is for.
+    listen_purpose: Listen,
+    transcribe_purpose: Listen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listen {
+    /// Mic button / shortcut.
+    Command,
+    /// Automatic follow-up after a spoken reply (gives up after a few silent seconds).
+    FollowUp,
+    /// Background listening for the wake phrase.
+    Wake,
 }
 
 struct RenderView {
@@ -304,6 +334,11 @@ impl App {
             mcp_calls: 0,
             render: None,
             show_render: false,
+            speaker: Default::default(),
+            voice_turn: None,
+            relisten: false,
+            listen_purpose: Listen::Command,
+            transcribe_purpose: Listen::Command,
         }
     }
 
@@ -424,8 +459,8 @@ impl App {
                     if snapped {
                         self.start_check(idx);
                     }
-                    if self.settings.speak_replies {
-                        speak(&reply);
+                    if self.settings.speak_replies && self.voice_turn.is_none() {
+                        self.speaker.speak(&reply);
                     }
                 }
                 AiEvent::Error(e) => {
@@ -485,10 +520,17 @@ impl App {
                 VoiceEvent::Transcript { text, secs } => {
                     self.transcribing = false;
                     let clean = clean_transcript(&text);
-                    if clean.is_empty() {
-                        self.toast("Didn't catch that — try again", theme::WARN);
-                    } else {
-                        self.submit_prompt(clean, true, secs);
+                    match self.transcribe_purpose {
+                        Listen::Wake => match crate::voiceflow::strip_wake(&clean, &self.settings.wake_phrase) {
+                            None => {} // not for us; background listening resumes
+                            Some(rest) if rest.trim().is_empty() => {
+                                self.speaker.speak("Yes?");
+                                self.relisten = true;
+                            }
+                            Some(rest) => self.handle_voice_text(rest, secs),
+                        },
+                        _ if clean.is_empty() => self.toast("Didn't catch that — try again", theme::WARN),
+                        _ => self.handle_voice_text(clean, secs),
                     }
                 }
                 VoiceEvent::Error(e) => {
@@ -706,6 +748,7 @@ impl App {
             history: self.history.clone(),
             scene,
             prompt: text.clone(),
+            voice: from_voice,
         });
         self.history.push(ChatMsg {
             role: "user".into(),
@@ -715,6 +758,13 @@ impl App {
     }
 
     fn start_recording(&mut self) {
+        self.start_listening(Listen::Command);
+    }
+
+    fn start_listening(&mut self, purpose: Listen) {
+        if purpose != Listen::Wake {
+            self.speaker.stop();
+        }
         match &self.voice_status {
             VoiceStatus::Ready(_) => {}
             VoiceStatus::Loading(_) | VoiceStatus::Downloading(..) => {
@@ -730,24 +780,167 @@ impl App {
         }
         if let Err(e) = self.voice.recorder.start() {
             self.toast(format!("Microphone: {e}"), theme::ERR);
+            if purpose == Listen::Wake {
+                self.settings.wake_word = false;
+            }
+            return;
         }
+        self.listen_purpose = purpose;
     }
 
     fn stop_recording(&mut self, transcribe: bool) {
         let pcm = self.voice.recorder.stop();
         if transcribe && pcm.len() > 16000 / 4 {
             self.transcribing = true;
+            self.transcribe_purpose = self.listen_purpose;
             self.voice.transcribe(pcm);
         }
     }
 
     fn toggle_mic(&mut self) {
-        if self.voice.recorder.recording {
+        self.relisten = false;
+        if self.voice.recorder.recording && self.listen_purpose == Listen::Wake {
+            // background wake listening → switch to a normal command recording
+            self.voice.recorder.stop();
+            self.start_listening(Listen::Command);
+        } else if self.speaker.busy() {
+            self.speaker.stop();
+            self.start_listening(Listen::Command);
+        } else if self.voice.recorder.recording {
             self.stop_recording(true);
         } else if self.pending_voice {
             self.pending_voice = false;
         } else {
             self.start_recording();
+        }
+    }
+
+    /// A finished transcript from the mic, follow-up or wake word.
+    fn handle_voice_text(&mut self, text: String, secs: f32) {
+        use crate::voiceflow::{VoiceIntent, fix_mishearings, voice_intent};
+        let text = fix_mishearings(text.trim());
+        if text.is_empty() {
+            return;
+        }
+        let conv = self.settings.conversation;
+        match voice_intent(&text) {
+            Some(VoiceIntent::Stop) => {
+                let busy = self.waiting_ai.is_some() || self.review.is_some();
+                if busy {
+                    self.cancel_ai();
+                }
+                self.voice_turn = None;
+                self.speaker.speak(if busy { "Stopped." } else { "Okay." });
+                self.relisten = conv;
+            }
+            Some(VoiceIntent::Undo) => {
+                if self.waiting_ai.is_some() || self.review.is_some() {
+                    self.cancel_ai();
+                }
+                let ok = self.ed.undo();
+                self.chat.push(ChatEntry::new(Role::System, if ok { "🎤 Undone." } else { "🎤 Nothing to undo." }));
+                self.speaker.speak(if ok { "Undone." } else { "Nothing to undo." });
+                self.relisten = conv;
+            }
+            Some(VoiceIntent::Goodbye) => {
+                self.speaker.speak("Okay, I'll stop listening.");
+                self.relisten = false;
+                self.toast(
+                    if self.settings.wake_word {
+                        format!("Say “{}” when you need me", self.settings.wake_phrase)
+                    } else {
+                        "Stopped listening — click the mic to talk again".to_string()
+                    },
+                    theme::TEXT_DIM,
+                );
+            }
+            Some(VoiceIntent::Repeat) => {
+                let last = if self.speaker.last.is_empty() { "I haven't done anything yet.".to_string() } else { self.speaker.last.clone() };
+                self.speaker.speak(&last);
+                self.relisten = conv;
+            }
+            None => {
+                self.voice_turn = Some(self.chat.len());
+                self.submit_prompt(text, true, secs);
+            }
+        }
+    }
+
+    /// Stop the running AI request (Stop button, "stop" by voice).
+    fn cancel_ai(&mut self) {
+        self.ai.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Stop immediately in the UI even if Ollama is still busy on its side.
+        self.review = None;
+        self.ai_cancelled = true;
+        self.waiting_ai = None;
+        self.route_stage = None;
+        let partial = self.streaming.take();
+        if let Some((i, _)) = partial {
+            self.chat[i].streaming = false;
+        }
+        self.chat.push(ChatEntry::new(Role::System, if partial.is_some() { "Stopped. Changes made so far are kept (Ctrl+Z undoes them in one step)." } else { "Stopped." }));
+    }
+
+    /// Per-frame voice session: spoken confirmations, follow-up listening, wake word.
+    fn voice_tick(&mut self, ctx: &egui::Context) {
+        let ai_idle = self.waiting_ai.is_none() && self.streaming.is_none() && self.review.is_none();
+        // 1. a voice request finished → say what happened
+        if let Some(start) = self.voice_turn.filter(|_| ai_idle) {
+            self.voice_turn = None;
+            let entries = self.chat.get(start..).unwrap_or(&[]);
+            let main = entries.iter().find(|e| e.role == Role::Assistant);
+            let fixes: usize = entries
+                .iter()
+                .filter(|e| e.role == Role::Assistant && e.via.as_deref().is_some_and(|v| v.contains("review")))
+                .map(|e| e.commands.len().min(1))
+                .sum();
+            let line = match main {
+                Some(e) => {
+                    let fixes = if main.is_some_and(|m| m.via.as_deref().is_some_and(|v| v.contains("review"))) { 0 } else { fixes };
+                    crate::voiceflow::spoken_summary(&e.text, &e.commands, &e.log, fixes)
+                }
+                None if entries.iter().any(|e| e.text.starts_with('⚠')) => "Sorry, something went wrong. Check the chat.".to_string(),
+                None if entries.iter().any(|e| e.text.starts_with("Stopped")) => String::new(),
+                None => entries.iter().rev().find(|e| e.role == Role::System).map(|e| e.text.chars().take(160).collect()).unwrap_or_default(),
+            };
+            if !line.is_empty() && (self.settings.voice_confirm || self.settings.speak_replies) {
+                self.speaker.speak(&line);
+            }
+            self.relisten = self.settings.conversation;
+        }
+        let ready = matches!(self.voice_status, VoiceStatus::Ready(_));
+        let free = !self.voice.recorder.recording && !self.transcribing && !self.pending_voice;
+        let speaking = self.speaker.busy();
+        // 2. follow-up: re-open the mic once the reply has been spoken
+        if self.relisten && free && !speaking && ready && ai_idle {
+            self.relisten = false;
+            self.start_listening(Listen::FollowUp);
+        }
+        // 3. a follow-up nobody answers ends the conversation
+        if self.voice.recorder.recording
+            && self.listen_purpose == Listen::FollowUp
+            && !self.voice.recorder.heard_speech
+            && self.voice.recorder.started.is_some_and(|t| t.elapsed().as_secs_f32() > 7.0)
+        {
+            self.voice.recorder.stop();
+        }
+        // 4. background wake-word listening
+        if self.settings.wake_word {
+            if self.voice_status == VoiceStatus::NotLoaded {
+                self.voice_status = VoiceStatus::Loading("Preparing Whisper…".into());
+                self.voice.load(&self.settings.voice_model);
+            }
+            if free && !speaking && ready && !self.relisten {
+                self.start_listening(Listen::Wake);
+            }
+            if speaking && self.voice.recorder.recording && self.listen_purpose == Listen::Wake {
+                self.voice.recorder.stop(); // don't listen to ourselves
+            }
+        } else if self.voice.recorder.recording && self.listen_purpose == Listen::Wake {
+            self.voice.recorder.stop();
+        }
+        if speaking || self.relisten || self.settings.wake_word {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
     }
 
@@ -1218,13 +1411,16 @@ impl App {
             self.play_accum = 0.0;
         }
         if self.voice.recorder.recording {
-            if self.settings.hands_free
+            let auto = self.settings.hands_free || self.listen_purpose != Listen::Command;
+            if auto
                 && self
                     .voice
                     .recorder
                     .update_vad(self.settings.vad_threshold, self.settings.silence_secs)
             {
-                self.stop_recording(true);
+                // only transcribe if someone actually spoke
+                let heard = self.voice.recorder.heard_speech || self.listen_purpose == Listen::Command;
+                self.stop_recording(heard);
             }
             ctx.request_repaint();
         }
@@ -1618,8 +1814,18 @@ impl App {
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         let c = rect.center();
         let p = ui.painter();
-        let rec = self.voice.recorder.recording;
+        let waking = self.voice.recorder.recording && self.listen_purpose == Listen::Wake;
+        let rec = self.voice.recorder.recording && !waking;
         let t = ui.input(|i| i.time) as f32;
+        if waking {
+            let lvl = (self.voice.recorder.level() * 18.0).clamp(0.0, 1.0);
+            p.circle_stroke(c, radius + 2.5 + lvl * 3.0, Stroke::new(1.5, theme::OK.gamma_multiply(0.8)));
+        }
+        if self.speaker.busy() {
+            let a = (t * 6.0).sin() * 0.5 + 0.5;
+            p.circle_stroke(c, radius + 3.0 + a * 2.0, Stroke::new(1.5, theme::AI_ACCENT2));
+            ui.ctx().request_repaint();
+        }
         let busy = self.transcribing
             || self.pending_voice
             || matches!(
@@ -1673,7 +1879,13 @@ impl App {
                 Stroke::new(1.6, Color32::WHITE),
             );
         }
-        let tip = if rec {
+        let tip = if waking {
+            format!("Waiting for “{}…” — or click to talk now", self.settings.wake_phrase)
+        } else if self.speaker.busy() {
+            "Speaking — click to interrupt and talk".to_string()
+        } else if rec && self.listen_purpose == Listen::FollowUp {
+            "Listening for a follow-up… (stay silent to stop)".to_string()
+        } else if rec {
             "Listening… click (or Ctrl+Space) to finish".to_string()
         } else {
             match &self.voice_status {
@@ -2038,18 +2250,8 @@ impl App {
                 ui.label(RichText::new("Still waiting for the first word — the first request loads the model into memory, and models that don't fit in GPU memory run slowly on the CPU.").small().color(theme::TEXT_DIM));
             }
             if stop {
-                self.ai
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                // Stop immediately in the UI even if Ollama is still busy on its side.
-                self.review = None;
-                self.ai_cancelled = true;
-                self.waiting_ai = None;
-                let partial = self.streaming.take();
-                if let Some((i, _)) = partial {
-                    self.chat[i].streaming = false;
-                }
-                self.chat.push(ChatEntry::new(Role::System, if partial.is_some() { "Stopped. Changes made so far are kept (Ctrl+Z undoes them in one step)." } else { "Stopped." }));
+                self.cancel_ai();
+                self.voice_turn = None;
             }
             ui.ctx().request_repaint();
         }
@@ -2152,10 +2354,16 @@ impl App {
                 ui.horizontal(|ui| {
                     self.mic_button(ui, 13.0);
                     ui.label(
-                        RichText::new(if self.settings.hands_free {
-                            "hands-free"
+                        RichText::new(if self.voice.recorder.recording && self.listen_purpose == Listen::Wake {
+                            format!("say “{}…”", self.settings.wake_phrase)
+                        } else if self.voice.recorder.recording && self.listen_purpose == Listen::FollowUp {
+                            "listening for a follow-up…".to_string()
+                        } else if self.speaker.busy() {
+                            "speaking…".to_string()
+                        } else if self.settings.hands_free {
+                            "hands-free".to_string()
                         } else {
-                            "push-to-talk"
+                            "push-to-talk".to_string()
                         })
                         .small()
                         .color(theme::TEXT_DIM),
@@ -2392,7 +2600,22 @@ impl App {
                         );
                         ui.end_row();
                         ui.label("");
-                        ui.checkbox(&mut self.settings.speak_replies, "🔊 Speak replies aloud");
+                        ui.checkbox(&mut self.settings.voice_confirm, "Say what I did after voice requests")
+                            .on_hover_text("A short spoken confirmation, e.g. “Added UV Sphere Ball.” Say “repeat that” to hear it again.");
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.settings.conversation, "Conversation: listen again after each reply")
+                            .on_hover_text("The mic re-opens after the spoken reply; stay silent for 7 s or say “that's all” to stop. “No, undo that” or “stop” work at any time.");
+                        ui.end_row();
+                        ui.label("Wake word");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.settings.wake_word, "");
+                            ui.add_enabled(self.settings.wake_word, egui::TextEdit::singleline(&mut self.settings.wake_phrase).desired_width(90.0))
+                                .on_hover_text("Say e.g. “Blender, add a red cube”. Listening runs locally with Whisper; nothing leaves your computer.");
+                        });
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.settings.speak_replies, "🔊 Also speak typed replies");
                         ui.end_row();
                     });
                 ui.vertical(|ui| {
@@ -3853,40 +4076,13 @@ fn clean_transcript(t: &str) -> String {
         .to_string()
 }
 
-fn speak(text: &str) {
-    let text = text.replace(['"', '\'', '`', '$'], " ");
-    if text.trim().is_empty() {
-        return;
-    }
-    std::thread::spawn(move || {
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            let script = format!(
-                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Rate = 1; $s.Speak(\"{}\")",
-                text
-            );
-            let _ = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &script])
-                .creation_flags(0x08000000)
-                .status();
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("say").arg(&text).status();
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let _ = std::process::Command::new("espeak").arg(&text).status();
-        }
-    });
-}
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_events();
         self.poll_mcp();
+        self.voice_tick(&ctx);
         self.shortcuts(&ctx);
         self.tick_playback(&ctx);
 

@@ -51,6 +51,8 @@ pub enum AiRequest {
         history: Vec<ChatMsg>,
         scene: String,
         prompt: String,
+        /// The prompt came from speech recognition (may contain mishearings; answers should be short).
+        voice: bool,
     },
     Pull(String),
     /// Agent loop check stage: review flagged issues with `model` and propose fixes.
@@ -126,10 +128,15 @@ impl AiClient {
                             history,
                             scene,
                             prompt,
+                            voice,
                         } => {
                             let t0 = std::time::Instant::now();
                             cancel2.store(false, Ordering::Relaxed);
-                            let mut prompt = prompt;
+                            let mut prompt = if voice {
+                                format!("{prompt}\n\n(Spoken request, transcribed by speech recognition: silently fix obvious mishearings of 3D terms. The reply is read aloud, so keep it to one short sentence.)")
+                            } else {
+                                prompt
+                            };
                             // ---- stage 1: decision model ----
                             if let Some(rm) = router.filter(|r| *r != model) {
                                 let tool_mode = *tool_caps.entry(rm.clone()).or_insert_with(|| crate::router::capabilities(&agent, &host, &rm).iter().any(|c| c == "tools" || c == "decision"));

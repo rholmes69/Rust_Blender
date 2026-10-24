@@ -53,6 +53,8 @@ pub enum AiRequest {
         prompt: String,
     },
     Pull(String),
+    /// Agent loop check stage: review flagged issues with `model` and propose fixes.
+    Review { model: String, prompt: String, round: u32 },
 }
 
 #[derive(Debug)]
@@ -73,6 +75,8 @@ pub enum AiEvent {
     Error(String),
     /// The decision model chose a route (shown in the chat before the builder answers).
     Routed { router: String, route: String, detail: String, secs: f32 },
+    /// Result of a review round.
+    Reviewed { model: String, reply: String, commands: Vec<Command>, round: u32, secs: f32, error: Option<String> },
     /// The decision model failed; the builder handles the request instead.
     RouterFailed(String),
     /// (model, fraction of the model in VRAM)
@@ -105,6 +109,7 @@ impl AiClient {
                     .build()
                     .into();
                 let mut tool_caps: std::collections::HashMap<String, bool> = Default::default();
+                let mut decide_modes: std::collections::HashMap<String, Option<String>> = Default::default();
                 for req in req_rx {
                     match req {
                         AiRequest::ListModels => {
@@ -127,8 +132,8 @@ impl AiClient {
                             let mut prompt = prompt;
                             // ---- stage 1: decision model ----
                             if let Some(rm) = router.filter(|r| *r != model) {
-                                let tool_mode = *tool_caps.entry(rm.clone()).or_insert_with(|| crate::router::capabilities(&agent, &host, &rm).iter().any(|c| c == "tools"));
-                                match crate::router::decide(&agent, &host, &rm, &history, &scene, &prompt, tool_mode) {
+                                let tool_mode = *tool_caps.entry(rm.clone()).or_insert_with(|| crate::router::capabilities(&agent, &host, &rm).iter().any(|c| c == "tools" || c == "decision"));
+                                match crate::router::decide(&agent, &host, &rm, &history, &scene, &prompt, tool_mode, decide_modes.entry(rm.clone()).or_default()) {
                                     Ok((route, raw)) => {
                                         let secs = t0.elapsed().as_secs_f32();
                                         match route {
@@ -179,6 +184,14 @@ impl AiClient {
                                 Err(e) => AiEvent::Error(friendly_error(&e, &model)),
                             };
                             let _ = ev_tx.send(ev);
+                        }
+                        AiRequest::Review { model, prompt, round } => {
+                            let t0 = std::time::Instant::now();
+                            let (reply, commands, error) = match crate::router::review(&agent, &host, &model, &prompt) {
+                                Ok((r, c)) => (r, c, None),
+                                Err(e) => (String::new(), vec![], Some(e)),
+                            };
+                            let _ = ev_tx.send(AiEvent::Reviewed { model, reply, commands, round, secs: t0.elapsed().as_secs_f32(), error });
                         }
                         AiRequest::Pull(model) => {
                             let r = pull(&agent, &host, &model, &ev_tx, &repaint);

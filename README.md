@@ -41,6 +41,16 @@ Install a small tool-calling **decision model** (for example `tev1`) alongside q
 
 The chat shows who handled each request ("handled by tev1 · direct" or "tev1 → qwen3:8b · plan: …"). If the decision model doesn't support Ollama tools, the app falls back to JSON output with the same routes. If the decision model fails, qwen handles the request. Simple commands like "undo" or "top view" still skip both models.
 
+### Agent loop: plan → act → check
+
+After any AI build, Rust Blender **checks the result** itself, using the real mesh geometry rather than the model's guess:
+
+* objects **floating** above whatever is below them, or **sunk** into the ground;
+* objects **hidden** completely inside another object (tested point by point against the actual mesh, so a scarf around a neck isn't flagged, but a nose buried inside a head is);
+* exact **duplicates**, and **failed commands**.
+
+Only objects the build touched are checked. The flagged issues and the scene's bounding boxes go to the **reviewer**: the decision model if you have one, otherwise the builder. The reviewer decides which problems are real (a ring meant to hover stays put) and sends fixes. The check runs again, up to 2 rounds. The build and all its fixes form **one undo step**. You can turn the loop off with Copilot ⚙ → "Check & fix AI builds".
+
 ## Setup (Windows)
 
 1. Install **Rust**: <https://rustup.rs>. You also need the *MSVC C++ Build Tools*; rustup offers to install them.

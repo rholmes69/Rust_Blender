@@ -23,6 +23,8 @@ pub struct Settings {
     pub auto_select_model: bool,
     /// Fast decision/router model consulted before the builder model ("" = none).
     pub decision_model: String,
+    /// Agent loop: inspect AI builds and let a reviewer fix mistakes.
+    pub auto_check: bool,
     pub auto_decision_model: bool,
     pub auto_execute: bool,
     pub instant_commands: bool,
@@ -51,6 +53,7 @@ impl Default for Settings {
             model: String::new(),
             auto_select_model: true,
             decision_model: String::new(),
+            auto_check: true,
             auto_decision_model: true,
             auto_execute: true,
             instant_commands: true,
@@ -141,6 +144,13 @@ impl ChatEntry {
     }
 }
 
+struct ReviewState {
+    request: String,
+    subjects: Vec<u64>,
+    round: u32,
+    idx: usize,
+}
+
 struct Toast {
     text: String,
     color: Color32,
@@ -168,6 +178,10 @@ pub struct App {
     route_stage: Option<String>,
     pending_via: Option<String>,
     router_warned: bool,
+    /// Agent loop state for the build being checked.
+    review: Option<ReviewState>,
+    pending_fixes: Vec<Command>,
+    last_prompt: String,
     pull: Option<(String, f32)>,
     voice_status: VoiceStatus,
     transcribing: bool,
@@ -238,6 +252,9 @@ impl App {
             route_stage: None,
             pending_via: None,
             router_warned: false,
+            review: None,
+            pending_fixes: vec![],
+            last_prompt: String::new(),
             pull: None,
             voice_status: VoiceStatus::NotLoaded,
             transcribing: false,
@@ -306,6 +323,7 @@ impl App {
                 AiEvent::Models(Err(e)) => {
                     self.ollama = OllamaStatus::Offline(e);
                 }
+                AiEvent::Reviewed { model, reply, commands, round, secs, error } => self.on_reviewed(model, reply, commands, round, secs, error),
                 AiEvent::Routed { router, route, detail, secs } => {
                     match route.as_str() {
                         "delegate" => {
@@ -368,8 +386,12 @@ impl App {
                         self.ed.view_requests.push(ViewRequest::FrameAll);
                     }
                     self.chat[idx].streaming = false;
+                    let snapped = self.streaming.is_some_and(|s| s.1);
                     self.streaming = None;
                     self.ai.send(AiRequest::Ps(self.settings.model.clone()));
+                    if snapped {
+                        self.start_check(idx);
+                    }
                     if self.settings.speak_replies {
                         speak(&reply);
                     }
@@ -496,8 +518,105 @@ impl App {
         self.chat[idx].commands.extend(cmds);
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Agent loop: check the result of an AI build and let a reviewer model fix mistakes
+    // ---------------------------------------------------------------------------------------
+    fn reviewer_model(&self) -> String {
+        let d = &self.settings.decision_model;
+        if !d.is_empty() && self.models.contains(d) { d.clone() } else { self.settings.model.clone() }
+    }
+
+    /// Called after an AI answer was applied (one undo snapshot was taken before it).
+    fn start_check(&mut self, idx: usize) {
+        if !self.settings.auto_check || !self.chat[idx].applied {
+            return;
+        }
+        let e = &self.chat[idx];
+        let failed: Vec<String> = e.log.iter().filter(|l| l.starts_with('✖')).cloned().collect();
+        let builds = e.commands.iter().any(|c| matches!(c.action.as_str(), "add" | "move" | "set_transform" | "scale" | "duplicate" | "extrude"));
+        if !builds && failed.is_empty() {
+            return;
+        }
+        let Some((before, _)) = self.ed.undo_stack.last() else { return };
+        let subjects = crate::agent::changed_objects(before, &self.ed.scene);
+        self.review = Some(ReviewState { request: self.last_prompt.clone(), subjects, round: 0, idx });
+        self.run_check(failed);
+    }
+
+    fn run_check(&mut self, failed: Vec<String>) {
+        let Some(st) = self.review.as_mut() else { return };
+        let issues = crate::agent::inspect(&self.ed.scene, &mut self.vp.mesh_cache, &st.subjects, &failed);
+        st.round += 1;
+        let round = st.round;
+        let idx = st.idx;
+        if issues.is_empty() {
+            if round == 1 {
+                if let Some(e) = self.chat.get_mut(idx) {
+                    let v = e.via.take().map(|v| format!("{v} · ")).unwrap_or_default();
+                    e.via = Some(format!("{v}🔍 checked: no problems found"));
+                }
+            } else {
+                self.chat.push(ChatEntry::new(Role::System, "🔍 Re-checked: all issues resolved."));
+            }
+            self.review = None;
+            return;
+        }
+        if round > 2 {
+            let list: Vec<String> = issues.iter().map(|i| format!("• {}", i.text)).collect();
+            self.chat.push(ChatEntry::new(Role::System, format!("🔍 Still flagged after 2 review rounds (probably intentional):\n{}", list.join("\n"))));
+            self.review = None;
+            return;
+        }
+        let list: Vec<String> = issues.iter().map(|i| format!("• {}", i.text)).collect();
+        self.chat.push(ChatEntry::new(Role::System, format!("🔍 Check {round}: {} possible problem(s)\n{}", issues.len(), list.join("\n"))));
+        let model = self.reviewer_model();
+        let bounds = crate::agent::bounds_report(&self.ed.scene, &mut self.vp.mesh_cache);
+        let req = self.review.as_ref().map(|r| r.request.clone()).unwrap_or_default();
+        let prompt = crate::agent::review_prompt(&req, &issues, &bounds);
+        self.pending_fixes = issues.into_iter().filter_map(|i| i.auto_fix).collect();
+        self.route_stage = Some(format!("{model} reviewing"));
+        self.waiting_ai = Some(Instant::now());
+        self.ai.send(AiRequest::Review { model, prompt, round });
+    }
+
+    fn on_reviewed(&mut self, model: String, reply: String, commands: Vec<Command>, round: u32, secs: f32, error: Option<String>) {
+        self.waiting_ai = None;
+        self.route_stage = None;
+        if self.review.as_ref().is_none_or(|r| r.round != round) {
+            return; // stale
+        }
+        let (cmds, note) = match error {
+            Some(e) => (std::mem::take(&mut self.pending_fixes), format!("reviewer unavailable ({e}); applied safe automatic fixes")),
+            None => (commands, String::new()),
+        };
+        self.pending_fixes.clear();
+        if cmds.is_empty() {
+            let mut e = ChatEntry::new(Role::Assistant, if reply.is_empty() { "Those look intentional — no changes." } else { reply.as_str() });
+            e.via = Some(format!("🔍 review by {} · round {round} · {secs:.1}s", short_model(&model)));
+            self.chat.push(e);
+            self.review = None;
+            return;
+        }
+        // Fixes join the build's undo step (no new snapshot).
+        let log = self.ed.execute_no_snapshot(&cmds);
+        let failed: Vec<String> = log.iter().filter(|l| l.starts_with('✖')).cloned().collect();
+        let mut e = ChatEntry::new(Role::Assistant, if reply.is_empty() { "Fixed.".to_string() } else { reply });
+        e.commands = cmds;
+        e.log = log;
+        e.applied = true;
+        e.secs = secs;
+        e.via = Some(if note.is_empty() { format!("🔍 review by {} · round {round}", short_model(&model)) } else { format!("🔍 {note}") });
+        self.chat.push(e);
+        // include anything the fixes added in the next check
+        if let (Some(st), Some((before, _))) = (self.review.as_mut(), self.ed.undo_stack.last()) {
+            st.subjects = crate::agent::changed_objects(before, &self.ed.scene);
+        }
+        self.run_check(failed);
+    }
+
     fn submit_prompt(&mut self, text: String, from_voice: bool, stt_secs: f32) {
         let text = text.trim().to_string();
+        self.last_prompt = text.clone();
         if text.is_empty() {
             return;
         }
@@ -1612,6 +1731,7 @@ impl App {
                     .cancel
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 // Stop immediately in the UI even if Ollama is still busy on its side.
+                self.review = None;
                 self.ai_cancelled = true;
                 self.waiting_ai = None;
                 let partial = self.streaming.take();
@@ -1846,6 +1966,9 @@ impl App {
                         ui.end_row();
                         ui.label("");
                         ui.checkbox(&mut self.settings.auto_decision_model, "Auto-use tev1 when installed");
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.settings.auto_check, "🔍 Check & fix AI builds (agent loop)").on_hover_text("After a build, Rust checks for floating, sunken, hidden or duplicate objects and failed commands; the decision model (or builder) reviews and fixes real mistakes — up to 2 rounds, all in one undo step.");
                         ui.end_row();
                         ui.label("Pull");
                         ui.horizontal(|ui| {

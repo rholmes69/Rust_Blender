@@ -102,30 +102,68 @@ CURRENT SCENE:
 }
 
 /// Ask the decision model how to handle `prompt`.
-pub fn decide(agent: &ureq::Agent, host: &str, model: &str, history: &[ChatMsg], scene: &str, prompt: &str, tool_mode: bool) -> Result<(Route, String), String> {
+/// `mode_cache` remembers which request style ("tools", "json", "plain") this model accepted,
+/// so later requests don't retry the ones it rejects.
+pub fn decide(agent: &ureq::Agent, host: &str, model: &str, history: &[ChatMsg], scene: &str, prompt: &str, tool_mode: bool, mode_cache: &mut Option<String>) -> Result<(Route, String), String> {
     let mut messages = vec![json!({"role": "system", "content": decision_prompt(scene, tool_mode)})];
     for m in history.iter().rev().take(4).rev() {
         let c: String = m.content.chars().take(600).collect();
         messages.push(json!({"role": m.role, "content": c}));
     }
     messages.push(json!({"role": "user", "content": prompt}));
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-        "keep_alive": "30m",
-        "options": {"temperature": 0.0, "num_ctx": 4096}
-    });
-    if tool_mode {
-        body["tools"] = tools();
-    } else {
-        body["format"] = json_route_schema();
+    // Try the richest mode first and degrade gracefully: tool calling -> JSON schema ->
+    // plain JSON instructions (some models, e.g. ones exposing a "decision" capability,
+    // reject `tools`, `format` or `think`).
+    let all: &[(&str, bool)] = if tool_mode { &[("tools", true), ("json", true), ("plain", false)] } else { &[("json", true), ("plain", false)] };
+    let cached: Vec<(&str, bool)> = all.iter().copied().filter(|(m, _)| mode_cache.as_deref() == Some(*m)).collect();
+    let modes: Vec<(&str, bool)> = if cached.is_empty() { all.to_vec() } else { cached.into_iter().chain(all.iter().copied().filter(|(m, _)| mode_cache.as_deref() != Some(*m))).collect() };
+    let mut last_err = String::new();
+    let mut v = Value::Null;
+    for (mode, think_flag) in &modes {
+        let mut msgs = messages.clone();
+        if *mode != "tools" {
+            msgs[0] = json!({"role": "system", "content": decision_prompt(scene, false)});
+        }
+        let mut body = json!({
+            "model": model,
+            "messages": msgs,
+            "stream": false,
+            "keep_alive": "30m",
+            "options": {"temperature": 0.0, "num_ctx": 4096}
+        });
+        if *think_flag {
+            body["think"] = json!(false);
+        }
+        match *mode {
+            "tools" => body["tools"] = tools(),
+            "json" => body["format"] = json_route_schema(),
+            _ => {}
+        }
+        let mut resp = match agent.post(&format!("{host}/api/chat")).send_json(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                // e.g. a dropped keep-alive connection after an error response: try the next mode
+                last_err = format!("request failed: {e}");
+                continue;
+            }
+        };
+        let status = resp.status();
+        let val: Value = match resp.body_mut().read_json() {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = format!("bad response: {e}");
+                continue;
+            }
+        };
+        if status.is_success() && val.get("error").is_none() {
+            v = val;
+            *mode_cache = Some(mode.to_string());
+            break;
+        }
+        last_err = val["error"].as_str().unwrap_or("unknown error").to_string();
     }
-    let mut resp = agent.post(&format!("{host}/api/chat")).send_json(&body).map_err(|e| format!("decision model request failed: {e}"))?;
-    let status = resp.status();
-    let v: Value = resp.body_mut().read_json().map_err(|e| format!("bad response from decision model: {e}"))?;
-    if !status.is_success() || v.get("error").is_some() {
-        return Err(format!("decision model error: {}", v["error"].as_str().unwrap_or("unknown")));
+    if v.is_null() {
+        return Err(format!("decision model error: {last_err}"));
     }
     let raw = v["message"].to_string();
     let route = parse_decision(&v["message"])?;
@@ -181,6 +219,7 @@ pub fn parse_decision(msg: &Value) -> Result<Route, String> {
         Some(i) => content[i + 8..].trim(),
         None => content,
     };
+    let content = content.trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     let start = content.find('{').ok_or_else(|| format!("decision model gave no decision: {content}"))?;
     let v: Value = serde_json::Deserializer::from_str(&content[start..]).into_iter::<Value>().next().ok_or("empty decision")?.map_err(|e| e.to_string())?;
     let reply = v["reply"].as_str().unwrap_or("").to_string();
@@ -237,4 +276,34 @@ mod tests {
         assert_eq!(pick_decision_model(&inst).as_deref(), Some("tev1:latest"));
         assert!(tools().as_array().unwrap().len() == 3);
     }
+}
+
+/// Agent loop "check" stage: ask a model to review flagged issues and return fix commands.
+pub fn review(agent: &ureq::Agent, host: &str, model: &str, prompt: &str) -> Result<(String, Vec<Command>), String> {
+    let mut last_err = String::new();
+    for (use_format, think_flag) in [(true, true), (false, false)] {
+        let mut body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+            "keep_alive": "30m",
+            "options": {"temperature": 0.1, "num_ctx": 6144}
+        });
+        if use_format {
+            body["format"] = command_schema();
+        }
+        if think_flag {
+            body["think"] = json!(false);
+        }
+        let mut resp = agent.post(&format!("{host}/api/chat")).send_json(&body).map_err(|e| format!("review request failed: {e}"))?;
+        let status = resp.status();
+        let v: Value = resp.body_mut().read_json().map_err(|e| format!("bad review response: {e}"))?;
+        if status.is_success() && v.get("error").is_none() {
+            let content = v["message"]["content"].as_str().unwrap_or("");
+            let (reply, cmds, _) = crate::ai::parse_ai_content(content)?;
+            return Ok((reply, cmds));
+        }
+        last_err = v["error"].as_str().unwrap_or("unknown error").to_string();
+    }
+    Err(format!("review model error: {last_err}"))
 }

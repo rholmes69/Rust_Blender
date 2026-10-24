@@ -3,6 +3,7 @@
     windows_subsystem = "windows"
 )]
 
+mod agent;
 mod ai;
 mod app;
 mod editmesh;

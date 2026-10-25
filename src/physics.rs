@@ -40,6 +40,43 @@ pub enum Collider {
 }
 
 impl Collider {
+    /// Where a moving point a→b first enters the collider (boxes; thin floors included).
+    fn sweep(&self, a: Vec3, b: Vec3) -> Option<(Vec3, Vec3)> {
+        let Collider::Box { to_local, to_world, half } = *self else { return None };
+        let (la, lb) = (to_local.transform_point3(a), to_local.transform_point3(b));
+        let d = lb - la;
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        let mut axis = None;
+        for k in 0..3 {
+            if d[k].abs() < 1e-12 {
+                if la[k].abs() > half[k] {
+                    return None;
+                }
+                continue;
+            }
+            let (mut e, mut x) = ((-half[k] - la[k]) / d[k], (half[k] - la[k]) / d[k]);
+            if e > x {
+                std::mem::swap(&mut e, &mut x);
+            }
+            if e > t0 {
+                t0 = e;
+                axis = Some(k);
+            }
+            t1 = t1.min(x);
+            if t0 > t1 {
+                return None;
+            }
+        }
+        let k = axis?;
+        if t0 <= 0.0 {
+            return None;
+        }
+        let mut nl = Vec3::ZERO;
+        nl[k] = -d[k].signum();
+        let hit = la + d * t0 + nl * 1e-4;
+        Some((to_world.transform_point3(hit), to_world.transform_vector3(nl).normalize_or_zero()))
+    }
+
     /// Push `p` out of the collider; returns the surface normal when it was inside.
     fn resolve(&self, p: &mut Vec3, margin: f32) -> Option<Vec3> {
         match *self {
@@ -233,6 +270,383 @@ pub fn pick_pins(pm: &PolyMesh, obj: Mat4, how: &str) -> Vec<u32> {
     }
 }
 
+// ---- rigid bodies ---------------------------------------------------------------------------
+
+/// A rigid body: simulated (active) or an obstacle that other bodies hit (passive).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RigidBody {
+    pub passive: bool,
+    /// 0..1 bounciness, 0..1 friction.
+    pub bounce: f32,
+    pub friction: f32,
+    /// Baked transforms per frame, from `start`.
+    #[serde(skip)]
+    pub cache: std::sync::Arc<Vec<crate::scene::Transform>>,
+    #[serde(default)]
+    pub start: i32,
+    /// Where the body starts (saved, so re-simulating after opening a file starts right).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::scene::Transform>,
+}
+
+impl Default for RigidBody {
+    fn default() -> Self {
+        RigidBody { passive: false, bounce: 0.3, friction: 0.5, cache: Default::default(), start: 1, origin: None }
+    }
+}
+
+/// Input for a rigid-body bake: one active body.
+pub struct BodyIn {
+    pub transform: crate::scene::Transform,
+    /// sphere primitive with uniform scale (simulated as one round particle)
+    pub sphere: bool,
+    /// local-space bounds of its mesh
+    pub bounds: (Vec3, Vec3),
+    pub bounce: f32,
+    pub friction: f32,
+}
+
+/// Rotation nearest to `a` (Müller et al. 2016), warm-started from `q`.
+fn extract_rotation(a: glam::Mat3, mut q: glam::Quat) -> glam::Quat {
+    for _ in 0..24 {
+        let r = glam::Mat3::from_quat(q);
+        let omega = r.x_axis.cross(a.x_axis) + r.y_axis.cross(a.y_axis) + r.z_axis.cross(a.z_axis);
+        let denom = (r.x_axis.dot(a.x_axis) + r.y_axis.dot(a.y_axis) + r.z_axis.dot(a.z_axis)).abs() + 1e-9;
+        let w = omega / denom;
+        let angle = w.length();
+        if angle < 1e-9 {
+            break;
+        }
+        q = (glam::Quat::from_axis_angle(w / angle, angle) * q).normalize();
+    }
+    q
+}
+
+/// Bake active bodies (particle clusters with shape matching) against static colliders.
+/// Returns per body the transform of every frame.
+pub fn bake_rigid(bodies: &[BodyIn], statics: &[Collider], frames: usize, fps: f32, gravity: f32) -> Vec<Vec<crate::scene::Transform>> {
+    struct Body {
+        idx: Vec<usize>,
+        rest: Vec<Vec3>,
+        c0: Vec3,
+        m0: Mat4,
+        q: glam::Quat,
+        bounce: f32,
+        friction: f32,
+    }
+    let mut x: Vec<Vec3> = vec![];
+    let mut rad: Vec<f32> = vec![];
+    let mut owner: Vec<usize> = vec![];
+    let mut bs: Vec<Body> = vec![];
+    for (bi, b) in bodies.iter().enumerate() {
+        let m = b.transform.matrix();
+        let mut pts = vec![];
+        if b.sphere {
+            pts.push((m.transform_point3(Vec3::ZERO), b.transform.scale.x.abs().max(1e-3)));
+        } else {
+            let (lo, hi) = b.bounds;
+            let ext = (hi - lo).max(Vec3::splat(1e-4));
+            let world_ext = m.transform_vector3(Vec3::X).length() * ext.x;
+            let world_ey = m.transform_vector3(Vec3::Y).length() * ext.y;
+            let world_ez = m.transform_vector3(Vec3::Z).length() * ext.z;
+            let we = Vec3::new(world_ext, world_ey, world_ez);
+            // particles across the box, spacing from the smallest side
+            let spacing = (we.min_element() / 3.0).max(we.max_element() / 7.0).max(1e-3);
+            let n = (we / spacing).ceil().max(Vec3::ONE);
+            let (nx, ny, nz) = (n.x as usize, n.y as usize, n.z as usize);
+            let r = spacing * 0.5;
+            for i in 0..nx {
+                for j in 0..ny {
+                    for k in 0..nz {
+                        let f = Vec3::new((i as f32 + 0.5) / nx as f32, (j as f32 + 0.5) / ny as f32, (k as f32 + 0.5) / nz as f32);
+                        // pull the outer particles in so their spheres stay inside the box
+                        let local = lo + ext * f;
+                        pts.push((m.transform_point3(local), r.min(we.min_element() * 0.5)));
+                    }
+                }
+            }
+        }
+        let start = x.len();
+        let c0 = pts.iter().map(|p| p.0).sum::<Vec3>() / pts.len() as f32;
+        let mut rest = vec![];
+        for (p, r) in pts {
+            x.push(p);
+            rad.push(r);
+            owner.push(bi);
+            rest.push(p - c0);
+        }
+        bs.push(Body { idx: (start..x.len()).collect(), rest, c0, m0: m, q: glam::Quat::IDENTITY, bounce: b.bounce, friction: b.friction });
+    }
+    let n = x.len();
+    let mut v = vec![Vec3::ZERO; n];
+    let sub = 10;
+    let dt = 1.0 / fps.max(1.0) / sub as f32;
+    let g = Vec3::new(0.0, 0.0, -gravity);
+    let rmax = rad.iter().copied().fold(0.01, f32::max);
+    let cell = rmax * 2.0;
+    let mut out: Vec<Vec<crate::scene::Transform>> = bodies.iter().map(|b| vec![b.transform]).collect();
+    for _f in 1..frames {
+        for _s in 0..sub {
+            let x0 = x.clone();
+            for i in 0..n {
+                v[i] += g * dt;
+                x[i] += v[i] * dt;
+            }
+            let v_pre = v.clone();
+            let mut contact = vec![None::<Vec3>; n];
+            for _it in 0..6 {
+                // static colliders
+                for i in 0..n {
+                    for c in statics {
+                        let before = x[i];
+                        if let Some(nrm) = c.resolve(&mut x[i], rad[i]) {
+                            contact[i] = Some(nrm);
+                            // position-based friction: cancel sliding up to mu × penetration
+                            let pen = (x[i] - before).length();
+                            let dp = x[i] - x0[i];
+                            let dpt = dp - nrm * dp.dot(nrm);
+                            let mu = bs[owner[i]].friction;
+                            let l = dpt.length();
+                            if l > 1e-9 {
+                                x[i] -= dpt * (mu * pen * 2.0 / l).min(1.0);
+                            }
+                        }
+                    }
+                }
+                // body–body: spatial hash
+                let mut grid: std::collections::HashMap<(i32, i32, i32), Vec<usize>> = std::collections::HashMap::new();
+                let key = |p: Vec3| ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32, (p.z / cell).floor() as i32);
+                for i in 0..n {
+                    grid.entry(key(x[i])).or_default().push(i);
+                }
+                for i in 0..n {
+                    let (kx, ky, kz) = key(x[i]);
+                    for dx in -1..=1 {
+                        for dy in -1..=1 {
+                            for dz in -1..=1 {
+                                let Some(list) = grid.get(&(kx + dx, ky + dy, kz + dz)) else { continue };
+                                for &j in list {
+                                    if j <= i || owner[j] == owner[i] {
+                                        continue;
+                                    }
+                                    let d = x[j] - x[i];
+                                    let l = d.length();
+                                    let min = rad[i] + rad[j];
+                                    if l < min && l > 1e-7 {
+                                        let nrm = d / l;
+                                        let corr = nrm * (min - l) * 0.5;
+                                        x[i] -= corr;
+                                        x[j] += corr;
+                                        // friction between the two bodies
+                                        let dp = (x[j] - x0[j]) - (x[i] - x0[i]);
+                                        let dpt = dp - nrm * dp.dot(nrm);
+                                        let mu = (bs[owner[i]].friction + bs[owner[j]].friction) * 0.5;
+                                        let lt = dpt.length();
+                                        if lt > 1e-9 {
+                                            let k = (mu * (min - l) * 2.0 / lt).min(1.0) * 0.5;
+                                            x[i] += dpt * k;
+                                            x[j] -= dpt * k;
+                                        }
+                                        contact[i] = Some(-nrm);
+                                        contact[j] = Some(nrm);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // shape matching: every body stays rigid
+                for b in bs.iter_mut() {
+                    let c = b.idx.iter().map(|&i| x[i]).sum::<Vec3>() / b.idx.len() as f32;
+                    if b.idx.len() > 1 {
+                        let mut a = glam::Mat3::ZERO;
+                        for (k, &i) in b.idx.iter().enumerate() {
+                            let p = x[i] - c;
+                            let q = b.rest[k];
+                            a += glam::Mat3::from_cols(p * q.x, p * q.y, p * q.z);
+                        }
+                        b.q = extract_rotation(a, b.q);
+                    }
+                    let r = glam::Mat3::from_quat(b.q);
+                    for (k, &i) in b.idx.iter().enumerate() {
+                        x[i] = c + r * b.rest[k];
+                    }
+                }
+            }
+            // velocities from positions, with bounce and friction at contacts
+            for b in &bs {
+                for &i in &b.idx {
+                    let mut vel = (x[i] - x0[i]) / dt;
+                    if let Some(nrm) = contact[i] {
+                        // position corrections must not launch things: the normal speed after a
+                        // contact is the bounce of the approach speed (resting contacts stay put)
+                        let approach = v_pre[i].dot(nrm);
+                        let vt = vel - nrm * vel.dot(nrm);
+                        let vn = if approach < -0.3 { -approach * b.bounce } else { vel.dot(nrm).clamp(-0.5, 0.0) };
+                        vel = nrm * vn + vt * (1.0 - b.friction * 0.15);
+                    }
+                    v[i] = vel * 0.998;
+                }
+            }
+            // keep each body's velocity field rigid (average linear + rotation implied by positions)
+            for b in &bs {
+                let vc = b.idx.iter().map(|&i| v[i]).sum::<Vec3>() / b.idx.len() as f32;
+                for &i in &b.idx {
+                    v[i] = v[i] * 0.5 + vc * 0.5;
+                }
+            }
+        }
+        for (bi, b) in bs.iter().enumerate() {
+            let c = b.idx.iter().map(|&i| x[i]).sum::<Vec3>() / b.idx.len() as f32;
+            let m = Mat4::from_rotation_translation(b.q, c) * Mat4::from_translation(-b.c0) * b.m0;
+            let mut t = crate::scene::Transform::from_matrix(m);
+            t.scale = bodies[bi].transform.scale;
+            out[bi].push(t);
+        }
+    }
+    out
+}
+
+// ---- particles --------------------------------------------------------------------------------
+
+/// A particle system: copies of `source` emitted from the surface of `emitter` over time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Particles {
+    pub source: u64,
+    pub emitter: u64,
+    /// New particles per frame.
+    pub rate: f32,
+    /// Life in frames.
+    pub lifetime: u32,
+    /// Launch speed along the emitter's normal (m/s) and random spread (0..1).
+    pub speed: f32,
+    pub spread: f32,
+    pub gravity: f32,
+    /// Velocity kept per second (air drag; 1 = none).
+    pub drag: f32,
+    pub size: f32,
+    /// Shrink to nothing at the end of life.
+    pub shrink: bool,
+    /// Bounce off the other meshes.
+    pub collide: bool,
+    pub seed: u32,
+    /// Frames simulated before the start, so it is already going at frame 1 (weather).
+    #[serde(default)]
+    pub preroll: u32,
+    /// Baked per frame: (position, size) of each living particle, world space, from `start`.
+    #[serde(skip)]
+    pub cache: std::sync::Arc<Vec<Vec<(Vec3, glam::Quat, f32)>>>,
+    #[serde(default)]
+    pub start: i32,
+}
+
+impl Particles {
+    pub fn new(source: u64, emitter: u64) -> Particles {
+        Particles { source, emitter, rate: 10.0, lifetime: 48, speed: 2.0, spread: 0.3, gravity: 9.81, drag: 0.9, size: 1.0, shrink: true, collide: true, seed: 1, preroll: 0, cache: Default::default(), start: 1 }
+    }
+}
+
+/// Simulate a particle system for `frames` frames.
+pub fn bake_particles(p: &Particles, emitter: &PolyMesh, emitter_world: Mat4, colliders: &[Collider], frames: usize, fps: f32) -> Vec<Vec<(Vec3, glam::Quat, f32)>> {
+    struct P {
+        x: Vec3,
+        v: Vec3,
+        rot: glam::Quat,
+        spin: Vec3,
+        age: f32,
+        life: f32,
+        size: f32,
+    }
+    let mut rng = {
+        let mut st = (p.seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 40) as f32 / (1u64 << 24) as f32
+        }
+    };
+    let dt = 1.0 / fps.max(1.0);
+    let drag = p.drag.clamp(0.0, 1.0).powf(dt);
+    let g = Vec3::new(0.0, 0.0, -p.gravity);
+    let mut alive: Vec<P> = vec![];
+    let mut out = Vec::with_capacity(frames);
+    let mut carry = 0.0f32;
+    let pre = p.preroll.min(2000) as usize;
+    for f in 0..frames + pre {
+        // emit (spawn points sampled on the surface, area-weighted)
+        carry += p.rate.max(0.0);
+        let n = carry.floor() as usize;
+        carry -= n as f32;
+        if n > 0 {
+            let pts = crate::scatter::sample_surface(emitter, emitter_world, n, p.seed.wrapping_add(f as u32 * 7919), 180.0);
+            for (pos, nrm) in pts {
+                let rand_dir = Vec3::new(rng() - 0.5, rng() - 0.5, rng() - 0.5) * 2.0;
+                let dir = (nrm + rand_dir * p.spread * 2.0).normalize_or(nrm);
+                let sub = rng(); // spread spawns over the frame
+                let mut x = pos;
+                let v = dir * p.speed * (0.75 + 0.5 * rng());
+                x += v * dt * sub;
+                alive.push(P {
+                    x,
+                    v,
+                    rot: glam::Quat::from_euler(glam::EulerRot::XYZ, rng() * 6.283, rng() * 6.283, rng() * 6.283),
+                    spin: Vec3::new(rng() - 0.5, rng() - 0.5, rng() - 0.5) * 6.0,
+                    age: 0.0,
+                    life: p.lifetime.max(1) as f32 * (0.8 + 0.4 * rng()),
+                    size: p.size * (0.7 + 0.6 * rng()),
+                });
+            }
+        }
+        // move
+        for q in alive.iter_mut() {
+            q.v = (q.v + g * dt) * drag;
+            let before = q.x;
+            q.x += q.v * dt;
+            if p.collide {
+                for c in colliders {
+                    if let Some((hit, nrm)) = c.sweep(before, q.x) {
+                        q.x = hit;
+                        let vn = q.v.dot(nrm);
+                        if vn < 0.0 {
+                            q.v -= nrm * vn * 1.5;
+                            q.v *= 0.7;
+                        }
+                        continue;
+                    }
+                    if let Some(nrm) = c.resolve(&mut q.x, 0.0) {
+                        let vn = q.v.dot(nrm);
+                        if vn < 0.0 {
+                            q.v -= nrm * vn * 1.5; // bounce a little
+                            q.v *= 0.7;
+                        }
+                        let _ = before;
+                    }
+                }
+            }
+            let w = q.spin * dt;
+            if w.length() > 1e-6 {
+                q.rot = (glam::Quat::from_axis_angle(w.normalize(), w.length()) * q.rot).normalize();
+            }
+            q.age += 1.0;
+        }
+        alive.retain(|q| q.age < q.life);
+        if f < pre {
+            continue;
+        }
+        out.push(
+            alive
+                .iter()
+                .map(|q| {
+                    let k = if p.shrink { (1.0 - q.age / q.life).clamp(0.0, 1.0).sqrt() } else { 1.0 };
+                    (q.x, q.rot, q.size * k)
+                })
+                .collect(),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +675,44 @@ mod tests {
         for p in pins {
             assert!(fr[23][p as usize].distance(pm.verts[p as usize]) < 1e-5);
         }
+    }
+    #[test]
+    fn rigid_bodies_fall_and_stack() {
+        let t = |z: f32| crate::scene::Transform { location: Vec3::new(0.0, 0.0, z), rotation: Vec3::new(20.0, 10.0, 0.0), scale: Vec3::splat(0.5) };
+        let cube = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        let bodies = vec![
+            BodyIn { transform: t(2.0), sphere: false, bounds: cube, bounce: 0.1, friction: 0.6 },
+            BodyIn { transform: t(4.0), sphere: false, bounds: cube, bounce: 0.1, friction: 0.6 },
+        ];
+        // a floor: a thin box at z = 0
+        let floor = Collider::Box { to_local: Mat4::IDENTITY, to_world: Mat4::IDENTITY, half: Vec3::new(10.0, 10.0, 0.001) };
+        let out = bake_rigid(&bodies, &[floor], 96, 24.0, 9.81);
+        let (a, b) = (out[0].last().unwrap(), out[1].last().unwrap());
+        assert!(a.location.z > 0.3 && a.location.z < 0.8, "first box rests on the floor: {:?}", a.location);
+        assert!(b.location.z > a.location.z + 0.6, "second box lands on top: {:?} vs {:?}", b.location, a.location);
+        // it settled: nearly still at the end
+        let p = out[1][out[1].len() - 2].location;
+        assert!(p.distance(b.location) < 0.02);
+    }
+    #[test]
+    fn particles_emit_fall_and_die() {
+        let plane = crate::mesh::Primitive::Plane.poly(1);
+        let w = Mat4::from_translation(Vec3::new(0.0, 0.0, 3.0));
+        let mut p = Particles::new(1, 2);
+        p.rate = 20.0;
+        p.lifetime = 24;
+        p.speed = 0.0;
+        let floor = Collider::Box { to_local: Mat4::IDENTITY, to_world: Mat4::IDENTITY, half: Vec3::new(10.0, 10.0, 0.001) };
+        let fr = bake_particles(&p, &plane, w, &[floor], 60, 24.0);
+        assert_eq!(fr.len(), 60);
+        assert!(fr[0].len() >= 19 && fr[0].len() <= 20);
+        // steady state: about rate × lifetime alive, nothing below the floor
+        let n = fr[59].len();
+        assert!(n > 350 && n < 600, "{n}");
+        assert!(fr.iter().flatten().all(|(x, _, _)| x.z >= -1e-3));
+        // falling
+        let z0 = fr[2].iter().map(|q| q.0.z).sum::<f32>() / fr[2].len() as f32;
+        let z1 = fr[20].iter().map(|q| q.0.z).sum::<f32>() / fr[20].len() as f32;
+        assert!(z1 < z0);
     }
 }

@@ -3321,7 +3321,7 @@ mod tests {
         v.proj = v.cam.proj(800.0 / 600.0);
         v.build_scene(&ed);
         let tris: Vec<&RPrim> = v.prims.iter().filter(|p| p.n == 3).collect();
-        let zs: Vec<f32> = tris.iter().flat_map(|p| p.p[..3].iter().map(|q| q[2])).collect();
+        let _zs: Vec<f32> = tris.iter().flat_map(|p| p.p[..3].iter().map(|q| q[2])).collect();
         let prims = v.prims.clone();
         v.raster.render([0.2; 3], [0.2; 3], &prims, None);
         assert_eq!(v.pick(pos2(400.0, 300.0)), ed.scene.objects.first().map(|o| o.id));

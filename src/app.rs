@@ -242,6 +242,11 @@ pub struct App {
     /// Last F12 render and whether its window is open.
     render: Option<RenderView>,
     show_render: bool,
+    /// Timeline render in progress.
+    anim: Option<crate::anim_render::AnimJob>,
+    /// Join rendered frames into an MP4 (when ffmpeg is installed).
+    anim_video: bool,
+    ffmpeg_ok: Option<bool>,
     /// Hands-free voice session.
     speaker: crate::voiceflow::Speaker,
     /// Chat index where the voice request currently being handled starts.
@@ -376,6 +381,9 @@ impl App {
             mcp_calls: 0,
             render: None,
             show_render: false,
+            anim: None,
+            anim_video: true,
+            ffmpeg_ok: None,
             speaker: Default::default(),
             voice_turn: None,
             relisten: false,
@@ -1111,6 +1119,8 @@ impl App {
                 self.ed.exit_edit();
                 self.ed.scene = s;
                 self.ed.reset_parent_cache();
+                // simulation caches aren't stored in the file: re-run them (they're deterministic)
+                self.ed.rebake_physics();
                 self.ed.selection.clear();
                 self.ed.active = None;
                 self.ed.file_path = Some(p.to_path_buf());
@@ -1307,6 +1317,61 @@ impl App {
                 }
                 self.chat.push(ChatEntry::new(Role::System, format!("⚙ MCP ({client_short}): rendered {}×{}", r.width, r.height)));
                 ToolResult { image_png: Some(png), ..ToolResult::ok(text) }
+            }
+            "render_animation" => {
+                let out = self.ed.scene.output;
+                let dir = args["dir"].as_str().filter(|d| !d.is_empty()).map(std::path::PathBuf::from).unwrap_or_else(|| crate::anim_render::default_dir(self.ed.file_path.as_deref()));
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    return ToolResult::err(format!("can't create {}: {e}", dir.display()));
+                }
+                let start = args["start"].as_i64().map(|v| v as i32).unwrap_or(self.ed.scene.frame_start);
+                let end = args["end"].as_i64().map(|v| v as i32).unwrap_or(self.ed.scene.frame_end).max(start);
+                if end - start > 2000 {
+                    return ToolResult::err("at most 2000 frames per call");
+                }
+                let w = args["width"].as_u64().map(|v| v as usize).unwrap_or(out.width as usize).clamp(16, 8192);
+                let h = args["height"].as_u64().map(|v| v as usize).unwrap_or(w * out.height as usize / out.width.max(1) as usize).clamp(16, 8192);
+                let path_traced = match args["engine"].as_str() {
+                    Some(e) => matches!(e, "path" | "path_traced" | "cycles"),
+                    None => out.engine == crate::scene::Engine::PathTraced,
+                };
+                let samples = args["samples"].as_u64().map(|v| v as u32).unwrap_or(out.samples).clamp(1, 1024);
+                let t0 = Instant::now();
+                let restore = self.ed.frame;
+                let mut last: Option<crate::viewport::RenderResult> = None;
+                for f in start..=end {
+                    self.ed.set_frame(f);
+                    self.ed.scene.update_derived();
+                    let r = if path_traced {
+                        let (cam, cam_name) = self.vp.render_view(&self.ed, w as f32 / h as f32);
+                        let sc = crate::pathtrace::PtScene::gather(&self.ed.scene, &mut self.vp.mesh_cache, &mut self.vp.tex_cache, cam);
+                        crate::viewport::RenderResult { width: w, height: h, rgba: crate::pathtrace::render_blocking(&sc, w, h, samples, out.denoise), camera: cam_name, ms: 0.0 }
+                    } else {
+                        self.vp.render_image(&self.ed, w, h, out.transparent)
+                    };
+                    let p = crate::anim_render::frame_path(&dir, f);
+                    if let Err(e) = crate::textures::encode_png(r.width, r.height, &r.rgba).and_then(|b| std::fs::write(&p, b).map_err(|e| e.to_string())) {
+                        self.ed.set_frame(restore);
+                        return ToolResult::err(format!("writing {}: {e}", p.display()));
+                    }
+                    last = Some(r);
+                }
+                self.ed.set_frame(restore);
+                let n = (end - start + 1) as usize;
+                let mut text = format!("Rendered {n} frames ({}×{}, {}) in {:.1} s to {}.", w, h, if path_traced { "path traced" } else { "fast" }, t0.elapsed().as_secs_f32(), dir.display());
+                if args["video"].as_bool().unwrap_or(true) && n > 1 {
+                    if *self.ffmpeg_ok.get_or_insert_with(crate::anim_render::ffmpeg_available) {
+                        match crate::anim_render::encode_video(&dir, start, self.ed.scene.fps) {
+                            Ok(p) => text += &format!(" Video: {}.", p.display()),
+                            Err(e) => text += &format!(" Video failed: {e}."),
+                        }
+                    } else {
+                        text += " (ffmpeg not found, so no MP4.)";
+                    }
+                }
+                self.chat.push(ChatEntry::new(Role::System, format!("⚙ MCP ({client_short}): rendered {n} frames")));
+                let png = last.and_then(|r| crate::textures::encode_png(r.width, r.height, &r.rgba).ok());
+                ToolResult { image_png: png, ..ToolResult::ok(text) }
             }
             other => ToolResult::err(format!("unknown tool: {other}")),
         }
@@ -1577,6 +1642,127 @@ impl App {
         }
     }
 
+    /// Start rendering the timeline into `dir` (default: next to the .rblend file).
+    fn start_anim_render(&mut self, ctx: &egui::Context, dir: Option<std::path::PathBuf>) {
+        if self.anim.is_some() {
+            self.toast("An animation render is already running", theme::WARN);
+            return;
+        }
+        let dir = dir.unwrap_or_else(|| crate::anim_render::default_dir(self.ed.file_path.as_deref()));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.toast(format!("Can't create {}: {e}", dir.display()), theme::ERR);
+            return;
+        }
+        let out = self.ed.scene.output;
+        let (start, end) = (self.ed.scene.frame_start, self.ed.scene.frame_end.max(self.ed.scene.frame_start));
+        let ff = *self.ffmpeg_ok.get_or_insert_with(crate::anim_render::ffmpeg_available);
+        self.ed.playing = false;
+        // a running still render would fight over the window
+        if let Some(rv) = self.render.as_mut() {
+            rv.job = None;
+        }
+        self.anim = Some(crate::anim_render::AnimJob {
+            dir: dir.clone(),
+            start,
+            end,
+            next: start,
+            path_traced: out.engine == crate::scene::Engine::PathTraced,
+            samples: out.samples.clamp(1, 4096),
+            denoise: out.denoise,
+            width: (out.width as usize).clamp(16, 8192),
+            height: (out.height as usize).clamp(16, 8192),
+            transparent: out.transparent,
+            video: self.anim_video && ff,
+            fps: self.ed.scene.fps.max(1),
+            started: Instant::now(),
+            done: 0,
+            restore_frame: self.ed.frame,
+            worker: None,
+            encoder: None,
+            error: None,
+            cancelled: false,
+        });
+        self.show_render = true;
+        self.toast(format!("Rendering frames {start}–{end} to {}", dir.display()), theme::OK);
+        ctx.request_repaint();
+    }
+
+    /// Advance the timeline render: one frame at a time, the heavy work on worker threads.
+    fn anim_tick(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.anim.as_mut() else { return };
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        // a frame finished?
+        if let Some(rx) = &job.worker {
+            match rx.try_recv() {
+                Ok(fd) => {
+                    job.worker = None;
+                    match fd.result {
+                        Ok(_) => job.done += 1,
+                        Err(e) => {
+                            job.error = Some(e);
+                            job.next = job.end + 1;
+                        }
+                    }
+                    // show it
+                    let img = egui::ColorImage::from_rgba_unmultiplied([fd.width, fd.height], &fd.rgba);
+                    let tex = ctx.load_texture("f12-render", img, egui::TextureOptions::LINEAR);
+                    let result = crate::viewport::RenderResult { width: fd.width, height: fd.height, rgba: fd.rgba, camera: Some(format!("frame {}", fd.frame)), ms: 0.0 };
+                    self.render = Some(RenderView { result, tex, saved: None, job: None, progress: None });
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(_) => {
+                    job.worker = None;
+                    job.error = Some("a render thread stopped".into());
+                    job.next = job.end + 1;
+                }
+            }
+        }
+        let job = self.anim.as_mut().unwrap();
+        if job.cancelled {
+            job.next = job.end + 1;
+        }
+        if job.next <= job.end {
+            let f = job.next;
+            job.next += 1;
+            let (dir, w, h, pt, samples, denoise, transparent) = (job.dir.clone(), job.width, job.height, job.path_traced, job.samples, job.denoise, job.transparent);
+            self.ed.set_frame(f);
+            self.ed.scene.update_derived();
+            let rx = if pt {
+                let (cam, _) = self.vp.render_view(&self.ed, w as f32 / h as f32);
+                let sc = crate::pathtrace::PtScene::gather(&self.ed.scene, &mut self.vp.mesh_cache, &mut self.vp.tex_cache, cam);
+                crate::anim_render::path_trace_async(sc, dir, f, w, h, samples, denoise)
+            } else {
+                let r = self.vp.render_image(&self.ed, w, h, transparent);
+                crate::anim_render::write_frame_async(dir, f, r.width, r.height, r.rgba)
+            };
+            self.anim.as_mut().unwrap().worker = Some(rx);
+            return;
+        }
+        // all frames written: video, then done
+        if job.video && job.error.is_none() && !job.cancelled && job.encoder.is_none() && job.done > 1 {
+            job.encoder = Some(crate::anim_render::encode_video_async(job.dir.clone(), job.start, job.fps));
+            job.video = false;
+            return;
+        }
+        let mut video_msg = String::new();
+        if let Some(rx) = &job.encoder {
+            match rx.try_recv() {
+                Ok(Ok(p)) => video_msg = format!(" and {}", p.display()),
+                Ok(Err(e)) => video_msg = format!(" (video: {e})"),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(_) => video_msg = " (video encoder stopped)".into(),
+            }
+        }
+        let job = self.anim.take().unwrap();
+        self.ed.set_frame(job.restore_frame);
+        let secs = job.started.elapsed().as_secs_f32();
+        match (&job.error, job.cancelled) {
+            (Some(e), _) => self.toast(format!("Animation render failed: {e}"), theme::ERR),
+            (None, true) => self.toast(format!("Animation render cancelled after {} frames", job.done), theme::WARN),
+            _ => self.toast(format!("Rendered {} frames in {secs:.0} s to {}{video_msg}", job.done, job.dir.display()), theme::OK),
+        }
+    }
+
     fn save_render(&mut self) {
         let Some(rv) = &self.render else { return };
         let name = self
@@ -1606,6 +1792,7 @@ impl App {
         }
         let mut open = true;
         let (mut rerender, mut save) = (false, false);
+        let mut anim_start: Option<Option<std::path::PathBuf>> = None;
         let mut out = self.ed.scene.output;
         egui::Window::new("Render")
             .open(&mut open)
@@ -1648,6 +1835,32 @@ impl App {
                         if running && ui.button("⏹ Stop").clicked() {
                             if let Some(rv) = self.render.as_mut() {
                                 rv.job = None;
+                            }
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let (s, e) = (self.ed.scene.frame_start, self.ed.scene.frame_end);
+                    match &mut self.anim {
+                        None => {
+                            if ui.button("🎞 Render Animation").on_hover_text(format!("Frames {s}–{e} as PNGs into {}", crate::anim_render::default_dir(self.ed.file_path.as_deref()).display())).clicked() {
+                                anim_start = Some(None);
+                            }
+                            if ui.button("Folder…").on_hover_text("Render the animation into a folder you pick").clicked() {
+                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                    anim_start = Some(Some(d));
+                                }
+                            }
+                            let ff = *self.ffmpeg_ok.get_or_insert_with(crate::anim_render::ffmpeg_available);
+                            ui.add_enabled(ff, egui::Checkbox::new(&mut self.anim_video, "MP4")).on_hover_text(if ff { "Join the frames into a video with ffmpeg" } else { "Install ffmpeg (on the PATH) to also get an MP4" });
+                            ui.label(RichText::new(format!("frames {s}–{e} · {} fps", self.ed.scene.fps)).small().color(theme::TEXT_DIM));
+                        }
+                        Some(job) => {
+                            let total = job.total().max(1);
+                            let text = if job.encoder.is_some() { "encoding MP4…".to_string() } else { format!("frame {} / {} · ≈ {:.0} s left", job.done.min(total), total, job.eta_secs()) };
+                            ui.add(egui::ProgressBar::new(job.done as f32 / total as f32).desired_width(300.0).text(text));
+                            if ui.button("⏹ Cancel").clicked() {
+                                job.cancelled = true;
                             }
                         }
                     }
@@ -1700,8 +1913,11 @@ impl App {
             self.ed.scene.output = out;
             self.ed.dirty = true;
         }
-        if rerender {
+        if rerender && self.anim.is_none() {
             self.render_now(ctx);
+        }
+        if let Some(d) = anim_start {
+            self.start_anim_render(ctx, d);
         }
         if save {
             self.save_render();
@@ -1866,7 +2082,10 @@ impl App {
                 }
             }
         }
-        if c(M::NONE, Key::F12) {
+        if c(M::COMMAND, Key::F12) {
+            self.start_anim_render(ctx, None);
+        }
+        if c(M::NONE, Key::F12) && self.anim.is_none() {
             self.render_now(ctx);
         }
         if c(M::NONE, Key::F11) {
@@ -2278,6 +2497,10 @@ impl App {
                             if ui.button("Render Image   F12").clicked() {
                                 self.ed.render_request = true;
                             }
+                            if ui.add_enabled(self.anim.is_none(), egui::Button::new("Render Animation   Ctrl+F12")).on_hover_text("Every frame of the timeline as PNGs (and an MP4 with ffmpeg)").clicked() {
+                                let ctx2 = ui.ctx().clone();
+                                self.start_anim_render(&ctx2, None);
+                            }
                             if ui.add_enabled(self.render.is_some(), egui::Button::new("View Render   F11")).clicked() {
                                 self.show_render = true;
                             }
@@ -2391,6 +2614,19 @@ impl App {
                 ui.close();
             }
         }
+        ui.separator();
+        ui.label(RichText::new("Particles").color(theme::TEXT_DIM).small());
+        ui.horizontal_wrapped(|ui| {
+            for (l, k) in [("Sparks", "sparks"), ("Snow", "snow"), ("Rain", "rain"), ("Confetti", "confetti"), ("Bubbles", "bubbles"), ("Smoke", "smoke"), ("Fire", "fire")] {
+                if ui.button(l).on_hover_text("From the active mesh if one is selected (sparks, smoke, fire, bubbles), otherwise from a new emitter above the scene").clicked() {
+                    let log = self.ed.execute(&[Command { action: "particles".into(), name: Some(k.into()), ..Default::default() }]);
+                    if let Some(l) = log.first() {
+                        self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                    }
+                    ui.close();
+                }
+            }
+        });
         ui.separator();
         ui.label(RichText::new("Armature").color(theme::TEXT_DIM).small());
         if ui.button("🏃  Single Bone").clicked() {
@@ -3715,6 +3951,9 @@ impl App {
                             *self.ed.scene.get_mut(id).unwrap() = o.clone();
                         }
                         let cmd = match a.as_str() {
+                            "rb:bake" => Command { action: "bake_physics".into(), ..Default::default() },
+                            "pt:bake" => Command { action: "particles".into(), target: Some(o.name.clone()), ..Default::default() },
+                            rb if rb.starts_with("rb:") => Command { action: "rigid_body".into(), target: Some(o.name.clone()), name: Some(rb[3..].into()), ..Default::default() },
                             "<remove>" => Command { action: "remove_cloth".into(), target: Some(o.name.clone()), ..Default::default() },
                             "<bake>" => Command { action: "bake_cloth".into(), target: Some(o.name.clone()), ..Default::default() },
                             pins => Command { action: "cloth".into(), target: Some(o.name.clone()), name: Some(pins.into()), ..Default::default() },
@@ -4814,6 +5053,9 @@ fn object_props(ui: &mut Ui, o: &mut crate::scene::Object) {
             });
         }
         crate::scene::ObjectKind::Mesh => {
+            if particle_props(ui, o) {
+                return;
+            }
             scatter_props(ui, o);
             shape_key_props(ui, o);
             cloth_props(ui, o);
@@ -5138,8 +5380,72 @@ fn shape_key_props(ui: &mut Ui, o: &mut crate::scene::Object) {
     });
 }
 
+/// Settings of a particle system object. Returns true when `o` is one.
+fn particle_props(ui: &mut Ui, o: &mut crate::scene::Object) -> bool {
+    let Some(p) = o.particles.as_mut() else { return false };
+    section(ui, "Particles", |ui| {
+        ui.add(egui::Slider::new(&mut p.rate, 0.0..=500.0).logarithmic(true).text("Per frame"));
+        ui.add(egui::Slider::new(&mut p.lifetime, 1..=600).text("Life (frames)"));
+        ui.add(egui::Slider::new(&mut p.speed, 0.0..=30.0).text("Speed"));
+        ui.add(egui::Slider::new(&mut p.spread, 0.0..=1.0).text("Spread"));
+        ui.add(egui::Slider::new(&mut p.gravity, -20.0..=30.0).text("Gravity"));
+        ui.add(egui::Slider::new(&mut p.drag, 0.0..=1.0).text("Keep speed"));
+        ui.add(egui::Slider::new(&mut p.size, 0.05..=10.0).logarithmic(true).text("Size"));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut p.shrink, "Shrink with age");
+            ui.checkbox(&mut p.collide, "Collide");
+            ui.add(egui::DragValue::new(&mut p.seed).prefix("seed "));
+        });
+        let peak = p.cache.iter().map(|f| f.len()).max().unwrap_or(0);
+        ui.horizontal(|ui| {
+            if ui.button("Bake").on_hover_text("Simulate over the timeline with these settings").clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("cloth_action"), "pt:bake".to_string()));
+            }
+            ui.label(RichText::new(format!("{} frames · up to {peak} particles", p.cache.len())).small().color(theme::TEXT_DIM));
+        });
+        ui.label(RichText::new("The particle's look is the hidden source object (outliner); the emitter is the object they come from.").small().color(theme::TEXT_DIM));
+    });
+    true
+}
+
 fn cloth_props(ui: &mut Ui, o: &mut crate::scene::Object) {
-    if o.scatter.is_some() || o.skin.is_some() {
+    if o.scatter.is_some() {
+        return;
+    }
+    section(ui, "Rigid Body", |ui| {
+        let mut act: Option<String> = None;
+        ui.horizontal(|ui| {
+            let cur = match &o.rigid {
+                None => 0,
+                Some(r) if r.passive => 2,
+                Some(_) => 1,
+            };
+            for (k, l, a) in [(0, "None", "rb:none"), (1, "Active", "rb:active"), (2, "Passive", "rb:passive")] {
+                if ui.selectable_label(cur == k, l).on_hover_text(match k {
+                    1 => "Falls, bounces and tumbles",
+                    2 => "An obstacle the active bodies hit (every other mesh is one too)",
+                    _ => "Not simulated",
+                }).clicked() && cur != k {
+                    act = Some(a.into());
+                }
+            }
+        });
+        if let Some(r) = o.rigid.as_mut().filter(|r| !r.passive) {
+            ui.add(egui::Slider::new(&mut r.bounce, 0.0..=1.0).text("Bounce"));
+            ui.add(egui::Slider::new(&mut r.friction, 0.0..=1.0).text("Friction"));
+            ui.horizontal(|ui| {
+                if ui.button("Bake").on_hover_text("Simulate all rigid bodies over the timeline").clicked() {
+                    act = Some("rb:bake".into());
+                }
+                ui.label(RichText::new(format!("{} frames baked", r.cache.len())).small().color(theme::TEXT_DIM));
+            });
+            ui.label(RichText::new("Spheres roll as spheres; other shapes collide as boxes. Move it at the first frame, then Bake.").small().color(theme::TEXT_DIM));
+        }
+        if let Some(a) = act {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("cloth_action"), a));
+        }
+    });
+    if o.skin.is_some() {
         return;
     }
     section(ui, "Physics", |ui| {
@@ -5328,6 +5634,10 @@ impl eframe::App for App {
         if std::mem::take(&mut self.ed.render_request) {
             self.render_now(&ctx);
         }
+        if let Some(dir) = self.ed.anim_render_request.take() {
+            self.start_anim_render(&ctx, if dir.is_empty() { None } else { Some(dir.into()) });
+        }
+        self.anim_tick(&ctx);
         self.render_window(&ctx);
         self.uv_window(&ctx);
 

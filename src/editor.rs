@@ -57,6 +57,8 @@ pub struct Editor {
     pub edit: Option<EditState>,
     /// Set by the `render` command; the app renders an image (F12) and clears it.
     pub render_request: bool,
+    /// Render the timeline (folder, empty = default).
+    pub anim_render_request: Option<String>,
     /// Sculpt mode on this mesh object.
     pub sculpt: Option<u64>,
     /// Armature in Pose Mode and its active bone.
@@ -94,6 +96,7 @@ impl Default for Editor {
             auto_key: false,
             edit: None,
             render_request: false,
+            anim_render_request: None,
             parent_cache: Default::default(),
             sculpt: None,
             pose: None,
@@ -360,6 +363,182 @@ impl Editor {
             key.value = 1.0;
         }
         Some(format!("Stored shape key \"{}\"", key.name))
+    }
+
+    /// Create a particle system from a preset (snow, sparks, rain, confetti, bubbles, smoke) or an
+    /// existing object (`object`), emitted from `emitter` (or a new plane / point above the scene).
+    pub fn add_particle_system(&mut self, spec: &str, emitter: Option<u64>, object: Option<&str>) -> Result<u64, String> {
+        use crate::mesh::Primitive;
+        let low = spec.to_lowercase();
+        // (primitive, scale, colour, emission, alpha, rate, life, speed, spread, gravity, drag, shrink, emitter z / size)
+        let preset = if low.contains("snow") {
+            (Primitive::IcoSphere, Vec3::splat(0.03), [0.97, 0.98, 1.0], 0.0, 1.0, 30.0, 160, 0.8, 0.8, 0.5, 0.6, false, (5.0, 4.5))
+        } else if low.contains("rain") {
+            (Primitive::Cylinder, Vec3::new(0.008, 0.008, 0.12), [0.6, 0.75, 1.0], 0.0, 0.6, 120.0, 30, 0.0, 0.05, 30.0, 1.0, false, (8.0, 6.0))
+        } else if low.contains("confetti") {
+            (Primitive::Plane, Vec3::new(0.05, 0.03, 0.05), [1.0, 0.35, 0.6], 0.0, 1.0, 40.0, 120, 3.0, 0.9, 1.5, 0.4, false, (4.0, 1.0))
+        } else if low.contains("bubble") {
+            (Primitive::UvSphere, Vec3::splat(0.08), [0.8, 0.9, 1.0], 0.0, 0.35, 8.0, 90, 0.5, 0.4, -1.2, 0.7, true, (0.2, 1.0))
+        } else if low.contains("smoke") || low.contains("steam") {
+            (Primitive::IcoSphere, Vec3::splat(0.18), [0.55, 0.55, 0.58], 0.0, 0.35, 12.0, 70, 0.6, 0.35, -0.8, 0.6, false, (0.2, 0.5))
+        } else if low.contains("fire") || low.contains("flame") {
+            (Primitive::IcoSphere, Vec3::splat(0.12), [1.0, 0.45, 0.1], 3.0, 0.8, 30.0, 24, 1.0, 0.25, -2.5, 0.5, true, (0.2, 0.6))
+        } else {
+            // sparks / fountain
+            (Primitive::IcoSphere, Vec3::splat(0.03), [1.0, 0.65, 0.2], 4.0, 1.0, 40.0, 30, 5.0, 0.35, 9.81, 0.95, true, (1.0, 0.3))
+        };
+        let (prim, scale, color, emission, alpha, rate, life, speed, spread, gravity, drag, shrink, (ez, es)) = preset;
+        // the particle shape
+        let src = match object.and_then(|n| self.scene.find_by_name(n)) {
+            Some(id) => id,
+            None => {
+                let label = spec.trim();
+                let nm = format!("{}{} Particle", label.get(..1).unwrap_or("P").to_uppercase(), label.get(1..).unwrap_or(""));
+                let id = self.scene.add(prim, Some(&nm));
+                let o = self.scene.get_mut(id).unwrap();
+                o.detail = 1;
+                let mut pm = prim.poly(1);
+                for v in &mut pm.verts {
+                    *v *= scale;
+                }
+                o.mesh = Some(pm);
+                o.material.color = color;
+                o.material.emission = emission;
+                o.material.alpha = alpha;
+                o.material.roughness = 0.3;
+                o.smooth_override = Some(true);
+                o.visible = false;
+                id
+            }
+        };
+        // where they come from
+        let em = match emitter {
+            Some(e) => e,
+            None => {
+                let id = self.scene.add(Primitive::Plane, Some(&format!("{} Emitter", spec.trim())));
+                let o = self.scene.get_mut(id).unwrap();
+                o.transform.location = Vec3::new(0.0, 0.0, ez);
+                o.transform.scale = Vec3::splat(es);
+                // a downward-facing sheet for snow/rain, upward for the rest
+                if gravity > 3.0 && speed < 1.0 || low.contains("snow") {
+                    o.transform.rotation = Vec3::new(180.0, 0.0, 0.0);
+                }
+                o.visible = false;
+                id
+            }
+        };
+        let name = format!("{} Particles", spec.trim());
+        let pid = self.scene.add(Primitive::Cube, Some(&name));
+        let mut ps = crate::physics::Particles::new(src, em);
+        (ps.rate, ps.lifetime, ps.speed, ps.spread, ps.gravity, ps.drag, ps.shrink) = (rate, life, speed, spread, gravity, drag, shrink);
+        if emitter.is_none() && (low.contains("snow") || low.contains("rain")) {
+            ps.preroll = life;
+        }
+        let (mat, coll) = (self.scene.get(src).unwrap().material, self.scene.get(em).unwrap().collection);
+        let o = self.scene.get_mut(pid).unwrap();
+        o.material = mat;
+        o.smooth_override = Some(true);
+        o.collection = coll;
+        o.particles = Some(ps);
+        Ok(pid)
+    }
+
+    /// Simulate a particle system over the timeline.
+    pub fn bake_particle_system(&mut self, pid: u64) -> Result<String, String> {
+        let ps = self.scene.get(pid).and_then(|o| o.particles.clone()).ok_or("not a particle system")?;
+        let em = self.scene.get(ps.emitter).ok_or("the emitter is gone")?;
+        let (epm, ew) = (em.poly(), em.transform.matrix());
+        let colliders: Vec<crate::physics::Collider> = if ps.collide {
+            self.scene
+                .objects
+                .iter()
+                .filter(|o| o.visible && o.is_mesh() && o.id != ps.emitter && o.id != pid && o.scatter.is_none() && o.particles.is_none())
+                .map(|o| {
+                    let p = o.poly();
+                    let lo = p.verts.iter().fold(Vec3::splat(f32::MAX), |a, b| a.min(*b));
+                    let hi = p.verts.iter().fold(Vec3::splat(f32::MIN), |a, b| a.max(*b));
+                    crate::physics::collider_for(o, (lo, hi))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let (f0, f1) = (self.scene.frame_start, self.scene.frame_end.max(self.scene.frame_start + 1));
+        let frames = ((f1 - f0 + 1) as usize).min(2000);
+        let cache = crate::physics::bake_particles(&ps, &epm, ew, &colliders, frames, self.scene.fps.max(1) as f32);
+        let peak = cache.iter().map(|f| f.len()).max().unwrap_or(0);
+        let o = self.scene.get_mut(pid).unwrap();
+        let p = o.particles.as_mut().unwrap();
+        p.cache = std::sync::Arc::new(cache);
+        p.start = f0;
+        o.posed_key = 0;
+        let n = o.name.clone();
+        self.set_frame(self.frame);
+        Ok(format!("\"{n}\": up to {peak} particles over frames {f0}–{f1} — press play"))
+    }
+
+    /// Re-run stored simulations (after opening a file).
+    pub fn rebake_physics(&mut self) {
+        let cloths: Vec<String> = self.scene.objects.iter().filter(|o| o.cloth.is_some()).map(|o| o.name.clone()).collect();
+        for n in cloths {
+            let _ = self.exec_one(&Command { action: "bake_cloth".into(), target: Some(n), ..Default::default() });
+        }
+        if self.scene.objects.iter().any(|o| o.rigid.as_ref().is_some_and(|r| !r.passive)) {
+            self.bake_rigid_bodies();
+        }
+        let ps: Vec<u64> = self.scene.objects.iter().filter(|o| o.particles.is_some()).map(|o| o.id).collect();
+        for id in ps {
+            let _ = self.bake_particle_system(id);
+        }
+    }
+
+    /// Simulate every active rigid body over the timeline (other meshes are obstacles).
+    pub fn bake_rigid_bodies(&mut self) -> String {
+        // start positions
+        for o in self.scene.objects.iter_mut() {
+            if let Some(t) = o.rigid.as_ref().filter(|r| !r.passive).and_then(|r| r.cache.first().copied().or(r.origin)) {
+                o.transform = t;
+            }
+        }
+        let active: Vec<u64> = self.scene.objects.iter().filter(|o| o.visible && o.is_mesh() && o.rigid.as_ref().is_some_and(|r| !r.passive)).map(|o| o.id).collect();
+        if active.is_empty() {
+            return "No active rigid bodies".into();
+        }
+        let bounds = |o: &crate::scene::Object| {
+            let p = o.poly();
+            let lo = p.verts.iter().fold(Vec3::splat(f32::MAX), |a, b| a.min(*b));
+            let hi = p.verts.iter().fold(Vec3::splat(f32::MIN), |a, b| a.max(*b));
+            (lo, hi)
+        };
+        let bodies: Vec<crate::physics::BodyIn> = active
+            .iter()
+            .map(|id| {
+                let o = self.scene.get(*id).unwrap();
+                let r = o.rigid.as_ref().unwrap();
+                let s = o.transform.scale.abs();
+                let sphere = o.mesh.is_none() && matches!(o.primitive, crate::mesh::Primitive::UvSphere | crate::mesh::Primitive::IcoSphere) && (s.x - s.y).abs() < 1e-3 && (s.y - s.z).abs() < 1e-3;
+                crate::physics::BodyIn { transform: o.transform, sphere, bounds: bounds(o), bounce: r.bounce, friction: r.friction }
+            })
+            .collect();
+        let statics: Vec<crate::physics::Collider> = self
+            .scene
+            .objects
+            .iter()
+            .filter(|o| o.visible && o.is_mesh() && o.scatter.is_none() && o.cloth.is_none() && !active.contains(&o.id))
+            .map(|o| crate::physics::collider_for(o, bounds(o)))
+            .collect();
+        let (f0, f1) = (self.scene.frame_start, self.scene.frame_end.max(self.scene.frame_start + 1));
+        let frames = ((f1 - f0 + 1) as usize).min(2000);
+        let out = crate::physics::bake_rigid(&bodies, &statics, frames, self.scene.fps.max(1) as f32, 9.81);
+        for (id, tr) in active.iter().zip(out) {
+            if let Some(r) = self.scene.get_mut(*id).and_then(|o| o.rigid.as_mut()) {
+                r.origin = tr.first().copied();
+                r.cache = std::sync::Arc::new(tr);
+                r.start = f0;
+            }
+        }
+        self.set_frame(self.frame);
+        format!("Simulated {} rigid bodies with {} obstacles over frames {f0}–{f1} — press play", active.len(), statics.len())
     }
 
     /// A texture by spec: an image path, an existing texture's name or a procedural pattern
@@ -1338,6 +1517,70 @@ impl Editor {
                     }
                 }
             }
+            "rigid_body" | "add_rigid_body" | "physics" | "bake_physics" | "remove_rigid_body" => {
+                if c.action != "bake_physics" {
+                    let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                    if ids.is_empty() {
+                        return Err("select the objects that should fall (meshes)".into());
+                    }
+                    let mode = c.name.clone().unwrap_or_else(|| if c.action == "remove_rigid_body" { "none".into() } else { "active".into() }).to_lowercase();
+                    for id in &ids {
+                        let o = self.scene.get_mut(*id).unwrap();
+                        // back to where it started before changing anything
+                        if let Some(t) = o.rigid.as_ref().and_then(|r| r.cache.first().copied().or(r.origin)) {
+                            o.transform = t;
+                        }
+                        if mode.contains("none") || mode.contains("remove") || mode.contains("off") {
+                            o.rigid = None;
+                        } else {
+                            let mut r = o.rigid.clone().unwrap_or_default();
+                            r.passive = mode.contains("passive") || mode.contains("static") || mode.contains("ground");
+                            if let Some(b) = c.number {
+                                r.bounce = (b as f32).clamp(0.0, 1.0);
+                            }
+                            r.cache = Default::default();
+                            o.rigid = Some(r);
+                        }
+                    }
+                }
+                let msg = self.bake_rigid_bodies();
+                Ok(msg)
+            }
+            "particles" | "emit" | "add_particles" | "particle_system" | "bake_particles" => {
+                // an existing particle system: re-bake with changed settings
+                let existing = c.target.as_deref().and_then(|t| self.scene.find_by_name(t)).filter(|id| self.scene.get(*id).is_some_and(|o| o.particles.is_some()));
+                let pid = match existing {
+                    Some(id) => id,
+                    None => {
+                        let spec = c.name.clone().or(c.primitive.clone()).unwrap_or_else(|| "sparks".into());
+                        // weather comes from the sky unless an emitter is named
+                        let sky = ["snow", "rain", "confetti"].iter().any(|k| spec.to_lowercase().contains(k));
+                        let emitter = c
+                            .target
+                            .as_deref()
+                            .and_then(|t| self.scene.find_by_name(t))
+                            .or(if sky { None } else { self.active })
+                            .filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh() && o.particles.is_none()));
+                        self.add_particle_system(&spec, emitter, c.object.as_deref())?
+                    }
+                };
+                {
+                    let ps = self.scene.get_mut(pid).unwrap().particles.as_mut().unwrap();
+                    if let Some(n) = c.number {
+                        ps.rate = (n as f32).clamp(0.0, 2000.0);
+                    }
+                    if let Some(v) = c.power {
+                        ps.speed = v as f32;
+                    }
+                    if let Some(s) = vec3_or_scalar(&c.scale) {
+                        ps.size = s.x.max(0.001);
+                    }
+                    if let Some(sd) = c.seed {
+                        ps.seed = sd as u32;
+                    }
+                }
+                self.bake_particle_system(pid)
+            }
             "cloth" | "add_cloth" | "simulate_cloth" | "bake_cloth" | "remove_cloth" => {
                 let id = targets().into_iter().find(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).ok_or("cloth needs a mesh object (a plane works well)")?;
                 if c.action == "remove_cloth" || c.name.as_deref() == Some("none") && c.action != "cloth" {
@@ -1667,6 +1910,18 @@ impl Editor {
                     self.shading = Shading::Material;
                 }
                 Ok(format!("Applied {label} to {}", self.names(&ids)))
+            }
+            "render_animation" | "render_video" | "render_frames" => {
+                match c.name.as_deref().map(|n| n.to_lowercase()) {
+                    Some(n) if n.contains("path") || n.contains("cycles") || n.contains("quality") => self.scene.output.engine = crate::scene::Engine::PathTraced,
+                    Some(n) if n.contains("fast") || n.contains("preview") => self.scene.output.engine = crate::scene::Engine::Fast,
+                    _ => {}
+                }
+                if let Some(s) = c.number.filter(|s| *s >= 1.0) {
+                    self.scene.output.samples = s as u32;
+                }
+                self.anim_render_request = Some(c.object.clone().unwrap_or_default());
+                Ok(format!("Rendering frames {}–{} ({})", self.scene.frame_start, self.scene.frame_end, if self.scene.output.engine == crate::scene::Engine::PathTraced { "path traced" } else { "fast" }))
             }
             "render" | "render_image" => {
                 match c.name.as_deref().map(|n| n.to_lowercase()) {
@@ -3156,5 +3411,56 @@ mod tests {
         };
         let (a, b) = (low(&mut ed, 1), low(&mut ed, 60));
         assert!((a - 1.5).abs() < 1e-3 && b < 0.5, "falls and drapes: {a} → {b}");
+    }
+    #[test]
+    fn rigid_body_command() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"delete","target":"Cube"}"#),
+            cmd(r#"{"action":"add","primitive":"plane","name":"Ground","scale":6}"#),
+            cmd(r#"{"action":"add","primitive":"cube","name":"Crate","location":[0,0,3],"rotation":[30,20,0],"scale":0.5}"#),
+            cmd(r#"{"action":"rigid_body","target":"Crate"}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let id = ed.scene.find_by_name("Crate").unwrap();
+        ed.set_frame(1);
+        assert!((ed.scene.get(id).unwrap().transform.location.z - 3.0).abs() < 1e-4);
+        ed.set_frame(100);
+        let z = ed.scene.get(id).unwrap().transform.location.z;
+        assert!(z > 0.3 && z < 0.8, "landed on the ground: {z}");
+        // saved mid-animation, reopened: re-simulated from the start position
+        let json = serde_json::to_string(&ed.scene).unwrap();
+        let mut ed2 = Editor::default();
+        ed2.scene = serde_json::from_str(&json).unwrap();
+        ed2.rebake_physics();
+        ed2.set_frame(1);
+        assert!((ed2.scene.get(id).unwrap().transform.location.z - 3.0).abs() < 1e-4);
+        ed2.set_frame(100);
+        assert!((ed2.scene.get(id).unwrap().transform.location.z - z).abs() < 1e-3);
+        // turning it off puts it back
+        ed.execute(&[cmd(r#"{"action":"rigid_body","target":"Crate","name":"none"}"#)]);
+        assert!((ed.scene.get(id).unwrap().transform.location.z - 3.0).abs() < 1e-4);
+    }
+    #[test]
+    fn particle_presets() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"delete","target":"Cube"}"#),
+            cmd(r#"{"action":"add","primitive":"plane","name":"Ground","scale":6}"#),
+            cmd(r#"{"action":"particles","name":"snow"}"#),
+            cmd(r#"{"action":"add","primitive":"uv_sphere","name":"Orb","location":[0,0,2]}"#),
+            cmd(r#"{"action":"particles","target":"Orb","name":"sparks","number":60}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let snow = ed.scene.find_by_name("snow Particles").unwrap();
+        let sparks = ed.scene.find_by_name("sparks Particles").unwrap();
+        ed.set_frame(60);
+        let count = |ed: &Editor, id| ed.scene.get(id).unwrap().posed.as_ref().map(|p| p.verts.len()).unwrap_or(0);
+        assert!(count(&ed, snow) > 0 && count(&ed, sparks) > 0);
+        // sparks never sink into the ground
+        let o = ed.scene.get(sparks).unwrap();
+        let zmin = o.posed.as_ref().unwrap().verts.iter().filter(|v| v.x.abs() < 5.5 && v.y.abs() < 5.5).map(|v| v.z).fold(f32::MAX, f32::min);
+        assert!(zmin > -0.1, "{zmin}");
+        assert_eq!(ed.scene.get(sparks).unwrap().particles.as_ref().unwrap().rate, 60.0);
     }
 }

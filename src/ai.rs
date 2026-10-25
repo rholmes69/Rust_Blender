@@ -421,6 +421,7 @@ pub const ACTIONS: &[&str] = &[
     "look_at",
     "camera_view",
     "render",
+    "render_animation",
     "set_texture",
     "bump",
     "roughness_map",
@@ -431,6 +432,9 @@ pub const ACTIONS: &[&str] = &[
     "pose_bone",
     "reset_pose",
     "add_ik",
+    "particles",
+    "rigid_body",
+    "bake_physics",
     "cloth",
     "remove_cloth",
     "add_shape_key",
@@ -487,6 +491,8 @@ Each command is an object with "action" plus only the fields it needs:
   Lights/cameras point along their local -Z axis; prefer look_at over rotation for aiming them.
 - set_light: target, color, power, number (spot cone angle in degrees).   look_at: target, look_at.
 - camera_view: look through the scene camera (or view = camera).   render: render a final image through the camera (F12); name "path" = path traced (realistic, slower), number = samples.
+- render_animation: render every frame of the timeline (PNG sequence + MP4 when ffmpeg is installed) into a
+  folder next to the saved file; name "path" / "fast" picks the engine, number = samples.
 - delete / select / hide / show / focus / smooth / flat: target
 - move: target, vector [dx,dy,dz] (relative).   rotate: target, vector [deg x,y,z] (relative).
 - scale: target, vector [fx,fy,fz] (multiplicative).   set_transform: target + absolute location/rotation/scale.
@@ -520,6 +526,14 @@ Each command is an object with "action" plus only the fields it needs:
   steepness in degrees (30 keeps things on flat ground), align = true to stand along the surface (planets),
   rotation = [tilt,tilt,spin]. Repeating it with the same target and name updates the scatter. realize: target
   = scatter object (bake to a real mesh). "a forest" = tree scatter; "a rocky field" = rock scatter.
+- particles: name = sparks | snow | rain | confetti | bubbles | smoke | fire (or object = an existing object to
+  emit), target = the emitter mesh (sparks from a sphere, smoke from a chimney; snow / rain without a target get
+  an emitter above the scene), number = particles per frame, power = speed, scale = size. Calling it with
+  target = an existing "… Particles" object re-simulates it with the new values.
+- rigid_body: target = an object that should fall / tumble / bounce (crates, balls, dominoes), name = active
+  (default) | passive (an obstacle) | none, number = bounce 0..1. Every call re-simulates all rigid bodies over
+  the timeline (other meshes are obstacles: put a ground plane under them); then play. bake_physics re-runs it
+  after moving things. For a stack or a domino row, add the objects first, then rigid_body each.
 - cloth: target = a plane / sheet above other objects (tablecloth, blanket, flag), name = pins: none | top |
   corners | left | right (a flag pinned on the left), number = stiffness 0.1-1. It is simulated over the
   timeline right away (the other meshes are colliders); then play. remove_cloth: target.
@@ -970,6 +984,7 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         "render" | "render image" | "render it" | "render the scene" | "f12" | "take a picture" | "take a render" => {
             return single("render");
         }
+        "render the animation" | "render animation" | "render a video" | "render the video" | "make a video" | "export the animation" => return single("render_animation"),
         "edit mode" | "enter edit mode" | "tab" => return single("edit_mode"),
         "sculpt mode" | "sculpt" | "enter sculpt mode" | "let me sculpt" => return single("sculpt_mode"),
         "object mode" | "exit edit mode" => return single("object_mode"),

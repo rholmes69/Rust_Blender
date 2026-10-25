@@ -84,6 +84,11 @@ pub fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}, "transparent": {"type": "boolean"}, "path": {"type": "string"}, "engine": {"type": "string", "enum": ["fast", "path"], "description": "fast (default, ~1 s) or path (path traced: bounced light, reflections, glass; slower)"}, "samples": {"type": "integer", "description": "path tracer samples per pixel (default 16)"}}}
         },
         {
+            "name": "render_animation",
+            "description": "Render frames of the timeline to PNG files (frame_0001.png …) in a folder, and join them into an MP4 when ffmpeg is installed. Blocks until done; returns the last frame. Optional: dir (absolute folder; default next to the .rblend file), start/end frames (default the scene range), engine fast|path, samples, width/height, video (default true).",
+            "inputSchema": {"type": "object", "properties": {"dir": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}, "engine": {"type": "string", "enum": ["fast", "path"]}, "samples": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "video": {"type": "boolean"}}}
+        },
+        {
             "name": "import_gltf",
             "description": "Import a glTF 2.0 file (.glb or .gltf, absolute path) into the scene: meshes with UVs, PBR materials and base-colour textures, lights and cameras. The new objects end up selected.",
             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
@@ -283,7 +288,7 @@ mod tests {
         assert!(handle_message(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), "t", &tx, &|| {}).is_none());
         let list = handle_message(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}), "t", &tx, &|| {}).unwrap();
         let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["run_commands", "get_scene", "check_scene", "ask_copilot", "render_image", "import_gltf", "export_gltf"]);
+        assert_eq!(names, vec!["run_commands", "get_scene", "check_scene", "ask_copilot", "render_image", "render_animation", "import_gltf", "export_gltf"]);
         assert_eq!(base64(b"Man"), "TWFu");
         assert_eq!(base64(b"Ma"), "TWE=");
         assert_eq!(base64(b"M"), "TQ==");

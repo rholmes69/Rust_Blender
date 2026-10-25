@@ -228,6 +228,12 @@ pub struct Object {
     /// Being edited: the shape keys don't apply (the mesh shows the key being edited).
     #[serde(skip)]
     pub shape_editing: bool,
+    /// Particle system (copies of a source object emitted from another object over time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub particles: Option<crate::physics::Particles>,
+    /// Rigid body (its baked frames drive the transform).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rigid: Option<crate::physics::RigidBody>,
     /// Cloth simulation (its baked frames drive the mesh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloth: Option<crate::physics::Cloth>,
@@ -369,6 +375,10 @@ impl Object {
             }
         }
         self.sim_frame = frame;
+        if let Some(r) = self.rigid.as_ref().filter(|r| !r.passive && !r.cache.is_empty()) {
+            let i = (frame - r.start).clamp(0, r.cache.len() as i32 - 1) as usize;
+            self.transform = r.cache[i];
+        }
     }
 
     /// The mesh with its shape keys blended in (the basis when none are active).
@@ -641,6 +651,8 @@ impl Scene {
             shape_keys: vec![],
             shape_editing: false,
             cloth: None,
+            rigid: None,
+            particles: None,
             sim_frame: 0,
             scatter: None,
             posed: None,
@@ -670,6 +682,7 @@ impl Scene {
         self.update_cloth();
         self.update_skins();
         self.update_scatter();
+        self.update_particles();
     }
 
     /// Solve IK constraints (bones reaching for target objects) when targets or poses moved.
@@ -739,6 +752,30 @@ impl Scene {
                 continue;
             }
             o.posed = o.shaped().map(std::sync::Arc::new);
+            o.posed_key = key;
+        }
+    }
+
+    /// Build the particles of the current frame.
+    pub fn update_particles(&mut self) {
+        for i in 0..self.objects.len() {
+            let Some(ps) = self.objects[i].particles.as_ref() else { continue };
+            if ps.cache.is_empty() {
+                continue;
+            }
+            let fi = self.objects[i].sim_frame - ps.start;
+            let key = 0x9A27_0000_0000_0001u64 ^ ((fi as i64 as u64) << 1) ^ ((ps.cache.len() as u64) << 40) ^ std::sync::Arc::as_ptr(&ps.cache) as u64;
+            if self.objects[i].posed.is_some() && self.objects[i].posed_key == key {
+                continue;
+            }
+            let Some(src) = self.get(ps.source) else { continue };
+            let (s, r, _) = src.transform.matrix().to_scale_rotation_translation();
+            let live: &[(Vec3, Quat, f32)] = if fi >= 0 && (fi as usize) < ps.cache.len() { &ps.cache[fi as usize] } else { &[] };
+            let mats: Vec<Mat4> = live.iter().map(|(p, q, k)| Mat4::from_scale_rotation_translation(s * *k, *q * r, *p)).collect();
+            let to_local = self.objects[i].transform.matrix().inverse();
+            let pm = crate::scatter::build(&src.poly(), &mats, to_local);
+            let o = &mut self.objects[i];
+            o.posed = Some(std::sync::Arc::new(pm));
             o.posed_key = key;
         }
     }

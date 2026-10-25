@@ -4,6 +4,7 @@
 )]
 
 mod agent;
+mod anim_render;
 mod armature;
 mod scatter;
 mod shapekeys;

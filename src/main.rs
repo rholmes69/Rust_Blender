@@ -8,6 +8,8 @@ mod anim_render;
 mod armature;
 mod scatter;
 mod hair;
+mod templates;
+mod assets;
 mod shapekeys;
 mod physics;
 mod ai;

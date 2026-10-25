@@ -212,6 +212,7 @@ pub struct Viewport {
     pub sculpt_ui: sculpt::SculptUi,
     pose_ui: pose::PoseUi,
     weight_ui: weightpaint::WeightUi,
+    groom_ui: groom::GroomUi,
     bone_ui: boneedit::BoneEditUi,
     /// (armature in edit mode, active bone, selected part) while building the frame
     bone_edit_draw: Option<(u64, usize, crate::armature::BonePart)>,
@@ -300,6 +301,7 @@ impl Default for Viewport {
             sculpt_ui: Default::default(),
             pose_ui: Default::default(),
             weight_ui: Default::default(),
+            groom_ui: Default::default(),
             bone_ui: Default::default(),
             bone_edit_draw: None,
             pose_draw: None,
@@ -350,6 +352,7 @@ mod edit;
 mod sculpt;
 mod pose;
 mod weightpaint;
+mod groom;
 mod boneedit;
 mod knife;
 
@@ -492,6 +495,20 @@ impl Viewport {
         let b = inv * Vec4::new(nx, ny, 0.9, 1.0);
         let (a, b) = (a.xyz() / a.w, b.xyz() / b.w);
         (a, (b - a).normalize())
+    }
+
+    pub fn screen_rect(&self) -> Rect {
+        self.rect
+    }
+
+    /// The first surface under a screen point (else the ground plane, else the 3D cursor).
+    pub fn surface_point(&mut self, ed: &Editor, s: Pos2) -> Vec3 {
+        let (o, d) = self.ray(s);
+        let bvh = scene_bvh(ed, &mut self.mesh_cache);
+        if let Some(h) = bvh.intersect(o, d, 1e5) {
+            return o + d * h.t;
+        }
+        self.ground_point(s).unwrap_or(self.cursor)
     }
 
     fn ground_point(&self, s: Pos2) -> Option<Vec3> {
@@ -819,11 +836,12 @@ impl Viewport {
             );
         }
         self.draw_cursor(&painter);
-        if ed.sculpt.is_none() && ed.weight_paint.is_none() {
+        if ed.sculpt.is_none() && ed.weight_paint.is_none() && ed.hair_edit.is_none() {
             self.draw_gizmo(&painter, ed);
         }
         self.draw_sculpt_cursor(&painter, ui, ed);
         self.draw_weight_cursor(&painter, ui, ed);
+        self.draw_groom_overlay(&painter, ui, ed);
         self.draw_loopcut_preview(&painter, ed);
         self.draw_knife_preview(&painter, ed);
         self.draw_modal_overlay(&painter, ed);
@@ -1262,7 +1280,7 @@ impl Viewport {
             nobj += 1;
             self.id_map.push(o.id);
             let pid = self.id_map.len() as u32;
-            let selected = !self.render_mode && ed.selection.contains(&o.id);
+            let selected = !self.render_mode && ed.selection.contains(&o.id) && ed.hair_edit != Some(o.id);
             let active = !self.render_mode && ed.active == Some(o.id);
             if !o.is_mesh() {
                 if !self.render_mode && self.camera_view != Some(o.id) {
@@ -1849,28 +1867,31 @@ impl Viewport {
     }
 
     /// The camera an F12 render uses: through the scene camera, else the current view.
+    /// The view through a camera object at an aspect ratio.
+    pub fn camera_for_render(o: &crate::scene::Object, aspect: f32) -> Camera {
+        let f = o.forward();
+        let off = -f;
+        let fov = match o.kind {
+            crate::scene::ObjectKind::Camera(c) => c.fov_deg,
+            _ => 40.0,
+        };
+        // the camera's FOV is the vertical FOV of a 16:9 frame; keep its width for other aspects
+        let half_w = (fov.to_radians() * 0.5).tan() * 16.0 / 9.0;
+        let vfov = 2.0 * (half_w / aspect).atan();
+        Camera {
+            target: o.transform.location + f * 10.0,
+            yaw: off.x.atan2(-off.y).to_degrees(),
+            pitch: off.z.clamp(-1.0, 1.0).asin().to_degrees(),
+            dist: 10.0,
+            ortho: false,
+            fov_deg: vfov.to_degrees(),
+        }
+    }
+
     pub fn render_view(&self, ed: &Editor, aspect: f32) -> (Camera, Option<String>) {
         let cam_obj = Self::render_camera(ed);
         let cam = match cam_obj {
-            Some(o) => {
-                let f = o.forward();
-                let off = -f;
-                let fov = match o.kind {
-                    crate::scene::ObjectKind::Camera(c) => c.fov_deg,
-                    _ => 40.0,
-                };
-                // the camera's FOV is the vertical FOV of a 16:9 frame; keep its width for other aspects
-                let half_w = (fov.to_radians() * 0.5).tan() * 16.0 / 9.0;
-                let vfov = 2.0 * (half_w / aspect).atan();
-                Camera {
-                    target: o.transform.location + f * 10.0,
-                    yaw: off.x.atan2(-off.y).to_degrees(),
-                    pitch: off.z.clamp(-1.0, 1.0).asin().to_degrees(),
-                    dist: 10.0,
-                    ortho: false,
-                    fov_deg: vfov.to_degrees(),
-                }
-            }
+            Some(o) => Self::camera_for_render(o, aspect),
             None => self.cam,
         };
         (cam, cam_obj.map(|o| o.name.clone()))
@@ -1958,7 +1979,7 @@ impl Viewport {
         let mut sel = vec![0u8; self.id_map.len() + 1];
         if ed.shading != Shading::Wireframe {
             for (i, id) in self.id_map.iter().enumerate() {
-                if ed.selection.contains(id) {
+                if ed.selection.contains(id) && ed.hair_edit != Some(*id) {
                     sel[i + 1] = if ed.active == Some(*id) { 2 } else { 1 };
                 }
             }
@@ -2478,6 +2499,8 @@ impl Viewport {
                     let sculpting = ed.sculpt.is_some();
                     let posing = ed.pose.is_some();
                     let painting = ed.weight_paint.is_some();
+                    let grooming = ed.hair_edit.is_some();
+                    let hair_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.hair.is_some() || ed.scene.objects.iter().any(|h| h.hair.as_ref().is_some_and(|hh| hh.target == o.id)));
                     let arm_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.armature.is_some());
                     let rigged_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.skin.is_some());
                     let label = if editing {
@@ -2488,6 +2511,8 @@ impl Viewport {
                         "🏃 Pose Mode"
                     } else if painting {
                         "⚖ Weight Paint"
+                    } else if grooming {
+                        "〰 Hair Edit"
                     } else {
                         "▣ Object Mode"
                     };
@@ -2496,7 +2521,7 @@ impl Viewport {
                         .selected_text(egui::RichText::new(label).size(12.5).color(if editing { Color32::from_rgb(255, 170, 90) } else if sculpting { Color32::from_rgb(140, 200, 255) } else { theme::TEXT }))
                         .width(118.0)
                         .show_ui(ui, |ui| {
-                            if ui.selectable_label(!editing && !sculpting && !posing && !painting, "▣ Object Mode").clicked() {
+                            if ui.selectable_label(!editing && !sculpting && !posing && !painting && !grooming, "▣ Object Mode").clicked() {
                                 pick = Some(0);
                             }
                             if ui.selectable_label(editing, "✎ Edit Mode   Tab").clicked() {
@@ -2514,9 +2539,18 @@ impl Viewport {
                                     pick = Some(4);
                                 }
                             }
+                            if hair_active || grooming {
+                                if ui.selectable_label(grooming, "〰 Hair Edit").clicked() {
+                                    pick = Some(5);
+                                }
+                            }
                         });
                     match pick {
                         Some(0) => ed.exit_edit(),
+                        Some(5) if !grooming => {
+                            let r = ed.toggle_groom();
+                            self.report(r);
+                        }
                         Some(4) if !painting => {
                             let r = ed.toggle_weight_paint();
                             self.report(r);
@@ -2554,6 +2588,10 @@ impl Viewport {
                     if painting {
                         ui.separator();
                         self.weight_header(ui, ed);
+                    }
+                    if grooming {
+                        ui.separator();
+                        self.groom_header(ui, ed);
                     }
                     if let Some(st) = ed.edit.as_mut() {
                         ui.separator();
@@ -3126,6 +3164,14 @@ impl Viewport {
         if ed.weight_paint.is_some() {
             self.gizmo_hover = None;
             if self.weight_input(&ctx, resp, ed, mouse, shift, ctrl) {
+                return;
+            }
+        }
+
+        // ---------- hair edit ----------
+        if ed.hair_edit.is_some() {
+            self.gizmo_hover = None;
+            if self.groom_input(&ctx, resp, ed, mouse, shift, ctrl) {
                 return;
             }
         }

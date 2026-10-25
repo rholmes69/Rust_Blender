@@ -13,6 +13,8 @@ use egui::{
 };
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
+
+mod library;
 use std::time::Instant;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -48,6 +50,10 @@ pub struct Settings {
     pub wake_phrase: String,
     /// Vision model for pictures ("" = pick automatically).
     pub vision_model: String,
+    /// Templates + recent files when the app starts.
+    pub show_start_screen: bool,
+    /// Most recent first.
+    pub recent_files: Vec<String>,
 }
 
 impl Default for Settings {
@@ -84,11 +90,20 @@ impl Default for Settings {
             wake_word: false,
             wake_phrase: "blender".into(),
             vision_model: String::new(),
+            show_start_screen: true,
+            recent_files: vec![],
         }
     }
 }
 
 impl Settings {
+    fn push_recent(&mut self, p: &std::path::Path) {
+        let s = p.display().to_string();
+        self.recent_files.retain(|f| *f != s);
+        self.recent_files.insert(0, s);
+        self.recent_files.truncate(12);
+        self.save();
+    }
     fn path() -> std::path::PathBuf {
         dirs::config_dir()
             .unwrap_or_else(std::env::temp_dir)
@@ -177,6 +192,7 @@ struct Toast {
 }
 
 pub struct App {
+    lib: library::Library,
     ed: Editor,
     vp: Viewport,
     ai: AiClient,
@@ -322,7 +338,8 @@ impl App {
             Role::System,
             "Welcome to Rust Blender! Type or speak what you want to build — e.g. “make a snowman”, “add a ring of 8 glowing cubes”, or “rotate it 45 degrees”. Simple commands run instantly; complex ones go to your local Ollama model.",
         ));
-        Self {
+        let mut app = Self {
+            lib: library::Library::new(false),
             ed: Editor::default(),
             vp,
             ai,
@@ -394,7 +411,9 @@ impl App {
             relisten: false,
             listen_purpose: Listen::Command,
             transcribe_purpose: Listen::Command,
-        }
+        };
+        app.lib.show_start = app.settings.show_start_screen && app.recovery.is_none() && std::env::var_os("RB_NO_START").is_none();
+        app
     }
 
     fn toast(&mut self, text: impl Into<String>, color: Color32) {
@@ -1097,6 +1116,7 @@ impl App {
             {
                 Ok(_) => {
                     self.toast(format!("Saved {}", p.display()), theme::OK);
+                    self.settings.push_recent(&p);
                     self.ed.file_path = Some(p);
                     self.ed.dirty = false;
                 }
@@ -1132,6 +1152,9 @@ impl App {
                 self.ed.dirty = false;
                 self.ed.view_requests.push(ViewRequest::FrameAll);
                 self.toast(format!("Opened {}", p.display()), theme::OK);
+                if !p.starts_with(autosave_dir()) {
+                    self.settings.push_recent(p);
+                }
             }
             Err(e) => self.toast(format!("Open failed: {e}"), theme::ERR),
         }
@@ -2003,6 +2026,9 @@ impl App {
         use egui::Modifiers as M;
         let typing = ctx.egui_wants_keyboard_input();
         let c = |m: M, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
+        if c(M::SHIFT, Key::F1) {
+            self.lib.show_assets = !self.lib.show_assets;
+        }
         if c(M::COMMAND | M::SHIFT, Key::Z) || c(M::COMMAND, Key::Y) {
             if !self.ed.redo() {
                 self.toast("Nothing to redo", theme::TEXT_DIM);
@@ -2197,6 +2223,17 @@ impl App {
                             if ui.button("New            Ctrl+N").clicked() {
                                 self.new_scene();
                             }
+                            ui.menu_button("New from Template", |ui| {
+                                for t in crate::templates::TEMPLATES {
+                                    if ui.button(t.name).on_hover_text(t.blurb).clicked() {
+                                        self.start_template(t.name);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if ui.button("Start Screen…").clicked() {
+                                self.lib.show_start = true;
+                            }
                             if ui.button("Open…          Ctrl+O").clicked() {
                                 self.open();
                             }
@@ -2261,6 +2298,11 @@ impl App {
                         });
                         ui.menu_button("Add", |ui| {
                             self.add_menu_items(ui);
+                            ui.separator();
+                            if ui.button("📚 Asset Library…   Shift+F1").clicked() {
+                                self.lib.show_assets = true;
+                                ui.close();
+                            }
                         });
                         if self.ed.editing() {
                             ui.menu_button("Mesh", |ui| {
@@ -3970,6 +4012,21 @@ impl App {
                         }
                         _ => {}
                     }
+                    if let Some(a) = ui.ctx().data_mut(|d| d.remove_temp::<String>(egui::Id::unique("hair_action"))) {
+                        if o != orig {
+                            self.ed.snapshot();
+                            *self.ed.scene.get_mut(id).unwrap() = o.clone();
+                        }
+                        let cmd = match a.as_str() {
+                            "groom" => Command { action: "groom".into(), ..Default::default() },
+                            _ => Command { action: "hair_dynamics".into(), target: Some(o.name.clone()), ..Default::default() },
+                        };
+                        let log = self.ed.execute(&[cmd]);
+                        if let Some(l) = log.first() {
+                            self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                        }
+                        return;
+                    }
                     if let Some(a) = ui.ctx().data_mut(|d| d.remove_temp::<String>(egui::Id::unique("cloth_action"))) {
                         // keep slider edits, then run the bake
                         if o != orig {
@@ -4107,7 +4164,7 @@ impl App {
         }
         let smp = self.vp.graph_images(&self.ed, &g);
         let n = 96;
-        let rgba = crate::nodes::preview_ball(&g, *mat, n, &smp);
+        let rgba = crate::nodes::preview_ball(Some(&g), *mat, n, &smp);
         let tex = ctx.load_texture("node_preview", egui::ColorImage::from_rgba_unmultiplied([n, n], &rgba), egui::TextureOptions::LINEAR);
         self.node_preview_tex = Some((key, tex.clone()));
         Some(tex)
@@ -5612,7 +5669,30 @@ fn hair_props(ui: &mut Ui, o: &mut crate::scene::Object) {
         ui.add(egui::Slider::new(&mut h.thickness, 0.0005..=0.05).logarithmic(true).text("Thickness (m)"));
         ui.add(egui::Slider::new(&mut h.tip, 0.0..=1.0).text("Tip width"));
         ui.add(egui::Slider::new(&mut h.segments, 1..=32).text("Segments"));
-        ui.add(egui::DragValue::new(&mut h.seed).prefix("Seed "));
+        ui.add(egui::DragValue::new(&mut h.seed).prefix("Seed ")).on_hover_text("A new seed moves the roots (and loses the grooming)");
+        ui.horizontal(|ui| {
+            if ui.button("〰 Groom (Hair Edit)").on_hover_text("Comb, length, puff, cut and smooth brushes").clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("hair_action"), "groom".to_string()));
+            }
+            if !h.groom.is_empty() && ui.button("Reset Grooming").clicked() {
+                h.groom.clear();
+            }
+        });
+        ui.separator();
+        ui.checkbox(&mut h.dynamics, "Dynamics").on_hover_text("Strands swing and lag when the surface moves (simulated over the timeline)");
+        if h.dynamics {
+            ui.add(egui::Slider::new(&mut h.stiffness, 0.0..=1.0).text("Stiffness"));
+            ui.add(egui::Slider::new(&mut h.damping, 0.0..=1.0).text("Damping"));
+            let label = if h.sim.is_empty() { "▶ Simulate" } else { "⟳ Re-simulate" };
+            if ui.button(label).clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("hair_action"), "bake".to_string()));
+            }
+            if h.sim.is_empty() {
+                ui.label(RichText::new("Not simulated yet — animate the surface, then Simulate.").small().color(theme::TEXT_DIM));
+            }
+        } else if !h.sim.is_empty() {
+            h.sim = Default::default();
+        }
         let n = h.strands();
         let tris = n * h.segments.clamp(1, 32) as usize * 6;
         ui.label(RichText::new(format!("{n} strands · {:.1}k triangles. Grows from the surface and follows it when it moves or deforms; Object ▸ Scatter ▸ Make Real bakes it.", tris as f32 / 1000.0)).small().color(theme::TEXT_DIM));
@@ -5749,6 +5829,7 @@ impl eframe::App for App {
         self.render_window(&ctx);
         self.node_editor.show(&ctx, &mut self.ed);
         self.uv_window(&ctx);
+        self.library_ui(&ctx);
 
         let title = format!(
             "Rust Blender{}{}",

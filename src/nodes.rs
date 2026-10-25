@@ -33,6 +33,10 @@ pub enum MathOp {
     Smooth,
 }
 
+fn brick_ratio() -> f32 {
+    2.0
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeKind {
@@ -50,7 +54,13 @@ pub enum NodeKind {
     Noise { scale: f32, detail: u32, distortion: f32 },
     Voronoi { scale: f32, randomness: f32 },
     Checker { scale: f32 },
-    Bricks { scale: f32, mortar: f32 },
+    Bricks {
+        scale: f32,
+        mortar: f32,
+        /// brick length ÷ height (2 = bricks, 6+ = floor planks)
+        #[serde(default = "brick_ratio")]
+        ratio: f32,
+    },
     Waves { scale: f32, distortion: f32 },
     /// Fac → colour through gradient stops (position, colour).
     Ramp { stops: Vec<(f32, [f32; 3])> },
@@ -124,7 +134,7 @@ impl NodeKind {
             NodeKind::Noise { scale: 5.0, detail: 4, distortion: 0.0 },
             NodeKind::Voronoi { scale: 5.0, randomness: 1.0 },
             NodeKind::Checker { scale: 8.0 },
-            NodeKind::Bricks { scale: 4.0, mortar: 0.06 },
+            NodeKind::Bricks { scale: 4.0, mortar: 0.06, ratio: 2.0 },
             NodeKind::Waves { scale: 6.0, distortion: 2.0 },
             NodeKind::Ramp { stops: vec![(0.0, [0.0; 3]), (1.0, [1.0; 3])] },
             NodeKind::Mix { mode: MixMode::Mix, fac: 0.5, a: [0.8; 3], b: [0.2; 3] },
@@ -501,13 +511,16 @@ impl NodeGraph {
                 let k = (p.x.floor() as i64 + p.y.floor() as i64 + p.z.floor() as i64).rem_euclid(2) as f32;
                 [Val::F(k), z, z]
             }
-            NodeKind::Bricks { scale, mortar } => {
+            NodeKind::Bricks { scale, mortar, ratio } => {
+                let k = ratio.max(0.1);
                 let p = vec_in(inp(0, memo)) * *scale;
-                let row = (p.y * 2.0).floor();
-                let x = p.x + if row as i64 % 2 == 0 { 0.0 } else { 0.5 };
-                let (fx, fy) = (x.fract().abs(), (p.y * 2.0).fract().abs());
+                let row = (p.y * k).floor();
+                // planks stagger irregularly, bricks by half
+                let shift = if k > 3.0 { hash2(row as i32, 17, 3) } else if row as i64 % 2 == 0 { 0.0 } else { 0.5 };
+                let x = p.x + shift;
+                let (fx, fy) = (x.fract().abs(), (p.y * k).fract().abs());
                 let m = *mortar;
-                let inside = fx > m && fx < 1.0 - m && fy > m * 2.0 && fy < 1.0 - m * 2.0;
+                let inside = fx > m && fx < 1.0 - m && fy > m * k && fy < 1.0 - m * k;
                 // brick variation in the colour channel
                 let var = hash2(x.floor() as i32, row as i32, 5);
                 [Val::F(if inside { 0.6 + 0.4 * var } else { 0.0 }), z, z]
@@ -617,6 +630,33 @@ impl NodeGraph {
             g.connect((m, 0), (inv, 1));
             g.connect((inv, 0), (out, 2)); // metal where clean
             g.connect((n, 0), (out, 4));
+        } else if low.contains("plank") || low.contains("floor") || low.contains("parquet") {
+            // floor boards: wood grain along each plank, a dark seam between them, each board
+            // a slightly different shade
+            title = "Wood Floor";
+            let c = co(&mut g, 1.0);
+            let b = g.add(NodeKind::Bricks { scale: 1.5, mortar: 0.004, ratio: 7.0 }, [160.0, 40.0]);
+            // grain along the boards: waves of the rotated coordinates vary with V only
+            let c2 = g.add(NodeKind::Coords { scale: 1.0, rotate: -45.0, object: false }, [0.0, 220.0]);
+            let w = g.add(NodeKind::Waves { scale: 14.0, distortion: 0.25 }, [160.0, 180.0]);
+            let r = g.add(NodeKind::Ramp { stops: vec![(0.0, [0.42, 0.25, 0.12]), (0.6, [0.55, 0.35, 0.18]), (1.0, [0.6, 0.4, 0.21])] }, [330.0, 180.0]);
+            let seam = g.add(NodeKind::Math { op: MathOp::Smooth, a: 0.0, b: 0.05 }, [330.0, 40.0]);
+            let tone = g.add(NodeKind::Math { op: MathOp::Multiply, a: 0.0, b: 1.0 }, [330.0, 300.0]);
+            let mx = g.add(NodeKind::Mix { mode: MixMode::Multiply, fac: 1.0, a: [1.0; 3], b: [1.0; 3] }, [480.0, 120.0]);
+            let rough = g.add(NodeKind::Value { value: 0.35 }, [480.0, 260.0]);
+            g.connect((c, 0), (b, 0));
+            g.connect((c2, 0), (w, 0));
+            g.connect((w, 0), (r, 0));
+            g.connect((b, 0), (seam, 0));
+            g.connect((b, 0), (tone, 0));
+            g.connect((r, 0), (mx, 1));
+            g.connect((tone, 0), (mx, 2));
+            g.connect((mx, 0), (out, 0));
+            g.connect((rough, 0), (out, 1));
+            g.connect((seam, 0), (out, 4));
+            if let Some(o) = g.nodes.iter_mut().find(|n| n.id == out) {
+                o.kind = NodeKind::Output { bump: 0.4 };
+            }
         } else if low.contains("wood") {
             title = "Wood";
             let c = co(&mut g, 1.0);
@@ -722,7 +762,7 @@ impl NodeGraph {
         } else if low.contains("brick") {
             title = "Bricks";
             let c = co(&mut g, 1.0);
-            let b = g.add(NodeKind::Bricks { scale: 4.0, mortar: 0.05 }, [160.0, 100.0]);
+            let b = g.add(NodeKind::Bricks { scale: 4.0, mortar: 0.05, ratio: 2.0 }, [160.0, 100.0]);
             let r = g.add(NodeKind::Ramp { stops: vec![(0.0, [0.72, 0.7, 0.66]), (0.05, [0.4, 0.15, 0.1]), (1.0, [0.65, 0.28, 0.17])] }, [330.0, 100.0]);
             g.connect((c, 0), (b, 0));
             g.connect((b, 0), (r, 0));
@@ -779,8 +819,8 @@ impl NodeGraph {
 pub fn param_rows(k: &NodeKind) -> usize {
     match k {
         NodeKind::Output { .. } | NodeKind::Checker { .. } | NodeKind::Image { .. } | NodeKind::Rgb { .. } | NodeKind::Value { .. } => 1,
-        NodeKind::Voronoi { .. } | NodeKind::Bricks { .. } | NodeKind::Waves { .. } => 2,
-        NodeKind::Coords { .. } | NodeKind::Noise { .. } | NodeKind::Math { .. } => 3,
+        NodeKind::Voronoi { .. } | NodeKind::Waves { .. } => 2,
+        NodeKind::Coords { .. } | NodeKind::Noise { .. } | NodeKind::Math { .. } | NodeKind::Bricks { .. } => 3,
         NodeKind::Mix { .. } => 4,
         NodeKind::Ramp { stops } => 2 + stops.len(),
         NodeKind::Invert => 0,
@@ -794,7 +834,7 @@ pub fn node_height_estimate(k: &NodeKind) -> f32 {
     22.0 + k.outputs().len() as f32 * 18.0 + params as f32 * 22.0 + k.inputs().len() as f32 * 18.0 + 6.0
 }
 
-pub const PRESETS: &[&str] = &["Rusty Metal", "Wood", "Marble", "Cobblestone", "Lava", "Bricks", "Tiles", "Granite"];
+pub const PRESETS: &[&str] = &["Rusty Metal", "Wood", "Wood Floor", "Marble", "Cobblestone", "Lava", "Bricks", "Tiles", "Granite"];
 
 /// Bake the colour (with bump shading for the raster renderers when `shade_bumps`), the
 /// roughness/metallic map and a normal map, each `size`² over UV 0..1.
@@ -937,7 +977,7 @@ pub fn bake_object(g: &NodeGraph, base: crate::scene::Material, mesh: &crate::me
 /// A small lit sphere showing the graph's real result (colour, roughness, metallic, emission and
 /// bumps) for the Material tab; RGBA8, transparent around the ball. Object coordinates are the
 /// unit sphere, UVs a latitude/longitude mapping.
-pub fn preview_ball(g: &NodeGraph, base: crate::scene::Material, size: usize, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>) -> Vec<u8> {
+pub fn preview_ball(g: Option<&NodeGraph>, base: crate::scene::Material, size: usize, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>) -> Vec<u8> {
     let n = size.max(8);
     let mut out = vec![0u8; n * n * 4];
     let light = Vec3::new(-0.55, -0.7, 0.65).normalize();
@@ -959,8 +999,8 @@ pub fn preview_ball(g: &NodeGraph, base: crate::scene::Material, size: usize, te
             let mut nrm = Vec3::new(sx, -(1.0 - sx * sx - sy * sy).max(0.0).sqrt(), sy).normalize();
             let p = nrm;
             let uv = uv_of(p);
-            let s = g.eval(uv, p, tex);
-            if let Some(h0) = s.height {
+            let s = g.map(|g| g.eval(uv, p, tex)).unwrap_or_default();
+            if let (Some(h0), Some(g)) = (s.height, g) {
                 // bump over the sphere's surface frame
                 let tu = Vec3::Z.cross(nrm).normalize_or(Vec3::X);
                 let tv = nrm.cross(tu);
@@ -986,7 +1026,10 @@ pub fn preview_ball(g: &NodeGraph, base: crate::scene::Material, size: usize, te
             let c = Vec3::new(c.x.max(0.0).powf(1.0 / 2.2), c.y.max(0.0).powf(1.0 / 2.2), c.z.max(0.0).powf(1.0 / 2.2));
             let i = (y * n + x) * 4;
             let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-            out[i..i + 4].copy_from_slice(&[q(c.x), q(c.y), q(c.z), q(cover)]);
+            // see-through materials: show them faintly, with their highlights
+            let a = base.alpha.clamp(0.0, 1.0);
+            let op = if a < 0.999 { (0.25 + 0.75 * a + (spec.max_element() * 2.0)).min(1.0) } else { 1.0 };
+            out[i..i + 4].copy_from_slice(&[q(c.x), q(c.y), q(c.z), q(cover * op)]);
         }
     }
     out

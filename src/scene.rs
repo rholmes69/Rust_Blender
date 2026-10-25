@@ -744,7 +744,10 @@ impl Scene {
                     (v.x.to_bits(), v.y.to_bits(), v.z.to_bits()).hash(&mut h);
                 }
             }
-            format!("{hr:?}").hash(&mut h);
+            hr.digest(&mut h);
+            if hr.dynamics && !hr.sim.is_empty() {
+                self.objects[i].sim_frame.hash(&mut h);
+            }
             let key = h.finish() | 1;
             if self.objects[i].posed.is_some() && self.objects[i].posed_key == key {
                 continue;
@@ -755,7 +758,9 @@ impl Scene {
                 _ => rest.clone(),
             };
             let to_local = self.objects[i].transform.matrix().inverse();
-            let pm = crate::hair::build(&hr, &rest, &surface, tgt.transform.matrix(), to_local);
+            let frame = self.objects[i].sim_frame;
+            let g = crate::hair::guides_at(&hr, &rest, &surface, tgt.transform.matrix(), frame);
+            let pm = crate::hair::build_from(&hr, &g, to_local);
             let o = &mut self.objects[i];
             o.posed = Some(std::sync::Arc::new(pm));
             o.posed_key = key;

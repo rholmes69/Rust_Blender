@@ -337,9 +337,10 @@ fn params(ui: &mut egui::Ui, k: &mut NodeKind, textures: &[(u32, String)], id: u
             ui.add(egui::Slider::new(randomness, 0.0..=1.0).text("Random"));
         }
         NodeKind::Checker { scale } => dv(ui, scale, "Scale", 0.1),
-        NodeKind::Bricks { scale, mortar } => {
+        NodeKind::Bricks { scale, mortar, ratio } => {
             dv(ui, scale, "Scale", 0.1);
-            ui.add(egui::Slider::new(mortar, 0.0..=0.3).text("Mortar"));
+            ui.add(egui::DragValue::new(mortar).range(0.0..=0.3).speed(0.002).prefix("Mortar ").max_decimals(3));
+            ui.add(egui::DragValue::new(ratio).range(0.2..=20.0).speed(0.05).prefix("Length ÷ height ").max_decimals(2));
         }
         NodeKind::Waves { scale, distortion } => {
             dv(ui, scale, "Scale", 0.1);

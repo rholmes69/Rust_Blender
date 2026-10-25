@@ -428,6 +428,11 @@ pub const ACTIONS: &[&str] = &[
     "roughness_map",
     "scatter",
     "hair",
+    "groom",
+    "hair_dynamics",
+    "template",
+    "add_asset",
+    "save_asset",
     "realize",
     "rig",
     "pose_mode",
@@ -531,10 +536,21 @@ Each command is an object with "action" plus only the fields it needs:
   steepness in degrees (30 keeps things on flat ground), align = true to stand along the surface (planets),
   rotation = [tilt,tilt,spin]. Repeating it with the same target and name updates the scatter. realize: target
   = scatter object (bake to a real mesh). "a forest" = tree scatter; "a rocky field" = rock scatter.
+- template: name = General | Empty | Product Shot | Turntable | Landscape | Interior | Physics Playground |
+  Hair & Fur — REPLACES the whole scene with a ready-made one (studio, lights, camera, content). Only when the
+  user asks for a new scene / a fresh start ("start a product shot", "new landscape scene").
+- add_asset: name = an asset from the library — built-in objects Vase, Rock, Pine Tree, Bush, Flower, Table,
+  Chair, Furry Ball, Domino, Lamp (or one the user saved), location = where (an object name puts it on top
+  of it… use [x,y,z]); or a material asset (Gold, Chrome, Copper, Glass, Red Plastic, Rubber, Ceramic, Neon
+  Glow, Wood Floor, Granite …) applied to target. "put a lamp next to the table", "make the cube chrome".
+- save_asset: target = objects to save to the user's asset library, name = asset name; modifier = "material"
+  saves only the target's material.
 - hair: target = the mesh to grow it on, name = fur | hair | curly | shaggy | grass (strands) or "none" to
   remove; number = guide strands, length = metres, gravity = droop 0..1, curl = turns, color = hair colour,
   seed. Repeating it on the same target updates the hair (only numbers → tweak, a name → restyle). "a furry
-  ball" = sphere + fur; "long hair on the head" = hair with length 0.6.
+  ball" = sphere + fur; "long hair on the head" = hair with length 0.6. groom: enter Hair Edit (brush
+  grooming) on the selected hair. hair_dynamics: target = hair (or its surface) — simulate swinging strands
+  over the animation; number = stiffness 0..1; name "off" removes it.
 - particles: name = sparks | snow | rain | confetti | bubbles | smoke | fire (or object = an existing object to
   emit), target = the emitter mesh (sparks from a sphere, smoke from a chimney; snow / rain without a target get
   an emitter above the scene), number = particles per frame, power = speed, scale = size. Calling it with
@@ -1025,6 +1041,12 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         }
         "add trees" | "add a forest" | "scatter trees" | "plant trees" => return Some(vec![Command { action: "scatter".into(), name: Some("tree".into()), ..Default::default() }]),
         "add rocks" | "scatter rocks" | "add some rocks" => return Some(vec![Command { action: "scatter".into(), name: Some("rock".into()), ..Default::default() }]),
+        "new product shot" | "start a product shot" | "product shot" | "studio scene" | "new studio scene" => return Some(vec![Command { action: "template".into(), name: Some("Product Shot".into()), ..Default::default() }]),
+        "new landscape" | "new landscape scene" | "start a landscape" | "landscape scene" => return Some(vec![Command { action: "template".into(), name: Some("Landscape".into()), ..Default::default() }]),
+        "new turntable" | "turntable" | "make a turntable" | "turntable scene" => return Some(vec![Command { action: "template".into(), name: Some("Turntable".into()), ..Default::default() }]),
+        "new interior" | "interior scene" | "new room" | "start an interior" => return Some(vec![Command { action: "template".into(), name: Some("Interior".into()), ..Default::default() }]),
+        "physics playground" | "new physics scene" => return Some(vec![Command { action: "template".into(), name: Some("Physics Playground".into()), ..Default::default() }]),
+        "save as asset" | "save it as an asset" | "add to library" | "add it to the library" | "save to library" => return Some(vec![Command::new("save_asset")]),
         "add fur" | "make it furry" | "furry" | "give it fur" => return Some(vec![Command { action: "hair".into(), name: Some("fur".into()), ..Default::default() }]),
         "add hair" | "give it hair" | "grow hair" => return Some(vec![Command { action: "hair".into(), name: Some("hair".into()), ..Default::default() }]),
         "remove hair" | "remove the hair" | "remove fur" | "remove the fur" | "shave it" => return Some(vec![Command { action: "hair".into(), name: Some("none".into()), ..Default::default() }]),

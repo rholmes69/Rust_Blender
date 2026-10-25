@@ -66,6 +66,8 @@ pub struct Editor {
     pub active_bone: usize,
     /// Rigged mesh in Weight Paint mode (paints `active_bone` of its armature).
     pub weight_paint: Option<u64>,
+    /// Hair object being groomed (Hair Edit mode).
+    pub hair_edit: Option<u64>,
     /// Armature in Edit Mode (rest bones) and the selected part of `active_bone`.
     pub bone_edit: Option<u64>,
     pub bone_part: crate::armature::BonePart,
@@ -102,6 +104,7 @@ impl Default for Editor {
             pose: None,
             active_bone: 0,
             weight_paint: None,
+            hair_edit: None,
             bone_edit: None,
             bone_part: Default::default(),
             shape_edit: None,
@@ -238,6 +241,44 @@ impl Editor {
 
     /// A ready-made object to scatter ("rock", "tree", "grass", "bush" or any primitive),
     /// created hidden at the origin with its base at z = 0.
+    /// Replace the scene with a template (one undo step).
+    pub fn load_template(&mut self, name: &str) -> Result<String, String> {
+        let scene = crate::templates::build(name).ok_or_else(|| format!("no template {name:?} ({})", crate::templates::TEMPLATES.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")))?;
+        Ok(self.use_template_scene(name, scene))
+    }
+
+    /// Switch to an already built template scene.
+    pub fn use_template_scene(&mut self, name: &str, scene: crate::scene::Scene) -> String {
+        self.exit_edit();
+        self.scene = scene;
+        self.reset_parent_cache();
+        self.selection.clear();
+        self.active = None;
+        self.file_path = None;
+        self.frame = self.scene.frame_start;
+        self.set_frame(self.frame);
+        self.shading = Shading::Material;
+        self.view_requests.push(ViewRequest::FrameAll);
+        let t = crate::templates::TEMPLATES.iter().find(|t| t.name.eq_ignore_ascii_case(name)).map(|t| t.name).unwrap_or(name);
+        format!("New scene from the {t} template ({} objects)", self.scene.objects.len())
+    }
+
+    /// Place an object asset (bottom centre at `at`) and select it.
+    pub fn place_asset(&mut self, a: &crate::assets::Asset, at: Vec3) -> Vec<u64> {
+        self.exit_edit();
+        let ids = crate::assets::insert(&mut self.scene, a, at);
+        self.reset_parent_cache();
+        let roots: Vec<u64> = ids.iter().copied().filter(|id| self.scene.get(*id).is_some_and(|o| o.visible && (o.parent.is_none() || !ids.contains(&o.parent.unwrap())) && o.hair.is_none() && o.scatter.is_none())).collect();
+        self.selection = if roots.is_empty() { ids.clone() } else { roots };
+        self.active = self.selection.first().copied();
+        ids
+    }
+
+    /// A scatter preset object (rock, tree, grass, bush, flower), hidden, in this scene.
+    pub fn scatter_preset_pub(&mut self, spec: &str) -> Result<(u64, ()), String> {
+        self.scatter_preset(spec).map(|(id, _)| (id, ()))
+    }
+
     fn scatter_preset(&mut self, spec: &str) -> Result<(u64, ScatterPreset), String> {
         use crate::mesh::Primitive;
         let low = spec.to_lowercase();
@@ -477,8 +518,47 @@ impl Editor {
         Ok(format!("\"{n}\": up to {peak} particles over frames {f0}–{f1} — press play"))
     }
 
+    /// Simulate hair dynamics over the timeline (the surface's animation drives the roots).
+    pub fn bake_hair(&mut self, id: u64) -> Result<String, String> {
+        let h = self.scene.get(id).and_then(|o| o.hair.clone()).ok_or("not a hair object")?;
+        let tid = h.target;
+        self.scene.get(tid).ok_or("the hair's surface is gone")?;
+        let (f0, f1) = (self.scene.frame_start, self.scene.frame_end.max(self.scene.frame_start + 1));
+        let frames = ((f1 - f0 + 1) as usize).min(1000);
+        let keep = self.frame;
+        // don't regrow the hair mesh on every frame while stepping
+        let saved = self.scene.get_mut(id).unwrap().hair.take();
+        let mut targets = Vec::with_capacity(frames);
+        for k in 0..frames {
+            self.set_frame(f0 + k as i32);
+            let t = self.scene.get(tid).unwrap();
+            let rest = t.poly();
+            let surface = match &t.posed {
+                Some(p) if p.faces.len() == rest.faces.len() && p.verts.len() == rest.verts.len() => (**p).clone(),
+                _ => rest.clone(),
+            };
+            targets.push(crate::hair::guides(&h, &rest, &surface, t.transform.matrix()));
+        }
+        let sim = crate::hair::simulate(&h, &targets, self.scene.fps.max(1) as f32);
+        let o = self.scene.get_mut(id).unwrap();
+        o.hair = saved;
+        if let Some(hh) = o.hair.as_mut() {
+            hh.dynamics = true;
+            hh.sim = std::sync::Arc::new(sim);
+            hh.sim_start = f0;
+        }
+        o.posed_key = 0;
+        self.set_frame(keep);
+        let name = self.scene.get(id).unwrap().name.clone();
+        Ok(format!("Hair dynamics for \"{name}\" over frames {f0}–{f1} — press play"))
+    }
+
     /// Re-run stored simulations (after opening a file).
     pub fn rebake_physics(&mut self) {
+        let hairs: Vec<u64> = self.scene.objects.iter().filter(|o| o.hair.as_ref().is_some_and(|h| h.dynamics)).map(|o| o.id).collect();
+        for id in hairs {
+            let _ = self.bake_hair(id);
+        }
         let cloths: Vec<String> = self.scene.objects.iter().filter(|o| o.cloth.is_some()).map(|o| o.name.clone()).collect();
         for n in cloths {
             let _ = self.exec_one(&Command { action: "bake_cloth".into(), target: Some(n), ..Default::default() });
@@ -714,6 +794,11 @@ impl Editor {
         if let Some(id) = self.weight_paint {
             if !self.scene.get(id).is_some_and(|o| o.skin.is_some()) {
                 self.weight_paint = None;
+            }
+        }
+        if let Some(id) = self.hair_edit {
+            if !self.scene.get(id).is_some_and(|o| o.hair.is_some()) {
+                self.hair_edit = None;
             }
         }
         if let Some(id) = self.pose {
@@ -1975,6 +2060,79 @@ impl Editor {
                 let name = self.scene.get(id).unwrap().name.clone();
                 Ok(format!("{} on \"{}\": {n} strands ({} guides × {} children), {:.2} m", if existing.is_some() { "Updated hair" } else { title }, self.scene.get(surf).unwrap().name, h.count, h.children + 1, h.length) + &format!(" → \"{name}\"{}", if tinted { " (surface tinted to the root colour)" } else { "" }))
             }
+            "template" | "new_from_template" | "load_template" | "start_template" => {
+                let name = c.name.clone().ok_or_else(|| format!("template needs name = one of {}", crate::templates::TEMPLATES.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")))?;
+                self.load_template(&name)
+            }
+            "add_asset" | "append_asset" | "place_asset" | "asset" | "use_asset" => {
+                let name = c.name.clone().or(c.object.clone()).ok_or("add_asset needs name = an asset from the library")?;
+                let a = find_asset(&name).ok_or_else(|| format!("no asset called {name:?} (built in: {}, {})", crate::assets::BUILTIN_OBJECTS.join(", "), crate::assets::BUILTIN_MATERIALS.join(", ")))?;
+                match a.kind {
+                    crate::assets::AssetKind::Material => {
+                        let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                        if ids.is_empty() {
+                            return Err(format!("select (or target) the objects to give the {} material", a.name));
+                        }
+                        crate::assets::apply_material(&mut self.scene, &a, &ids);
+                        if self.shading == Shading::Solid {
+                            self.shading = Shading::Material;
+                        }
+                        Ok(format!("{} material on {}", a.name, self.names(&ids)))
+                    }
+                    crate::assets::AssetKind::Object => {
+                        let at = c.location.as_ref().and_then(|v| self.resolve_point(v)).unwrap_or(Vec3::ZERO);
+                        let ids = self.place_asset(&a, at);
+                        Ok(format!("Placed {} ({}) at [{:.1}, {:.1}, {:.1}]", a.name, self.names(&ids), at.x, at.y, at.z))
+                    }
+                }
+            }
+            "save_asset" | "mark_asset" | "add_to_library" => {
+                let dir = crate::assets::library_dir();
+                let ids: Vec<u64> = targets();
+                if ids.is_empty() {
+                    return Err("select the objects to save as an asset".into());
+                }
+                let first = self.scene.get(ids[0]).map(|o| o.name.clone()).unwrap_or_default();
+                let mat_only = c.modifier.as_deref().is_some_and(|m| m.contains("material")) || c.primitive.as_deref() == Some("material");
+                let name = c.name.clone().unwrap_or_else(|| first.clone());
+                let a = if mat_only {
+                    let m = self.scene.get(ids[0]).ok_or("no object")?.material;
+                    crate::assets::from_material(&self.scene, &m, &name)
+                } else {
+                    crate::assets::from_objects(&self.scene, &ids, &name).ok_or("nothing to save")?
+                };
+                let p = crate::assets::save(&dir, &a, None)?;
+                Ok(format!("Saved {} \"{name}\" to the asset library ({})", if mat_only { "material" } else { "asset" }, p.display()))
+            }
+            "groom" | "hair_edit" | "comb_hair" | "groom_hair" => self.toggle_groom(),
+            "hair_dynamics" | "bake_hair" | "simulate_hair" => {
+                let id = c
+                    .target
+                    .as_deref()
+                    .and_then(|t| self.scene.find_by_name(t))
+                    .or(self.active)
+                    .and_then(|id| {
+                        let o = self.scene.get(id)?;
+                        if o.hair.is_some() { Some(id) } else { self.scene.objects.iter().find(|h| h.hair.as_ref().is_some_and(|hh| hh.target == id)).map(|h| h.id) }
+                    })
+                    .ok_or("hair_dynamics needs target = a hair object (or the mesh it grows on)")?;
+                let off = c.name.as_deref().is_some_and(|n| matches!(n.to_lowercase().as_str(), "off" | "none" | "remove" | "stop"));
+                let o = self.scene.get_mut(id).unwrap();
+                let h = o.hair.as_mut().unwrap();
+                if off {
+                    h.dynamics = false;
+                    h.sim = Default::default();
+                    o.posed_key = 0;
+                    return Ok(format!("Hair dynamics off for \"{}\"", o.name));
+                }
+                if let Some(v) = c.number {
+                    h.stiffness = (v as f32).clamp(0.0, 1.0);
+                }
+                if let Some(v) = c.gravity {
+                    h.damping = (v as f32).clamp(0.0, 1.0);
+                }
+                self.bake_hair(id)
+            }
             "realize" | "apply_scatter" | "make_real" => {
                 let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_generated())).collect();
                 if ids.is_empty() {
@@ -2434,6 +2592,7 @@ impl Editor {
         self.sculpt = None;
         self.pose = None;
         self.weight_paint = None;
+        self.hair_edit = None;
         self.edit = Some(EditState {
             obj: id,
             mode: SelectMode::Vertex,
@@ -2449,6 +2608,30 @@ impl Editor {
         self.sculpt = None;
         self.pose = None;
         self.weight_paint = None;
+        self.hair_edit = None;
+    }
+
+    /// Enter / leave Hair Edit (grooming) on the active hair object, or the hair of the active mesh.
+    pub fn toggle_groom(&mut self) -> Result<String, String> {
+        if self.hair_edit.take().is_some() {
+            return Ok("Object mode".into());
+        }
+        let hair_of = |ed: &Editor, id: u64| -> Option<u64> {
+            let o = ed.scene.get(id)?;
+            if o.hair.is_some() {
+                return Some(id);
+            }
+            ed.scene.objects.iter().find(|h| h.hair.as_ref().is_some_and(|hh| hh.target == id)).map(|h| h.id)
+        };
+        let id = self
+            .active
+            .and_then(|a| hair_of(self, a))
+            .or_else(|| self.selection.iter().find_map(|s| hair_of(self, *s)))
+            .ok_or("select a hair object (Object ▸ Hair adds some) to groom it")?;
+        self.exit_edit();
+        self.select_only(id);
+        self.hair_edit = Some(id);
+        Ok(format!("Hair Edit: \"{}\" — comb with the mouse", self.scene.get(id).unwrap().name))
     }
 
     /// Enter / leave Weight Paint on the active rigged mesh.
@@ -2465,6 +2648,7 @@ impl Editor {
         self.sculpt = None;
         self.pose = None;
         self.bone_edit = None;
+        self.hair_edit = None;
         self.select_only(id);
         self.weight_paint = Some(id);
         let o = self.scene.get(id).unwrap();
@@ -2487,6 +2671,7 @@ impl Editor {
         self.edit = None;
         self.sculpt = None;
         self.weight_paint = None;
+        self.hair_edit = None;
         self.bone_edit = None;
         self.select_only(id);
         self.pose = Some(id);
@@ -2504,6 +2689,7 @@ impl Editor {
         self.edit = None;
         self.pose = None;
         self.weight_paint = None;
+        self.hair_edit = None;
         let name = o.name.clone();
         let mut pm = o.poly();
         let before = pm.verts.len();
@@ -2517,7 +2703,7 @@ impl Editor {
     }
 
     pub fn toggle_edit(&mut self) -> Result<String, String> {
-        if self.pose.take().is_some() || self.weight_paint.take().is_some() || self.bone_edit.take().is_some() {
+        if self.pose.take().is_some() || self.weight_paint.take().is_some() || self.bone_edit.take().is_some() || self.hair_edit.take().is_some() {
             return Ok("Object mode".into());
         }
         if let Some(id) = self.active.filter(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some())) {
@@ -3013,6 +3199,19 @@ pub struct Command {
     pub curl: Option<f64>,
 }
 
+/// An asset by name: the user's library first, then the built-ins (exact, then partial match).
+pub fn find_asset(name: &str) -> Option<crate::assets::Asset> {
+    let low = name.trim().to_lowercase();
+    let user = crate::assets::list(&crate::assets::library_dir());
+    let builtin = crate::assets::builtin_entries();
+    let all: Vec<&crate::assets::Entry> = user.iter().chain(builtin.iter()).collect();
+    let e = all.iter().find(|e| e.name.to_lowercase() == low).or_else(|| all.iter().find(|e| e.name.to_lowercase().contains(&low) || (low.len() > 3 && low.contains(&e.name.to_lowercase()))))?;
+    match &e.path {
+        Some(p) => crate::assets::load(p).ok(),
+        None => crate::assets::builtin(&e.name),
+    }
+}
+
 fn lenient_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
     let v = Option::<Value>::deserialize(d)?;
     Ok(match v {
@@ -3466,6 +3665,37 @@ mod tests {
     }
 
     #[test]
+    fn template_and_asset_commands() {
+        let dir = std::env::temp_dir().join(format!("rb_lib_{}", std::process::id()));
+        // SAFETY: only this test reads RB_ASSET_DIR
+        unsafe { std::env::set_var("RB_ASSET_DIR", &dir) };
+        let mut ed = Editor::default();
+        let log = ed.execute(&[cmd(r#"{"action":"template","name":"product shot"}"#)]);
+        assert!(log[0].starts_with('✔'), "{log:?}");
+        assert!(ed.scene.find_by_name("Vase").is_some() && ed.scene.find_by_name("Backdrop").is_some());
+        let log = ed.execute(&[
+            cmd(r#"{"action":"add_asset","name":"lamp","location":[2,0,0]}"#),
+            cmd(r#"{"action":"add_asset","name":"gold","target":"Vase"}"#),
+            cmd(r#"{"action":"save_asset","target":"Vase","name":"Golden Vase"}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let lamp = ed.scene.find_by_name("Lamp").unwrap();
+        assert!((ed.scene.get(lamp).unwrap().transform.location - Vec3::new(2.0, 0.0, 0.02)).length() < 0.05);
+        assert!(ed.scene.objects.iter().filter(|o| o.parent == Some(lamp)).count() == 3);
+        assert_eq!(ed.scene.get(ed.scene.find_by_name("Vase").unwrap()).unwrap().material.metallic, 1.0);
+        // the saved asset comes back by name
+        let log = ed.execute(&[cmd(r#"{"action":"add_asset","name":"golden vase","location":[-3,0,0]}"#)]);
+        assert!(log[0].starts_with('✔'), "{log:?}");
+        assert!(ed.scene.find_by_name("Vase.001").is_some());
+        assert!(ed.execute(&[cmd(r#"{"action":"add_asset","name":"no such thing"}"#)])[0].starts_with('✖'));
+        // undo (past the failed no-op) takes the placed asset away again
+        ed.undo();
+        ed.undo();
+        assert!(ed.scene.find_by_name("Vase.001").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn hair_command() {
         let mut ed = Editor::default();
         let log = ed.execute(&[
@@ -3492,6 +3722,25 @@ mod tests {
         ed.scene.update_derived();
         let pm = ed.scene.get(hid).unwrap().posed.clone().unwrap();
         assert!(pm.verts.iter().all(|v| (*v - Vec3::new(5.0, 0.0, 0.0)).length() < 1.5), "follows the surface");
+        // dynamics: animate the ball, simulate, the strands differ from the static groom mid-move
+        ed.execute(&[cmd(r#"{"action":"set_frame","number":1}"#), cmd(r#"{"action":"keyframe","target":"Ball"}"#), cmd(r#"{"action":"set_frame","number":10}"#), cmd(r#"{"action":"move","target":"Ball","location":[2,0,0]}"#), cmd(r#"{"action":"keyframe","target":"Ball"}"#), cmd(r#"{"action":"set_frame_range","vector":[1,30]}"#)]);
+        let log = ed.execute(&[cmd(r#"{"action":"hair_dynamics","target":"Ball"}"#)]);
+        assert!(log[0].starts_with('✔'), "{log:?}");
+        let h = ed.scene.get(hid).unwrap().hair.clone().unwrap();
+        assert!(h.dynamics && h.sim.len() == 30, "{}", h.sim.len());
+        ed.set_frame(8);
+        let moving = ed.scene.get(hid).unwrap().posed.clone().unwrap();
+        ed.execute(&[cmd(r#"{"action":"hair_dynamics","target":"Ball","name":"off"}"#)]);
+        ed.set_frame(8);
+        let still = ed.scene.get(hid).unwrap().posed.clone().unwrap();
+        assert_eq!(moving.verts.len(), still.verts.len());
+        assert!(moving.verts.iter().zip(&still.verts).any(|(a, b)| a.distance(*b) > 0.01), "dynamics change the strands");
+        // grooming mode
+        ed.select_only(hid);
+        assert!(ed.execute(&[cmd(r#"{"action":"groom"}"#)])[0].starts_with('✔'));
+        assert_eq!(ed.hair_edit, Some(hid));
+        ed.exit_edit();
+        assert!(ed.hair_edit.is_none());
         // make real, and removal
         ed.execute(&[cmd(r#"{"action":"hair","target":"Ball","name":"none"}"#)]);
         assert!(ed.scene.find_by_name("Ball Fur").is_none());

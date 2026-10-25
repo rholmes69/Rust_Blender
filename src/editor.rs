@@ -1887,6 +1887,39 @@ impl Editor {
                 }
                 Ok(format!("Made {} a real mesh", self.names(&ids)))
             }
+            "node_material" | "shader" | "material_preset" | "use_nodes" => {
+                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
+                if ids.is_empty() {
+                    return Err("no mesh object for the material".into());
+                }
+                let spec = c.name.clone().unwrap_or_else(|| "basic".into());
+                let low = spec.to_lowercase();
+                if matches!(low.as_str(), "none" | "off" | "remove") {
+                    for id in &ids {
+                        self.scene.get_mut(*id).unwrap().material.graph = 0;
+                    }
+                    return Ok(format!("Removed the node material from {}", self.names(&ids)));
+                }
+                let col = self.scene.get(ids[0]).unwrap().material.color;
+                let g = match crate::nodes::NodeGraph::preset(0, &spec) {
+                    Some(g) => g,
+                    None if matches!(low.as_str(), "basic" | "nodes" | "use nodes" | "default") => crate::nodes::NodeGraph::basic(0, &format!("{} Nodes", self.scene.get(ids[0]).unwrap().name), col),
+                    None => return Err(format!("unknown node material {spec:?} (presets: {})", crate::nodes::PRESETS.join(", "))),
+                };
+                let name = g.name.clone();
+                let gid = self.scene.add_graph(g);
+                for id in &ids {
+                    let o = self.scene.get_mut(*id).unwrap();
+                    o.material.graph = gid;
+                    if let Some(n) = c.number {
+                        o.material.tex_scale = (n as f32).clamp(0.05, 100.0);
+                    }
+                }
+                if self.shading == Shading::Solid {
+                    self.shading = Shading::Material;
+                }
+                Ok(format!("Node material \"{name}\" on {}", self.names(&ids)))
+            }
             "set_texture" | "texture" => {
                 let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh())).collect();
                 if ids.is_empty() {

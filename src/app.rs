@@ -242,6 +242,7 @@ pub struct App {
     /// Last F12 render and whether its window is open.
     render: Option<RenderView>,
     show_render: bool,
+    node_editor: crate::node_editor::NodeEditor,
     /// Timeline render in progress.
     anim: Option<crate::anim_render::AnimJob>,
     /// Join rendered frames into an MP4 (when ffmpeg is installed).
@@ -381,6 +382,7 @@ impl App {
             mcp_calls: 0,
             render: None,
             show_render: false,
+            node_editor: Default::default(),
             anim: None,
             anim_video: true,
             ffmpeg_ok: None,
@@ -4013,6 +4015,21 @@ impl App {
                             Some(p) => p.display().to_string(),
                             None => String::new(),
                         };
+                        if let Some(n) = spec.strip_prefix("<nodes:").and_then(|s| s.strip_suffix('>')) {
+                            if n == "edit" {
+                                self.node_editor.open_graph(o.material.graph);
+                            } else {
+                                let log = self.ed.execute(&[Command { action: "node_material".into(), target: Some(o.name.clone()), name: Some(n.into()), ..Default::default() }]);
+                                if let Some(l) = log.first() {
+                                    self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::ERR });
+                                }
+                                let g = self.ed.scene.get(id).map(|o| o.material.graph).unwrap_or(0);
+                                if g != 0 {
+                                    self.node_editor.open_graph(g);
+                                }
+                            }
+                            return;
+                        }
                         let (cmd, spec) = match spec.as_str() {
                             "<load>" => ("set_texture", pick()),
                             "<load-normal>" => ("bump", pick()),
@@ -5269,6 +5286,30 @@ fn material_props(ui: &mut Ui, o: &mut crate::scene::Object, textures: &[crate::
                 .color(theme::TEXT_DIM),
         );
     });
+    section(ui, "Nodes", |ui| {
+        if o.material.graph != 0 {
+            ui.horizontal(|ui| {
+                if ui.button("✎ Edit Nodes…").on_hover_text("Open the Shader Editor").clicked() {
+                    action = Some("<nodes:edit>".into());
+                }
+                if ui.button("Remove").clicked() {
+                    action = Some("<nodes:none>".into());
+                }
+            });
+            ui.add(egui::Slider::new(&mut o.material.tex_scale, 0.1..=20.0).logarithmic(true).text("Repeats"));
+            ui.label(RichText::new("The node material replaces the texture slots below. Path traced renders shade it per pixel; Material Preview shows a baked version.").small().color(theme::TEXT_DIM));
+        } else if ui.button("Use Nodes").on_hover_text("Build this material from shader nodes").clicked() {
+            action = Some("<nodes:basic>".into());
+        }
+        ui.label(RichText::new("Presets").small().color(theme::TEXT_DIM));
+        ui.horizontal_wrapped(|ui| {
+            for p in crate::nodes::PRESETS {
+                if ui.small_button(*p).clicked() {
+                    action = Some(format!("<nodes:{p}>"));
+                }
+            }
+        });
+    });
     section(ui, "Texture", |ui| {
         let current = textures.iter().find(|t| t.id == o.material.texture).map(|t| t.name.clone()).unwrap_or_else(|| "None".into());
         ui.horizontal(|ui| {
@@ -5639,6 +5680,7 @@ impl eframe::App for App {
         }
         self.anim_tick(&ctx);
         self.render_window(&ctx);
+        self.node_editor.show(&ctx, &mut self.ed);
         self.uv_window(&ctx);
 
         let title = format!(

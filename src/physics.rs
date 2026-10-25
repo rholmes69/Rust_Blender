@@ -509,6 +509,15 @@ pub fn bake_rigid(bodies: &[BodyIn], statics: &[Collider], frames: usize, fps: f
 
 // ---- particles --------------------------------------------------------------------------------
 
+/// One living particle in one frame (world space). `id` follows it across frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PState {
+    pub x: Vec3,
+    pub rot: glam::Quat,
+    pub size: f32,
+    pub id: u32,
+}
+
 /// A particle system: copies of `source` emitted from the surface of `emitter` over time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Particles {
@@ -535,7 +544,7 @@ pub struct Particles {
     pub preroll: u32,
     /// Baked per frame: (position, size) of each living particle, world space, from `start`.
     #[serde(skip)]
-    pub cache: std::sync::Arc<Vec<Vec<(Vec3, glam::Quat, f32)>>>,
+    pub cache: std::sync::Arc<Vec<Vec<PState>>>,
     #[serde(default)]
     pub start: i32,
 }
@@ -547,8 +556,9 @@ impl Particles {
 }
 
 /// Simulate a particle system for `frames` frames.
-pub fn bake_particles(p: &Particles, emitter: &PolyMesh, emitter_world: Mat4, colliders: &[Collider], frames: usize, fps: f32) -> Vec<Vec<(Vec3, glam::Quat, f32)>> {
+pub fn bake_particles(p: &Particles, emitter: &PolyMesh, emitter_world: Mat4, colliders: &[Collider], frames: usize, fps: f32) -> Vec<Vec<PState>> {
     struct P {
+        id: u32,
         x: Vec3,
         v: Vec3,
         rot: glam::Quat,
@@ -572,6 +582,7 @@ pub fn bake_particles(p: &Particles, emitter: &PolyMesh, emitter_world: Mat4, co
     let mut alive: Vec<P> = vec![];
     let mut out = Vec::with_capacity(frames);
     let mut carry = 0.0f32;
+    let mut next_id = 0u32;
     let pre = p.preroll.min(2000) as usize;
     for f in 0..frames + pre {
         // emit (spawn points sampled on the surface, area-weighted)
@@ -587,7 +598,9 @@ pub fn bake_particles(p: &Particles, emitter: &PolyMesh, emitter_world: Mat4, co
                 let mut x = pos;
                 let v = dir * p.speed * (0.75 + 0.5 * rng());
                 x += v * dt * sub;
+                next_id += 1;
                 alive.push(P {
+                    id: next_id,
                     x,
                     v,
                     rot: glam::Quat::from_euler(glam::EulerRot::XYZ, rng() * 6.283, rng() * 6.283, rng() * 6.283),
@@ -639,7 +652,7 @@ pub fn bake_particles(p: &Particles, emitter: &PolyMesh, emitter_world: Mat4, co
                 .iter()
                 .map(|q| {
                     let k = if p.shrink { (1.0 - q.age / q.life).clamp(0.0, 1.0).sqrt() } else { 1.0 };
-                    (q.x, q.rot, q.size * k)
+                    PState { x: q.x, rot: q.rot, size: q.size * k, id: q.id }
                 })
                 .collect(),
         );
@@ -709,10 +722,10 @@ mod tests {
         // steady state: about rate × lifetime alive, nothing below the floor
         let n = fr[59].len();
         assert!(n > 350 && n < 600, "{n}");
-        assert!(fr.iter().flatten().all(|(x, _, _)| x.z >= -1e-3));
+        assert!(fr.iter().flatten().all(|q| q.x.z >= -1e-3));
         // falling
-        let z0 = fr[2].iter().map(|q| q.0.z).sum::<f32>() / fr[2].len() as f32;
-        let z1 = fr[20].iter().map(|q| q.0.z).sum::<f32>() / fr[20].len() as f32;
+        let z0 = fr[2].iter().map(|q| q.x.z).sum::<f32>() / fr[2].len() as f32;
+        let z1 = fr[20].iter().map(|q| q.x.z).sum::<f32>() / fr[20].len() as f32;
         assert!(z1 < z0);
     }
 }

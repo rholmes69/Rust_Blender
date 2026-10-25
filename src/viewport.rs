@@ -244,6 +244,8 @@ pub struct Viewport {
     pub overlays: Overlays,
     pub mesh_cache: MeshCache,
     pub tex_cache: crate::textures::TextureCache,
+    /// Baked node materials: (graph id, signature) → colour texture with bump shading.
+    graph_bakes: std::collections::HashMap<(u32, u64), std::sync::Arc<crate::textures::TexImage>>,
     /// Scene texture ids in `raster.textures` order for the current frame.
     /// textures used this frame: (base texture, normal map) ids
     frame_tex: Vec<(u32, u32)>,
@@ -335,6 +337,7 @@ impl Default for Viewport {
             last_frame_time: 0.0,
             render_mode: false,
             tex_cache: Default::default(),
+            graph_bakes: Default::default(),
             frame_tex: vec![],
         }
     }
@@ -1276,10 +1279,11 @@ impl Viewport {
                 self.mesh_cache.for_object(o)
             };
             let smooth = mesh.smooth;
-            let base = lin(o.material.color);
+            // node materials bake their colour (and the material colour) into the texture
+            let base = if o.material.graph != 0 && ed.scene.graph(o.material.graph).is_some() && shading == Shading::Material { Vec3::ONE } else { lin(o.material.color) };
             let mat = o.material;
             // image / procedural texture (Material Preview and F12 renders)
-            let tex = if (mat.texture != 0 || mat.normal_tex != 0) && (shading == Shading::Material) { self.texture_slot(ed, &mat) } else { 0 };
+            let tex = if (mat.texture != 0 || mat.normal_tex != 0 || mat.graph != 0) && (shading == Shading::Material) { self.texture_slot(ed, &mat) } else { 0 };
             let tsc = mat.tex_scale.max(1e-3);
             let tri_uv = |fi: usize| -> [[f32; 2]; 3] { mesh.tri_uv.get(fi).map(|t| t.map(|u| [u[0] * tsc, u[1] * tsc])).unwrap_or([[0.0; 2]; 3]) };
             let alpha = if self.overlays.xray { 0.4 } else { mat.alpha };
@@ -1705,6 +1709,27 @@ impl Viewport {
 
     /// Raster slot (index + 1) for a scene texture this frame; 0 if it can't be decoded.
     fn texture_slot(&mut self, ed: &Editor, mat: &crate::scene::Material) -> u32 {
+        if let Some(g) = ed.scene.graph(mat.graph) {
+            let sig = g.signature() ^ (mat.color.iter().map(|c| c.to_bits() as u64).sum::<u64>() << 1);
+            let key = (0x8000_0000 | g.id, sig as u32);
+            if let Some(i) = self.frame_tex.iter().position(|t| *t == key) {
+                return i as u32 + 1;
+            }
+            let img = match self.graph_bakes.get(&(g.id, sig)) {
+                Some(i) => i.clone(),
+                None => {
+                    let img = std::sync::Arc::new(crate::nodes::bake(g, *mat, 384, true, &self.graph_images(ed, g)).color);
+                    if self.graph_bakes.len() > 32 {
+                        self.graph_bakes.clear();
+                    }
+                    self.graph_bakes.insert((g.id, sig), img.clone());
+                    img
+                }
+            };
+            self.frame_tex.push(key);
+            self.raster.textures.push(img);
+            return self.frame_tex.len() as u32;
+        }
         let normal = ed.scene.texture(mat.normal_tex).filter(|_| mat.normal_strength > 0.0);
         let key = (mat.texture, normal.map(|t| t.id).unwrap_or(0));
         if let Some(i) = self.frame_tex.iter().position(|t| *t == key) {
@@ -1720,6 +1745,19 @@ impl Viewport {
         self.frame_tex.push(key);
         self.raster.textures.push(img);
         self.frame_tex.len() as u32
+    }
+
+    /// A sampler for the Image nodes of a graph.
+    pub fn graph_images(&mut self, ed: &Editor, g: &crate::nodes::NodeGraph) -> impl Fn(u32, glam::Vec2) -> Option<[f32; 4]> + use<> {
+        let mut imgs: std::collections::HashMap<u32, std::sync::Arc<crate::textures::TexImage>> = Default::default();
+        for n in &g.nodes {
+            if let crate::nodes::NodeKind::Image { texture } = n.kind {
+                if let Some(i) = ed.scene.texture(texture).and_then(|t| self.tex_cache.get(t)) {
+                    imgs.insert(texture, i);
+                }
+            }
+        }
+        move |id: u32, q: glam::Vec2| imgs.get(&id).map(|i| i.sample(q.x, q.y))
     }
 
     /// Opaque first, then blended prims far-to-near.

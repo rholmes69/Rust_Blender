@@ -74,6 +74,9 @@ pub struct Material {
     /// as a roughness map), multiplied with `roughness` and `metallic`.
     #[serde(default)]
     pub rough_tex: u32,
+    /// Shader node graph (`Scene::node_graphs` id; 0 = none). Replaces the texture slots.
+    #[serde(default)]
+    pub graph: u32,
 }
 
 fn one() -> f32 {
@@ -93,6 +96,7 @@ impl Default for Material {
             normal_tex: 0,
             normal_strength: 1.0,
             rough_tex: 0,
+            graph: 0,
         }
     }
 }
@@ -461,6 +465,9 @@ pub struct Scene {
     pub textures: Vec<crate::textures::Texture>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<Collection>,
+    /// Shader node graphs used by materials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_graphs: Vec<crate::nodes::NodeGraph>,
     next_id: u64,
 }
 
@@ -508,6 +515,7 @@ impl Default for Scene {
             output: Output::default(),
             textures: vec![],
             collections: vec![],
+            node_graphs: vec![],
             next_id: 1,
         };
         s.add(Primitive::Cube, None);
@@ -595,6 +603,25 @@ impl Scene {
         id
     }
 
+    pub fn graph(&self, id: u32) -> Option<&crate::nodes::NodeGraph> {
+        (id != 0).then(|| self.node_graphs.iter().find(|g| g.id == id)).flatten()
+    }
+    pub fn graph_mut(&mut self, id: u32) -> Option<&mut crate::nodes::NodeGraph> {
+        (id != 0).then(|| self.node_graphs.iter_mut().find(|g| g.id == id)).flatten()
+    }
+    /// Store a graph under a fresh id (and a unique name).
+    pub fn add_graph(&mut self, mut g: crate::nodes::NodeGraph) -> u32 {
+        let id = self.node_graphs.iter().map(|g| g.id).max().unwrap_or(0) + 1;
+        g.id = id;
+        let base = g.name.clone();
+        let mut k = 1;
+        while self.node_graphs.iter().any(|x| x.name == g.name) {
+            g.name = format!("{base}.{k:03}");
+            k += 1;
+        }
+        self.node_graphs.push(g);
+        id
+    }
     pub fn texture(&self, id: u32) -> Option<&crate::textures::Texture> {
         (id != 0).then(|| self.textures.iter().find(|t| t.id == id)).flatten()
     }
@@ -770,8 +797,8 @@ impl Scene {
             }
             let Some(src) = self.get(ps.source) else { continue };
             let (s, r, _) = src.transform.matrix().to_scale_rotation_translation();
-            let live: &[(Vec3, Quat, f32)] = if fi >= 0 && (fi as usize) < ps.cache.len() { &ps.cache[fi as usize] } else { &[] };
-            let mats: Vec<Mat4> = live.iter().map(|(p, q, k)| Mat4::from_scale_rotation_translation(s * *k, *q * r, *p)).collect();
+            let live: &[crate::physics::PState] = if fi >= 0 && (fi as usize) < ps.cache.len() { &ps.cache[fi as usize] } else { &[] };
+            let mats: Vec<Mat4> = live.iter().map(|q| Mat4::from_scale_rotation_translation(s * q.size, q.rot * r, q.x)).collect();
             let to_local = self.objects[i].transform.matrix().inverse();
             let pm = crate::scatter::build(&src.poly(), &mats, to_local);
             let o = &mut self.objects[i];

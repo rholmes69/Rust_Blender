@@ -24,6 +24,9 @@ struct PtMat {
     normal_tex: Option<u16>,
     normal_strength: f32,
     rough_tex: Option<u16>,
+    /// shader node graph (index into `PtScene::graphs`) and the material's emission strength
+    graph: Option<u16>,
+    emit: f32,
 }
 
 struct Light {
@@ -49,6 +52,9 @@ pub struct PtScene {
     mat_of: Vec<u16>,
     mats: Vec<PtMat>,
     textures: Vec<Arc<TexImage>>,
+    graphs: Vec<Arc<crate::nodes::NodeGraph>>,
+    /// scene texture id → slot, for Image nodes
+    graph_tex: std::collections::HashMap<u32, u16>,
     lights: Vec<Light>,
     ambient: f32,
     bg_top: Vec3,
@@ -86,6 +92,8 @@ impl PtScene {
         let mut mat_of = vec![];
         let mut mats = vec![];
         let mut textures: Vec<Arc<TexImage>> = vec![];
+        let mut graphs: Vec<Arc<crate::nodes::NodeGraph>> = vec![];
+        let mut graph_tex: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
         let mut tex_slot: Vec<(u32, u16)> = vec![];
         let mut opaque = vec![];
         for o in scene.objects.iter().filter(|o| o.visible && o.is_mesh()) {
@@ -105,7 +113,25 @@ impl PtScene {
                     }),
                 }
             };
-            let (tex, normal_tex, rough_tex) = (slot(m.texture), slot(m.normal_tex), slot(m.rough_tex));
+            let g = scene.graph(m.graph);
+            let (tex, normal_tex, rough_tex) = if g.is_some() { (None, None, None) } else { (slot(m.texture), slot(m.normal_tex), slot(m.rough_tex)) };
+            let graph = g.map(|g| {
+                for n in &g.nodes {
+                    if let crate::nodes::NodeKind::Image { texture } = n.kind {
+                        if let Some(s) = slot(texture) {
+                            graph_tex.insert(texture, s);
+                        }
+                    }
+                }
+                match graphs.iter().position(|x: &Arc<crate::nodes::NodeGraph>| x.id == g.id) {
+                    Some(i) => i as u16,
+                    None => {
+                        graphs.push(Arc::new(g.clone()));
+                        (graphs.len() - 1) as u16
+                    }
+                }
+            });
+            let needs_frame = normal_tex.is_some() || g.is_some_and(|g| g.has_bump());
             let base = lin(m.color);
             mats.push(PtMat {
                 albedo: base,
@@ -117,6 +143,8 @@ impl PtScene {
                 normal_tex,
                 normal_strength: m.normal_strength.clamp(0.0, 10.0),
                 rough_tex,
+                graph,
+                emit: m.emission,
             });
             let mi = (mats.len() - 1) as u16;
             let tsc = m.tex_scale;
@@ -131,7 +159,7 @@ impl PtScene {
                     let cn = mesh.corner_normals.get(ti).copied().unwrap_or([fnrm; 3]);
                     normals.push(if mesh.smooth { cn.map(|n| (nm * n).normalize_or_zero() * if flip { -1.0 } else { 1.0 }) } else { [fnrm * if flip { -1.0 } else { 1.0 }; 3] });
                     let uv = mesh.tri_uv.get(ti).map(|u| u.map(|c| [c[0] * tsc, c[1] * tsc])).unwrap_or([[0.0; 2]; 3]);
-                    tangents.push(if normal_tex.is_some() { uv_frame(&tri, &uv) } else { [Vec3::ZERO; 2] });
+                    tangents.push(if needs_frame { uv_frame(&tri, &uv) } else { [Vec3::ZERO; 2] });
                     uvs.push(uv);
                     mat_of.push(mi);
                     if m.alpha > 0.5 {
@@ -171,6 +199,8 @@ impl PtScene {
             mat_of,
             mats,
             textures,
+            graphs,
+            graph_tex,
             lights,
             ambient: scene.world.ambient,
             // the viewport background is a display colour: undo gamma (tone mapping is close to neutral there)
@@ -269,10 +299,40 @@ impl PtScene {
             let mut m = self.mats[self.mat_of[ti] as usize];
             let mut albedo = m.albedo;
             let mut alpha = m.alpha;
-            if m.tex.is_some() || m.normal_tex.is_some() || m.rough_tex.is_some() {
+            if m.tex.is_some() || m.normal_tex.is_some() || m.rough_tex.is_some() || m.graph.is_some() {
                 let uv = self.uvs[ti];
                 let tu = uv[0][0] * w0 + uv[1][0] * h.u + uv[2][0] * h.v;
                 let tv = uv[0][1] * w0 + uv[1][1] * h.u + uv[2][1] * h.v;
+                if let Some(gi) = m.graph {
+                    let g = &self.graphs[gi as usize];
+                    let tex = |id: u32, q: glam::Vec2| self.graph_tex.get(&id).map(|s| self.textures[*s as usize].sample(q.x, q.y));
+                    let at = glam::Vec2::new(tu, tv);
+                    let sh = g.eval(at, &tex);
+                    if let Some(c) = sh.color {
+                        let c = c.max(Vec3::ZERO);
+                        albedo = Vec3::new(c.x.powf(2.2), c.y.powf(2.2), c.z.powf(2.2));
+                    }
+                    if let Some(r) = sh.roughness {
+                        m.roughness = r.clamp(0.02, 1.0);
+                    }
+                    if let Some(v) = sh.metallic {
+                        m.metallic = v;
+                    }
+                    m.emission = albedo * sh.emission.unwrap_or(m.emit);
+                    if let Some(h0) = sh.height {
+                        // bump: height differences across the UV frame tilt the normal
+                        let eps = 1.0 / 1024.0;
+                        let du = (g.height(at + glam::Vec2::new(eps, 0.0), &tex) - h0) / eps;
+                        let dv = (g.height(at + glam::Vec2::new(0.0, eps), &tex) - h0) / eps;
+                        let [tt, bb] = self.tangents[ti];
+                        let pv = -bb; // dP/dv
+                        let grad = tt * (du / tt.length_squared().max(1e-12)) + pv * (dv / pv.length_squared().max(1e-12));
+                        let gs = grad - n * n.dot(grad);
+                        let pn = (n - gs * (sh.bump * 0.05)).normalize_or(n);
+                        let side = n.dot(d).signum();
+                        n = if pn.dot(d).signum() == side { pn } else { (pn - d * (pn.dot(d) - side * 0.01)).normalize_or(n) };
+                    }
+                }
                 if let Some(t) = m.tex {
                     let c = self.textures[t as usize].sample(tu, tv);
                     albedo *= Vec3::new(c[0].powf(2.2), c[1].powf(2.2), c[2].powf(2.2));

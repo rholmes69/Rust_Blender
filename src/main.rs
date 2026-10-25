@@ -21,6 +21,8 @@ mod mcp;
 mod pathtrace;
 mod raytrace;
 mod mesh;
+mod nodes;
+mod node_editor;
 mod render;
 mod router;
 mod scene;

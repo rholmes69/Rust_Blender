@@ -423,6 +423,7 @@ pub const ACTIONS: &[&str] = &[
     "render",
     "render_animation",
     "set_texture",
+    "node_material",
     "bump",
     "roughness_map",
     "scatter",
@@ -518,6 +519,9 @@ Each command is an object with "action" plus only the fields it needs:
   modelling, before set_texture).
 - set_texture: target, name = checker|bricks|wood|marble|tiles|grid|noise|stripes|concrete|grass (or an
   image file path), number = repeats (e.g. 6 for a big floor), optional color = tint; name "none" removes it.
+- node_material: target, name = rusty metal | wood | marble | cobblestone | lava | bricks | tiles (procedural
+  shader-node materials with colour, roughness, metal and bumps; lava glows), number = repeats; "none" removes.
+  Prefer it for realistic surfaces ("make it rusty", "a lava floor", "cobblestone street").
 - bump: target, name = "auto" (bumps from the object's texture), a pattern / image / normal-map path, or
   "none"; number = strength (1 normal, 2-3 deep). Add "invert" to the name when light parts should be low.
   Use for "make the bricks bumpy", "rough stone surface", "add a normal map".

@@ -82,6 +82,17 @@ impl Bin {
         );
         self.accessors.len() - 1
     }
+    fn vec4s_target(&mut self, v: &[[f32; 4]]) -> usize {
+        let mut b = Vec::with_capacity(v.len() * 16);
+        for q in v {
+            for c in q {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let view = self.view(&b, Some(34962));
+        self.accessors.push(json!({"bufferView": view, "componentType": 5126, "count": v.len(), "type": "VEC4"}));
+        self.accessors.len() - 1
+    }
     fn scalars(&mut self, v: &[f32]) -> usize {
         let mut b = Vec::with_capacity(v.len() * 4);
         for c in v {
@@ -200,6 +211,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     let mut anim_names: Vec<Option<String>> = vec![None];
     let mut extra: Vec<(Vec<Value>, Vec<Value>)> = vec![];
     let mut pending_weights: Vec<(usize, usize)> = vec![];
+    let mut baked_graphs: std::collections::HashMap<u64, (Option<usize>, Option<usize>, Option<usize>)> = Default::default();
     // skinned meshes are exported in their rest shape when their armature is exported too
     let exports_skin = |o: &crate::scene::Object| -> bool {
         o.skin.as_ref().is_some_and(|sk| {
@@ -217,7 +229,9 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         let skin_rest = o.is_mesh() && exports_skin(o);
         // shape keys export as morph targets of the basis mesh
         let morphs = o.is_mesh() && o.mesh.as_ref().is_some_and(|m| o.shape_keys.iter().any(|k| k.verts.len() == m.verts.len()));
-        let base_shape = skin_rest || morphs;
+        // baked cloth exports as morph targets (one per sampled frame) with a weight animation
+        let cloth_anim = o.cloth.as_ref().filter(|c| c.cache.len() >= 2 && o.mesh.as_ref().is_some_and(|m| c.cache[0].len() == m.verts.len()));
+        let base_shape = skin_rest || morphs || cloth_anim.is_some();
         let r = rot(t.quat(), special);
         let tr = cv(t.location);
         node["translation"] = json!([tr.x, tr.y, tr.z]);
@@ -227,6 +241,108 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
             node["scale"] = json!([s.x, s.y, s.z]);
         }
         match &o.kind {
+            ObjectKind::Mesh if o.particles.as_ref().is_some_and(|p| !p.cache.is_empty() && scene.get(p.source).is_some()) => {
+                // particles: one animated node per particle slot sharing the source's mesh
+                let ps = o.particles.as_ref().unwrap();
+                let srco = scene.get(ps.source).unwrap();
+                let sm = srco.poly().to_mesh_opts(srco.smooth(), srco.auto_smooth);
+                let (mut pos, mut nrm, mut idx) = (vec![], vec![], vec![]);
+                for (ti, tri) in sm.tris.iter().enumerate() {
+                    let fnrm = (sm.positions[tri[1] as usize] - sm.positions[tri[0] as usize]).cross(sm.positions[tri[2] as usize] - sm.positions[tri[0] as usize]).normalize_or_zero();
+                    let k = pos.len() as u32;
+                    for q in 0..3 {
+                        let vi = tri[q] as usize;
+                        pos.push(cv(sm.positions[vi]));
+                        let nn = if sm.smooth { sm.corner_normals.get(ti).map(|c| c[q]).unwrap_or(sm.normals[vi]) } else { fnrm };
+                        nrm.push(cv(nn));
+                    }
+                    idx.extend([k, k + 1, k + 2]);
+                }
+                if !idx.is_empty() {
+                    let m = o.material;
+                    let mut mat = json!({"name": format!("{} Material", o.name), "pbrMetallicRoughness": {"baseColorFactor": [lin(m.color[0]), lin(m.color[1]), lin(m.color[2]), m.alpha], "metallicFactor": m.metallic, "roughnessFactor": m.roughness}});
+                    if m.emission > 0.0 {
+                        mat["emissiveFactor"] = json!([lin(m.color[0]), lin(m.color[1]), lin(m.color[2])]);
+                        if m.emission != 1.0 {
+                            mat["extensions"] = json!({"KHR_materials_emissive_strength": {"emissiveStrength": m.emission}});
+                            uses_emissive_strength = true;
+                        }
+                    }
+                    if m.alpha < 0.999 {
+                        mat["alphaMode"] = json!("BLEND");
+                    }
+                    materials.push(mat);
+                    let (pa, na, ia) = (bin.vec3s(&pos, Some(34962)), bin.vec3s(&nrm, Some(34962)), bin.indices(&idx));
+                    meshes.push(json!({"name": format!("{} Particle", o.name), "primitives": [{"attributes": {"POSITION": pa, "NORMAL": na}, "indices": ia, "material": materials.len() - 1, "mode": 4}]}));
+                    let mesh_i = meshes.len() - 1;
+                    // give each particle a slot (node) for its lifetime
+                    const MAX_SLOTS: usize = 400;
+                    let mut slot_of: std::collections::HashMap<u32, usize> = Default::default();
+                    let mut free: Vec<usize> = vec![];
+                    let mut nslots = 0usize;
+                    let nf = ps.cache.len();
+                    let mut track: Vec<Vec<Option<crate::physics::PState>>> = vec![];
+                    for (f, frame) in ps.cache.iter().enumerate() {
+                        let alive: std::collections::HashSet<u32> = frame.iter().map(|q| q.id).collect();
+                        slot_of.retain(|id, s| {
+                            let keep = alive.contains(id);
+                            if !keep {
+                                free.push(*s);
+                            }
+                            keep
+                        });
+                        for q in frame {
+                            let s = match slot_of.get(&q.id) {
+                                Some(s) => *s,
+                                None => {
+                                    let s = match free.pop() {
+                                        Some(s) => s,
+                                        None if nslots < MAX_SLOTS => {
+                                            nslots += 1;
+                                            track.push(vec![None; nf]);
+                                            nslots - 1
+                                        }
+                                        None => continue,
+                                    };
+                                    slot_of.insert(q.id, s);
+                                    s
+                                }
+                            };
+                            track[s][f] = Some(*q);
+                        }
+                    }
+                    let fps = scene.fps.max(1) as f32;
+                    let times: Vec<f32> = (0..nf).map(|f| f as f32 / fps).collect();
+                    let input = bin.scalars(&times);
+                    let (ss, sr, _) = srco.transform.matrix().to_scale_rotation_translation();
+                    for (si, tr) in track.iter().enumerate() {
+                        let first = tr.iter().flatten().next().copied();
+                        let Some(first) = first else { continue };
+                        let mut last = first;
+                        let (mut tl, mut rl, mut sl) = (vec![], vec![], vec![]);
+                        for q in tr {
+                            let (p, on) = match q {
+                                Some(q) => {
+                                    last = *q;
+                                    (*q, true)
+                                }
+                                None => (last, false),
+                            };
+                            tl.push(cv(p.x));
+                            let r = cq(p.rot * sr);
+                            rl.push([r.x, r.y, r.z, r.w]);
+                            sl.push(if on { cs(ss * p.size) } else { Vec3::ZERO });
+                        }
+                        let t0 = cv(first.x);
+                        nodes.push(json!({"name": format!("{} {si}", o.name), "mesh": mesh_i, "translation": [t0.x, t0.y, t0.z], "scale": [0.0, 0.0, 0.0]}));
+                        let ni = nodes.len() - 1;
+                        for (path, out) in [("translation", bin.vec3s(&tl, None)), ("rotation", bin.vec4s(&rl)), ("scale", bin.vec3s(&sl, None))] {
+                            samplers.push(json!({"input": input, "output": out, "interpolation": "LINEAR"}));
+                            channels.push(json!({"sampler": samplers.len() - 1, "target": {"node": ni, "path": path}}));
+                        }
+                    }
+                }
+            }
             ObjectKind::Mesh => {
                 // rigged meshes: the rest shape (the viewer skins it); others: as displayed
                 let mesh = if base_shape { o.mesh.as_ref().unwrap().to_mesh_opts(o.smooth(), o.auto_smooth) } else { cache.for_object(o) };
@@ -236,7 +352,9 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                 let tex = scene.texture(o.material.texture);
                 let ntex = scene.texture(o.material.normal_tex);
                 let rtex = scene.texture(o.material.rough_tex);
-                let textured = tex.is_some() || ntex.is_some() || rtex.is_some();
+                let graph = scene.graph(o.material.graph);
+                let (tex, ntex, rtex) = if graph.is_some() { (None, None, None) } else { (tex, ntex, rtex) };
+                let textured = tex.is_some() || ntex.is_some() || rtex.is_some() || graph.is_some();
                 let insts = if base_shape { vec![glam::Mat4::IDENTITY] } else { o.instance_matrices() };
                 for inst in insts {
                     let nm = Mat3::from_mat4(inst).inverse().transpose();
@@ -338,11 +456,80 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                     if let Some(ti) = rtex.and_then(&mut add) {
                         mat["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({"index": ti});
                     }
+                    // node materials: bake colour, roughness/metal and bumps into textures
+                    if let Some(g) = graph {
+                        let imgs: std::collections::HashMap<u32, crate::textures::TexImage> = g
+                            .nodes
+                            .iter()
+                            .filter_map(|n| if let crate::nodes::NodeKind::Image { texture } = n.kind { Some(texture) } else { None })
+                            .filter_map(|id| scene.texture(id).and_then(|t| crate::textures::decode(&t.source).ok()).map(|i| (id, i)))
+                            .collect();
+                        let sample = |id: u32, q: glam::Vec2| imgs.get(&id).map(|i| i.sample(q.x, q.y));
+                        let key = g.id as u64 ^ g.signature() ^ ((m.color[0].to_bits() as u64) << 7);
+                        let (ci, mi, ni) = match baked_graphs.get(&key) {
+                            Some(v) => *v,
+                            None => {
+                                let b = crate::nodes::bake(g, m, 512, false, &sample);
+                                let mut put = |img: &crate::textures::TexImage, suffix: &str| -> Option<usize> {
+                                    let raw: Vec<u8> = img.rgba.iter().flatten().copied().collect();
+                                    let png = crate::textures::encode_png(img.w, img.h, &raw).ok()?;
+                                    let view = bin.view(&png, None);
+                                    images.push(json!({"name": format!("{} {suffix}", g.name), "bufferView": view, "mimeType": "image/png"}));
+                                    gl_textures.push(json!({"sampler": 0, "source": images.len() - 1}));
+                                    Some(gl_textures.len() - 1)
+                                };
+                                let v = (put(&b.color, "color"), b.mr.as_ref().and_then(|i| put(i, "roughness")), b.normal.as_ref().and_then(|i| put(i, "normal")));
+                                baked_graphs.insert(key, v);
+                                v
+                            }
+                        };
+                        if let Some(ti) = ci {
+                            mat["pbrMetallicRoughness"]["baseColorTexture"] = json!({"index": ti});
+                            mat["pbrMetallicRoughness"]["baseColorFactor"] = json!([1.0, 1.0, 1.0, m.alpha]);
+                        }
+                        if let Some(ti) = mi {
+                            mat["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({"index": ti});
+                            mat["pbrMetallicRoughness"]["metallicFactor"] = json!(if g.drives(2) { 1.0 } else { m.metallic });
+                            mat["pbrMetallicRoughness"]["roughnessFactor"] = json!(if g.drives(1) { 1.0 } else { m.roughness });
+                        }
+                        if let Some(ti) = ni {
+                            mat["normalTexture"] = json!({"index": ti});
+                        }
+                    }
                 }
+                let has_normal_map = mat.get("normalTexture").is_some();
                 materials.push(mat);
                 let mut attrs = json!({"POSITION": pa, "NORMAL": na});
                 if let Some(ua) = ua {
                     attrs["TEXCOORD_0"] = json!(ua);
+                    // normal maps need a tangent frame: per triangle from positions and UVs
+                    if has_normal_map && uvs.len() == pos.len() {
+                        let mut tan = vec![[1.0f32, 0.0, 0.0, 1.0]; pos.len()];
+                        for t in idx.chunks_exact(3) {
+                            let [a, b, c] = [t[0] as usize, t[1] as usize, t[2] as usize];
+                            let (e1, e2) = (pos[b] - pos[a], pos[c] - pos[a]);
+                            let (du1, dv1) = (uvs[b][0] - uvs[a][0], uvs[b][1] - uvs[a][1]);
+                            let (du2, dv2) = (uvs[c][0] - uvs[a][0], uvs[c][1] - uvs[a][1]);
+                            let det = du1 * dv2 - du2 * dv1;
+                            if det.abs() < 1e-12 {
+                                continue;
+                            }
+                            let r = 1.0 / det;
+                            let tu = (e1 * dv2 - e2 * dv1) * r; // dP/du
+                            let tv = (e2 * du1 - e1 * du2) * r; // dP/dv
+                            for &v in &[a, b, c] {
+                                let n = nrm[v];
+                                let tt = (tu - n * n.dot(tu)).normalize_or_zero();
+                                if tt == Vec3::ZERO {
+                                    continue;
+                                }
+                                // glTF bitangent = cross(N, T) * w should point to decreasing v
+                                let w = if n.cross(tt).dot(-tv) < 0.0 { -1.0 } else { 1.0 };
+                                tan[v] = [tt.x, tt.y, tt.z, w];
+                            }
+                        }
+                        attrs["TANGENT"] = json!(bin.vec4s_target(&tan));
+                    }
                 }
                 if skin_rest {
                     let sk = o.skin.as_ref().unwrap();
@@ -395,6 +582,45 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
                         let out = bin.scalars(&vals);
                         pending_weights.push((input, out));
                     }
+                } else if let Some(cl) = cloth_anim {
+                    let n = cl.cache.len();
+                    let step = n.div_ceil(96).max(1);
+                    let mut keys: Vec<usize> = (0..n).step_by(step).collect();
+                    if *keys.last().unwrap() != n - 1 {
+                        keys.push(n - 1);
+                    }
+                    let basis = &cl.cache[0];
+                    let smooth = o.smooth();
+                    let targets: Vec<Value> = keys[1..]
+                        .iter()
+                        .map(|&k| {
+                            let fv = &cl.cache[k];
+                            let d: Vec<Vec3> = src.iter().map(|i| cv(fv[*i as usize] - basis[*i as usize])).collect();
+                            let mut t = json!({"POSITION": bin.vec3s(&d, Some(34962))});
+                            if smooth {
+                                let mut pmk = o.mesh.clone().unwrap();
+                                pmk.verts = fv.clone();
+                                let vn = crate::sculpt::vertex_normals(&pmk);
+                                let dn: Vec<Vec3> = src.iter().zip(&nrm).map(|(i, n0)| cv(vn[*i as usize]) - *n0).collect();
+                                t["NORMAL"] = json!(bin.vec3s(&dn, Some(34962)));
+                            }
+                            t
+                        })
+                        .collect();
+                    let nt = targets.len();
+                    prim["targets"] = json!(targets);
+                    mj["weights"] = json!(vec![0.0; nt]);
+                    let fps = scene.fps.max(1) as f32;
+                    let times: Vec<f32> = keys.iter().map(|k| *k as f32 / fps).collect();
+                    let mut vals = Vec::with_capacity(keys.len() * nt);
+                    for i in 0..keys.len() {
+                        for t in 0..nt {
+                            vals.push(if i > 0 && t == i - 1 { 1.0 } else { 0.0 });
+                        }
+                    }
+                    let input = bin.scalars(&times);
+                    let out = bin.scalars(&vals);
+                    pending_weights.push((input, out));
                 }
                 mj["primitives"] = json!([prim]);
                 meshes.push(mj);
@@ -526,14 +752,21 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
         }
 
         // baked animation (one sample per frame, preserving the eased interpolation)
-        if o.keyframes.len() >= 2 {
-            let f0 = o.keyframes.first().unwrap().frame;
-            let f1 = o.keyframes.last().unwrap().frame;
+        // rigid bodies play their simulation like keyframes
+        let rigid = o.rigid.as_ref().filter(|r| !r.passive && r.cache.len() >= 2);
+        if o.keyframes.len() >= 2 || rigid.is_some() {
+            let (f0, f1) = match rigid {
+                Some(r) => (r.start, r.start + r.cache.len() as i32 - 1),
+                None => (o.keyframes.first().unwrap().frame, o.keyframes.last().unwrap().frame),
+            };
             let fps = scene.fps.max(1) as f32;
             let mut times = vec![];
             let (mut tl, mut rl, mut sl) = (vec![], vec![], vec![]);
             for f in f0..=f1 {
-                let tf = crate::scene::sample_keys(&o.keyframes, f).unwrap_or(*t);
+                let tf = match rigid {
+                    Some(r) => r.cache[(f - r.start) as usize],
+                    None => crate::scene::sample_keys(&o.keyframes, f).unwrap_or(*t),
+                };
                 times.push((f - f0) as f32 / fps);
                 tl.push(cv(tf.location));
                 let q = rot(tf.quat(), special);
@@ -568,7 +801,7 @@ pub fn export_glb(scene: &Scene, cache: &mut MeshCache) -> (Vec<u8>, ExportStats
     let mut is_child = vec![false; nodes.len()];
     for o in scene.objects.iter().filter(|o| o.visible) {
         let (Some(&ci), Some(&pi)) = (node_of.get(&o.id), o.parent.and_then(|p| node_of.get(&p))) else { continue };
-        let animated = o.keyframes.len() >= 2;
+        let animated = o.keyframes.len() >= 2 || o.rigid.as_ref().is_some_and(|r| !r.passive && r.cache.len() >= 2);
         if animated || skinned.iter().any(|(_, id)| *id == o.id) {
             continue;
         }

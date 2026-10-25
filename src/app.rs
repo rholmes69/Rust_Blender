@@ -211,6 +211,8 @@ pub struct App {
     play_accum: f64,
     last_time: f64,
     prop_snapshotted: bool,
+    /// Material tab ball for node materials: (graph + material signature, texture)
+    node_preview_tex: Option<(u64, egui::TextureHandle)>,
     show_settings: bool,
     show_help: bool,
     focus_prompt: bool,
@@ -351,6 +353,7 @@ impl App {
             play_accum: 0.0,
             last_time: 0.0,
             prop_snapshotted: false,
+            node_preview_tex: None,
             show_settings: false,
             show_help: false,
             focus_prompt: false,
@@ -2404,6 +2407,24 @@ impl App {
                                     ui.close();
                                 }
                             });
+                            ui.menu_button("Hair", |ui| {
+                                for (label, what) in [("Fur", "fur"), ("Hair", "hair"), ("Curly Hair", "curly"), ("Shaggy Fur", "shaggy"), ("Grass Strands", "grass")] {
+                                    if ui.button(format!("{label} on the active object")).clicked() {
+                                        let log = self.ed.execute(&[Command { action: "hair".into(), name: Some(what.into()), ..Default::default() }]);
+                                        if let Some(l) = log.first() {
+                                            self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                if ui.button("Remove Hair").clicked() {
+                                    let log = self.ed.execute(&[Command { action: "hair".into(), name: Some("none".into()), ..Default::default() }]);
+                                    if let Some(l) = log.first() {
+                                        self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                                    }
+                                    ui.close();
+                                }
+                            });
                             ui.menu_button("Rig", |ui| {
                                 for n in [2usize, 3, 4, 6, 8] {
                                     if ui.button(format!("Auto Rig · {n} bones")).on_hover_text("Add an armature fitted to the active mesh and bind it with automatic weights").clicked() {
@@ -3943,7 +3964,10 @@ impl App {
                     match self.props_tab {
                         PropsTab::Object => object_props(ui, &mut o),
                         PropsTab::Modifiers => modifier_props(ui, &mut o),
-                        PropsTab::Material => tex_action = material_props(ui, &mut o, &self.ed.scene.textures),
+                        PropsTab::Material => {
+                            let preview = self.node_preview(ui.ctx(), &o.material);
+                            tex_action = material_props(ui, &mut o, &self.ed.scene.textures, preview.as_ref())
+                        }
                         _ => {}
                     }
                     if let Some(a) = ui.ctx().data_mut(|d| d.remove_temp::<String>(egui::Id::unique("cloth_action"))) {
@@ -4070,6 +4094,23 @@ impl App {
                     }
                 }
             });
+    }
+
+    /// The Material tab's preview ball for a node material (re-rendered when the graph changes).
+    fn node_preview(&mut self, ctx: &egui::Context, mat: &crate::scene::Material) -> Option<egui::TextureHandle> {
+        let g = self.ed.scene.graph(mat.graph)?.clone();
+        let key = g.signature() ^ [mat.color[0], mat.color[1], mat.color[2], mat.roughness, mat.metallic, mat.emission].iter().fold(0u64, |h, v| h.rotate_left(9) ^ v.to_bits() as u64);
+        if let Some((k, t)) = &self.node_preview_tex {
+            if *k == key {
+                return Some(t.clone());
+            }
+        }
+        let smp = self.vp.graph_images(&self.ed, &g);
+        let n = 96;
+        let rgba = crate::nodes::preview_ball(&g, *mat, n, &smp);
+        let tex = ctx.load_texture("node_preview", egui::ColorImage::from_rgba_unmultiplied([n, n], &rgba), egui::TextureOptions::LINEAR);
+        self.node_preview_tex = Some((key, tex.clone()));
+        Some(tex)
     }
 
     fn world_props(&mut self, ui: &mut Ui) {
@@ -5074,6 +5115,7 @@ fn object_props(ui: &mut Ui, o: &mut crate::scene::Object) {
                 return;
             }
             scatter_props(ui, o);
+            hair_props(ui, o);
             shape_key_props(ui, o);
             cloth_props(ui, o);
         }
@@ -5095,6 +5137,8 @@ fn object_props(ui: &mut Ui, o: &mut crate::scene::Object) {
                 {
                     o.mesh = None;
                 }
+            } else if o.is_generated() {
+                ui.label(RichText::new("Generated geometry (see above)").small().color(theme::TEXT_DIM));
             } else {
                 egui::ComboBox::from_label("Primitive")
                     .selected_text(o.primitive.label())
@@ -5231,7 +5275,7 @@ fn modifier_props(ui: &mut Ui, o: &mut crate::scene::Object) {
 }
 
 /// Returns a texture request: a pattern name, an image path, "none", or "<load>" (file dialog).
-fn material_props(ui: &mut Ui, o: &mut crate::scene::Object, textures: &[crate::textures::Texture]) -> Option<String> {
+fn material_props(ui: &mut Ui, o: &mut crate::scene::Object, textures: &[crate::textures::Texture], node_preview: Option<&egui::TextureHandle>) -> Option<String> {
     if !o.is_mesh() {
         ui.label(
             RichText::new("Lights and cameras have no material — see the Object tab.")
@@ -5241,26 +5285,26 @@ fn material_props(ui: &mut Ui, o: &mut crate::scene::Object, textures: &[crate::
     }
     let mut action = None;
     // preview swatch
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(r, 6.0, Color32::from_rgb(30, 30, 30));
-    let c = r.center();
-    let base = o.material.color;
-    for i in (0..24).rev() {
-        let t = i as f32 / 24.0;
-        let lit = 0.35 + 0.75 * (1.0 - t);
-        let spec = (1.0 - t).powf(1.0 / (o.material.roughness.max(0.05) * 0.5))
-            * (0.3 + o.material.metallic * 0.5);
-        let col = [
-            base[0] * lit + spec,
-            base[1] * lit + spec,
-            base[2] * lit + spec,
-        ];
-        p.circle_filled(
-            c + vec2(-t * 4.0, -t * 4.0) * -1.0 + vec2(-4.0 * (1.0 - t), -4.0 * (1.0 - t)),
-            24.0 * (1.0 - t * 0.85),
-            color32(col),
-        );
+    if let Some(t) = node_preview {
+        // node material: the real graph result on a lit ball
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 104.0), Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(r, 6.0, Color32::from_rgb(30, 30, 30));
+        let img = egui::Rect::from_center_size(r.center(), vec2(96.0, 96.0));
+        p.image(t.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+    } else {
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(r, 6.0, Color32::from_rgb(30, 30, 30));
+        let c = r.center();
+        let base = o.material.color;
+        for i in (0..24).rev() {
+            let t = i as f32 / 24.0;
+            let lit = 0.35 + 0.75 * (1.0 - t);
+            let spec = (1.0 - t).powf(1.0 / (o.material.roughness.max(0.05) * 0.5)) * (0.3 + o.material.metallic * 0.5);
+            let col = [base[0] * lit + spec, base[1] * lit + spec, base[2] * lit + spec];
+            p.circle_filled(c + vec2(-t * 4.0, -t * 4.0) * -1.0 + vec2(-4.0 * (1.0 - t), -4.0 * (1.0 - t)), 24.0 * (1.0 - t * 0.85), color32(col));
+        }
     }
     section(ui, "Surface", |ui| {
         ui.horizontal(|ui| {
@@ -5383,7 +5427,7 @@ fn material_props(ui: &mut Ui, o: &mut crate::scene::Object, textures: &[crate::
 }
 
 fn shape_key_props(ui: &mut Ui, o: &mut crate::scene::Object) {
-    if !o.is_mesh() || o.scatter.is_some() {
+    if !o.is_mesh() || o.is_generated() {
         return;
     }
     let editing = o.shape_editing;
@@ -5450,7 +5494,7 @@ fn particle_props(ui: &mut Ui, o: &mut crate::scene::Object) -> bool {
 }
 
 fn cloth_props(ui: &mut Ui, o: &mut crate::scene::Object) {
-    if o.scatter.is_some() {
+    if o.is_generated() {
         return;
     }
     section(ui, "Rigid Body", |ui| {
@@ -5549,6 +5593,29 @@ fn scatter_props(ui: &mut Ui, o: &mut crate::scene::Object) {
         ui.add(egui::Slider::new(&mut sc.max_slope, 0.0..=180.0).text("Max slope °"));
         ui.checkbox(&mut sc.align, "Align to surface normal");
         ui.label(RichText::new("Edit the hidden source object (outliner) to change every copy. Object ▸ Scatter ▸ Make Real bakes it.").small().color(theme::TEXT_DIM));
+    });
+}
+
+fn hair_props(ui: &mut Ui, o: &mut crate::scene::Object) {
+    let Some(h) = o.hair.as_mut() else { return };
+    section(ui, "Hair", |ui| {
+        ui.add(egui::Slider::new(&mut h.count, 1..=20_000).logarithmic(true).text("Guides"));
+        ui.add(egui::Slider::new(&mut h.children, 0..=64).text("Children"));
+        ui.add(egui::Slider::new(&mut h.length, 0.005..=3.0).logarithmic(true).text("Length (m)"));
+        ui.add(egui::Slider::new(&mut h.random_length, 0.0..=1.0).text("Random length"));
+        ui.add(egui::Slider::new(&mut h.gravity, 0.0..=1.0).text("Gravity"));
+        ui.add(egui::Slider::new(&mut h.clump, 0.0..=1.0).text("Clump"));
+        ui.add(egui::Slider::new(&mut h.child_radius, 0.0..=0.5).text("Child spread (m)"));
+        ui.add(egui::Slider::new(&mut h.curl, 0.0..=10.0).text("Curl turns"));
+        ui.add(egui::Slider::new(&mut h.curl_radius, 0.0..=0.2).text("Curl radius (m)"));
+        ui.add(egui::Slider::new(&mut h.frizz, 0.0..=0.1).text("Frizz (m)"));
+        ui.add(egui::Slider::new(&mut h.thickness, 0.0005..=0.05).logarithmic(true).text("Thickness (m)"));
+        ui.add(egui::Slider::new(&mut h.tip, 0.0..=1.0).text("Tip width"));
+        ui.add(egui::Slider::new(&mut h.segments, 1..=32).text("Segments"));
+        ui.add(egui::DragValue::new(&mut h.seed).prefix("Seed "));
+        let n = h.strands();
+        let tris = n * h.segments.clamp(1, 32) as usize * 6;
+        ui.label(RichText::new(format!("{n} strands · {:.1}k triangles. Grows from the surface and follows it when it moves or deforms; Object ▸ Scatter ▸ Make Real bakes it.", tris as f32 / 1000.0)).small().color(theme::TEXT_DIM));
     });
 }
 

@@ -7,6 +7,7 @@ mod agent;
 mod anim_render;
 mod armature;
 mod scatter;
+mod hair;
 mod shapekeys;
 mod physics;
 mod ai;

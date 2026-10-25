@@ -49,6 +49,9 @@ pub struct PtScene {
     uvs: Vec<[[f32; 2]; 3]>,
     /// per triangle: UV tangent frame (dP/du, -dP/dv), for normal maps
     tangents: Vec<[Vec3; 2]>,
+    /// world → object matrix per triangle (index into `invs`), for Object texture coordinates
+    inv_of: Vec<u32>,
+    invs: Vec<glam::Mat4>,
     mat_of: Vec<u16>,
     mats: Vec<PtMat>,
     textures: Vec<Arc<TexImage>>,
@@ -89,6 +92,8 @@ impl PtScene {
         let mut normals = vec![];
         let mut uvs = vec![];
         let mut tangents = vec![];
+        let mut inv_of = vec![];
+        let mut invs = vec![];
         let mut mat_of = vec![];
         let mut mats = vec![];
         let mut textures: Vec<Arc<TexImage>> = vec![];
@@ -131,7 +136,7 @@ impl PtScene {
                     }
                 }
             });
-            let needs_frame = normal_tex.is_some() || g.is_some_and(|g| g.has_bump());
+            let needs_frame = normal_tex.is_some() || g.is_some_and(|g| g.has_bump() || g.drives(5));
             let base = lin(m.color);
             mats.push(PtMat {
                 albedo: base,
@@ -153,12 +158,15 @@ impl PtScene {
                 let nm = Mat3::from_mat4(w).inverse().transpose();
                 let flip = w.determinant() < 0.0;
                 let wp: Vec<Vec3> = mesh.positions.iter().map(|p| w.transform_point3(*p)).collect();
+                invs.push(w.inverse());
+                let ii = (invs.len() - 1) as u32;
                 for (ti, t) in mesh.tris.iter().enumerate() {
                     let tri = t.map(|i| wp[i as usize]);
                     let fnrm = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
                     let cn = mesh.corner_normals.get(ti).copied().unwrap_or([fnrm; 3]);
                     normals.push(if mesh.smooth { cn.map(|n| (nm * n).normalize_or_zero() * if flip { -1.0 } else { 1.0 }) } else { [fnrm * if flip { -1.0 } else { 1.0 }; 3] });
                     let uv = mesh.tri_uv.get(ti).map(|u| u.map(|c| [c[0] * tsc, c[1] * tsc])).unwrap_or([[0.0; 2]; 3]);
+                    inv_of.push(ii);
                     tangents.push(if needs_frame { uv_frame(&tri, &uv) } else { [Vec3::ZERO; 2] });
                     uvs.push(uv);
                     mat_of.push(mi);
@@ -196,6 +204,8 @@ impl PtScene {
             normals,
             uvs,
             tangents,
+            inv_of,
+            invs,
             mat_of,
             mats,
             textures,
@@ -307,7 +317,9 @@ impl PtScene {
                     let g = &self.graphs[gi as usize];
                     let tex = |id: u32, q: glam::Vec2| self.graph_tex.get(&id).map(|s| self.textures[*s as usize].sample(q.x, q.y));
                     let at = glam::Vec2::new(tu, tv);
-                    let sh = g.eval(at, &tex);
+                    let inv = self.invs[self.inv_of[ti] as usize];
+                    let lp = |wp: Vec3| inv.transform_point3(wp);
+                    let sh = g.eval(at, lp(p), &tex);
                     if let Some(c) = sh.color {
                         let c = c.max(Vec3::ZERO);
                         albedo = Vec3::new(c.x.powf(2.2), c.y.powf(2.2), c.z.powf(2.2));
@@ -319,18 +331,33 @@ impl PtScene {
                         m.metallic = v;
                     }
                     m.emission = albedo * sh.emission.unwrap_or(m.emit);
+                    // the surface frame: dP/du, dP/dv from the UVs, or any frame when they're missing
+                    let [tt, bb] = self.tangents[ti];
+                    let (fu, fv, has_uv) = if tt.length_squared() > 1e-16 && bb.length_squared() > 1e-16 {
+                        (tt, -bb, true)
+                    } else {
+                        let (a, b) = basis(n);
+                        (a, b, false)
+                    };
+                    let side = n.dot(d).signum();
+                    let keep_side = |pn: Vec3, n: Vec3| if pn.dot(d).signum() == side { pn } else { (pn - d * (pn.dot(d) - side * 0.01)).normalize_or(n) };
                     if let Some(h0) = sh.height {
-                        // bump: height differences across the UV frame tilt the normal
-                        let eps = 1.0 / 1024.0;
-                        let du = (g.height(at + glam::Vec2::new(eps, 0.0), &tex) - h0) / eps;
-                        let dv = (g.height(at + glam::Vec2::new(0.0, eps), &tex) - h0) / eps;
-                        let [tt, bb] = self.tangents[ti];
-                        let pv = -bb; // dP/dv
-                        let grad = tt * (du / tt.length_squared().max(1e-12)) + pv * (dv / pv.length_squared().max(1e-12));
+                        // bump: height differences across the surface frame tilt the normal; each
+                        // step moves both the UV and the 3D point so UV and Object coords agree
+                        let (eps, step) = if has_uv { (1.0 / 1024.0, 1.0 / 1024.0) } else { (0.0, 1e-3) };
+                        let du = (g.height(at + glam::Vec2::new(eps, 0.0), lp(p + fu * step), &tex) - h0) / step;
+                        let dv = (g.height(at + glam::Vec2::new(0.0, eps), lp(p + fv * step), &tex) - h0) / step;
+                        let grad = fu * (du / fu.length_squared().max(1e-12)) + fv * (dv / fv.length_squared().max(1e-12));
                         let gs = grad - n * n.dot(grad);
-                        let pn = (n - gs * (sh.bump * 0.05)).normalize_or(n);
-                        let side = n.dot(d).signum();
-                        n = if pn.dot(d).signum() == side { pn } else { (pn - d * (pn.dot(d) - side * 0.01)).normalize_or(n) };
+                        n = keep_side((n - gs * (sh.bump * 0.05)).normalize_or(n), n);
+                    }
+                    if let Some(tn) = sh.normal {
+                        let t1 = (fu - n * n.dot(fu)).normalize_or_zero();
+                        let bv = -fv;
+                        let b1 = (bv - n * n.dot(bv) - t1 * t1.dot(bv)).normalize_or_zero();
+                        if t1 != Vec3::ZERO && b1 != Vec3::ZERO {
+                            n = keep_side((t1 * tn.x + b1 * tn.y + n * tn.z).normalize_or(n), n);
+                        }
                     }
                 }
                 if let Some(t) = m.tex {

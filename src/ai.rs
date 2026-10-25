@@ -427,6 +427,7 @@ pub const ACTIONS: &[&str] = &[
     "bump",
     "roughness_map",
     "scatter",
+    "hair",
     "realize",
     "rig",
     "pose_mode",
@@ -530,6 +531,10 @@ Each command is an object with "action" plus only the fields it needs:
   steepness in degrees (30 keeps things on flat ground), align = true to stand along the surface (planets),
   rotation = [tilt,tilt,spin]. Repeating it with the same target and name updates the scatter. realize: target
   = scatter object (bake to a real mesh). "a forest" = tree scatter; "a rocky field" = rock scatter.
+- hair: target = the mesh to grow it on, name = fur | hair | curly | shaggy | grass (strands) or "none" to
+  remove; number = guide strands, length = metres, gravity = droop 0..1, curl = turns, color = hair colour,
+  seed. Repeating it on the same target updates the hair (only numbers → tweak, a name → restyle). "a furry
+  ball" = sphere + fur; "long hair on the head" = hair with length 0.6.
 - particles: name = sparks | snow | rain | confetti | bubbles | smoke | fire (or object = an existing object to
   emit), target = the emitter mesh (sparks from a sphere, smoke from a chimney; snow / rain without a target get
   an emitter above the scene), number = particles per frame, power = speed, scale = size. Calling it with
@@ -1020,6 +1025,9 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         }
         "add trees" | "add a forest" | "scatter trees" | "plant trees" => return Some(vec![Command { action: "scatter".into(), name: Some("tree".into()), ..Default::default() }]),
         "add rocks" | "scatter rocks" | "add some rocks" => return Some(vec![Command { action: "scatter".into(), name: Some("rock".into()), ..Default::default() }]),
+        "add fur" | "make it furry" | "furry" | "give it fur" => return Some(vec![Command { action: "hair".into(), name: Some("fur".into()), ..Default::default() }]),
+        "add hair" | "give it hair" | "grow hair" => return Some(vec![Command { action: "hair".into(), name: Some("hair".into()), ..Default::default() }]),
+        "remove hair" | "remove the hair" | "remove fur" | "remove the fur" | "shave it" => return Some(vec![Command { action: "hair".into(), name: Some("none".into()), ..Default::default() }]),
         "add grass" | "scatter grass" | "grow grass" => return Some(vec![Command { action: "scatter".into(), name: Some("grass".into()), ..Default::default() }]),
         "make it bumpy" | "add bumps" | "bumpy" | "add a normal map" | "add normal map" | "add bump" | "add bump map" | "make the texture bumpy" => {
             return Some(vec![Command { action: "bump".into(), name: Some("auto".into()), number: Some(1.0), ..Default::default() }]);

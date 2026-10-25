@@ -452,7 +452,7 @@ impl Editor {
             self.scene
                 .objects
                 .iter()
-                .filter(|o| o.visible && o.is_mesh() && o.id != ps.emitter && o.id != pid && o.scatter.is_none() && o.particles.is_none())
+                .filter(|o| o.visible && o.is_mesh() && o.id != ps.emitter && o.id != pid && !o.is_generated() && o.particles.is_none())
                 .map(|o| {
                     let p = o.poly();
                     let lo = p.verts.iter().fold(Vec3::splat(f32::MAX), |a, b| a.min(*b));
@@ -524,7 +524,7 @@ impl Editor {
             .scene
             .objects
             .iter()
-            .filter(|o| o.visible && o.is_mesh() && o.scatter.is_none() && o.cloth.is_none() && !active.contains(&o.id))
+            .filter(|o| o.visible && o.is_mesh() && !o.is_generated() && o.cloth.is_none() && !active.contains(&o.id))
             .map(|o| crate::physics::collider_for(o, bounds(o)))
             .collect();
         let (f0, f1) = (self.scene.frame_start, self.scene.frame_end.max(self.scene.frame_start + 1));
@@ -1618,7 +1618,7 @@ impl Editor {
                     .scene
                     .objects
                     .iter()
-                    .filter(|x| x.id != id && x.visible && x.is_mesh() && x.scatter.is_none())
+                    .filter(|x| x.id != id && x.visible && x.is_mesh() && !x.is_generated())
                     .map(|x| {
                         let p = x.posed.as_ref().map(|p| (**p).clone()).unwrap_or_else(|| x.poly());
                         let lo = p.verts.iter().fold(Vec3::splat(f32::MAX), |a, b| a.min(*b));
@@ -1800,7 +1800,7 @@ impl Editor {
                     .filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh()))
                     .ok_or("scatter needs target = the surface mesh")?;
                 let spec = c.object.clone().or(c.name.clone()).or(c.primitive.clone()).unwrap_or_else(|| "rock".into());
-                let (src, preset) = match self.scene.find_by_name(&spec).filter(|id| *id != surf && self.scene.get(*id).is_some_and(|o| o.is_mesh() && o.scatter.is_none())) {
+                let (src, preset) = match self.scene.find_by_name(&spec).filter(|id| *id != surf && self.scene.get(*id).is_some_and(|o| o.is_mesh() && !o.is_generated())) {
                     Some(id) => (id, None),
                     None => {
                         let (id, p) = self.scatter_preset(&spec)?;
@@ -1873,10 +1873,112 @@ impl Editor {
                 let names = (self.scene.get(src).unwrap().name.clone(), self.scene.get(surf).unwrap().name.clone());
                 Ok(format!("Scattered {n} × \"{}\" on \"{}\"{}", names.0, names.1, if existing.is_some() { " (updated)" } else { "" }))
             }
+            "hair" | "fur" | "add_hair" | "add_fur" | "grow_hair" => {
+                let surf = c
+                    .target
+                    .as_deref()
+                    .and_then(|t| self.scene.find_by_name(t))
+                    .or(self.active)
+                    .and_then(|id| {
+                        // a hair object as target means "edit that hair"
+                        let o = self.scene.get(id)?;
+                        Some(o.hair.as_ref().map(|h| h.target).unwrap_or(id))
+                    })
+                    .filter(|id| self.scene.get(*id).is_some_and(|o| o.is_mesh() && !o.is_generated()))
+                    .ok_or("hair needs target = the mesh to grow it on")?;
+                let style = c.name.clone().unwrap_or_else(|| if c.action.contains("fur") { "fur".into() } else { "hair".into() });
+                if matches!(style.to_lowercase().as_str(), "none" | "off" | "remove") {
+                    let ids: Vec<u64> = self.scene.objects.iter().filter(|o| o.hair.as_ref().is_some_and(|h| h.target == surf)).map(|o| o.id).collect();
+                    if ids.is_empty() {
+                        return Err("no hair on that object".into());
+                    }
+                    let n = self.names(&ids);
+                    self.scene.objects.retain(|o| !ids.contains(&o.id));
+                    self.selection.retain(|id| !ids.contains(id));
+                    if self.active.is_some_and(|a| ids.contains(&a)) {
+                        self.active = Some(surf);
+                    }
+                    return Ok(format!("Removed {n}"));
+                }
+                let existing = self.scene.objects.iter().find(|o| o.hair.as_ref().is_some_and(|h| h.target == surf)).map(|o| o.id);
+                let (preset, title, col) = crate::hair::Hair::preset(surf, &style);
+                // a new style name replaces the settings; repeating with only numbers tweaks them
+                let restyle = c.name.is_some() || existing.is_none();
+                let mut h = match existing.and_then(|id| self.scene.get(id)?.hair.clone()) {
+                    Some(h) if !restyle => h,
+                    Some(old) => crate::hair::Hair { seed: old.seed, ..preset.clone() },
+                    None => preset.clone(),
+                };
+                if let Some(n) = c.number {
+                    h.count = (n as u32).clamp(1, 20_000);
+                }
+                if let Some(v) = c.length.or_else(|| match &c.scale {
+                    Some(Value::Number(n)) => n.as_f64(),
+                    _ => None,
+                }) {
+                    h.length = (v as f32).clamp(0.001, 10.0);
+                }
+                if let Some(v) = c.gravity {
+                    h.gravity = (v as f32).clamp(0.0, 1.0);
+                }
+                if let Some(v) = c.curl {
+                    h.curl = (v as f32).clamp(0.0, 20.0);
+                    if h.curl > 0.0 && h.segments < 10 {
+                        h.segments = 12;
+                    }
+                }
+                if let Some(v) = c.seed {
+                    h.seed = v as u32;
+                }
+                if let Some(v) = c.segments {
+                    h.segments = (v as u32).clamp(1, 32);
+                }
+                let color = c.color.as_ref().and_then(parse_color);
+                let id = match existing {
+                    Some(id) => id,
+                    None => {
+                        let sname = format!("{} {}", self.scene.get(surf).unwrap().name, title);
+                        let id = self.scene.add(crate::mesh::Primitive::Cube, Some(&sname));
+                        let coll = self.scene.get(surf).unwrap().collection;
+                        let o = self.scene.get_mut(id).unwrap();
+                        o.collection = coll;
+                        o.smooth_override = Some(true);
+                        o.material.roughness = 0.45;
+                        id
+                    }
+                };
+                if restyle || color.is_some() {
+                    let base = color.unwrap_or(col);
+                    let mut g = crate::nodes::NodeGraph::preset(0, "hair strands").expect("hair preset");
+                    g.set_rgb(base);
+                    let gid = self.scene.add_graph(g);
+                    let o = self.scene.get_mut(id).unwrap();
+                    o.material.color = base;
+                    o.material.graph = gid;
+                }
+                // an untouched grey surface shows through thin strands: give it the root colour
+                let mut tinted = false;
+                if existing.is_none() {
+                    let base = color.unwrap_or(col);
+                    let so = self.scene.get_mut(surf).unwrap();
+                    let d = crate::scene::Material::default();
+                    if so.material.color == d.color && so.material.texture == 0 && so.material.graph == 0 {
+                        so.material.color = [base[0] * 0.45, base[1] * 0.45, base[2] * 0.45];
+                        tinted = true;
+                    }
+                }
+                let o = self.scene.get_mut(id).unwrap();
+                o.hair = Some(h.clone());
+                o.posed = None;
+                self.scene.update_hair();
+                let n = h.strands();
+                let name = self.scene.get(id).unwrap().name.clone();
+                Ok(format!("{} on \"{}\": {n} strands ({} guides × {} children), {:.2} m", if existing.is_some() { "Updated hair" } else { title }, self.scene.get(surf).unwrap().name, h.count, h.children + 1, h.length) + &format!(" → \"{name}\"{}", if tinted { " (surface tinted to the root colour)" } else { "" }))
+            }
             "realize" | "apply_scatter" | "make_real" => {
-                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.scatter.is_some())).collect();
+                let ids: Vec<u64> = targets().into_iter().filter(|id| self.scene.get(*id).is_some_and(|o| o.is_generated())).collect();
                 if ids.is_empty() {
-                    return Err("select a scatter object".into());
+                    return Err("select a scatter or hair object".into());
                 }
                 for id in &ids {
                     let o = self.scene.get_mut(*id).unwrap();
@@ -1884,6 +1986,7 @@ impl Editor {
                         o.mesh = Some((*p).clone());
                     }
                     o.scatter = None;
+                    o.hair = None;
                 }
                 Ok(format!("Made {} a real mesh", self.names(&ids)))
             }
@@ -2901,6 +3004,13 @@ pub struct Command {
     pub slope: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align: Option<bool>,
+    /// Hair: strand length (m), droop 0..1, curl turns.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_f64")]
+    pub length: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_f64")]
+    pub gravity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_f64")]
+    pub curl: Option<f64>,
 }
 
 fn lenient_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
@@ -3353,6 +3463,38 @@ mod tests {
         let arm = ed.scene.get(ed.scene.find_by_name("Arm").unwrap()).unwrap().armature.as_ref().unwrap();
         let tip = arm.segments(&arm.pose_globals())[2].1;
         assert!((tip - Vec3::new(2.0, 0.0, 0.0)).length() < 0.05, "{tip}");
+    }
+
+    #[test]
+    fn hair_command() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"add","primitive":"uv_sphere","name":"Ball"}"#),
+            cmd(r#"{"action":"hair","target":"Ball","name":"fur","number":60,"color":"orange"}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let hid = ed.scene.find_by_name("Ball Fur").expect("hair object");
+        let tris = |ed: &mut Editor| {
+            ed.scene.update_derived();
+            ed.scene.get(hid).unwrap().posed.as_ref().map(|p| p.faces.len()).unwrap_or(0)
+        };
+        let n0 = tris(&mut ed);
+        assert!(n0 > 0);
+        // the strands sit on the sphere (roots within the fur length of its surface)
+        let pm = ed.scene.get(hid).unwrap().posed.clone().unwrap();
+        assert!(pm.verts.iter().all(|v| v.length() > 0.9 && v.length() < 1.3), "on the ball");
+        // numbers tweak, keeping the style; the surface moved → the hair follows
+        ed.execute(&[cmd(r#"{"action":"hair","target":"Ball","number":120,"length":0.3}"#)]);
+        let h = ed.scene.get(hid).unwrap().hair.clone().unwrap();
+        assert_eq!((h.count, h.length), (120, 0.3));
+        assert!(tris(&mut ed) > n0);
+        ed.execute(&[cmd(r#"{"action":"move","target":"Ball","location":[5,0,0]}"#)]);
+        ed.scene.update_derived();
+        let pm = ed.scene.get(hid).unwrap().posed.clone().unwrap();
+        assert!(pm.verts.iter().all(|v| (*v - Vec3::new(5.0, 0.0, 0.0)).length() < 1.5), "follows the surface");
+        // make real, and removal
+        ed.execute(&[cmd(r#"{"action":"hair","target":"Ball","name":"none"}"#)]);
+        assert!(ed.scene.find_by_name("Ball Fur").is_none());
     }
 
     #[test]

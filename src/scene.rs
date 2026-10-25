@@ -247,6 +247,9 @@ pub struct Object {
     /// Copies of another object spread over a surface (the mesh is derived into `posed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scatter: Option<crate::scatter::Scatter>,
+    /// Hair / fur grown from another object's surface (strands derived into `posed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hair: Option<crate::hair::Hair>,
     /// Derived mesh: the armature pose (`Scene::update_skins`) or a scatter result.
     #[serde(skip)]
     pub posed: Option<std::sync::Arc<crate::mesh::PolyMesh>>,
@@ -273,6 +276,10 @@ fn yes() -> bool {
 impl Object {
     pub fn is_mesh(&self) -> bool {
         matches!(self.kind, ObjectKind::Mesh)
+    }
+    /// Its mesh is generated from other objects (scatter, hair).
+    pub fn is_generated(&self) -> bool {
+        self.scatter.is_some() || self.hair.is_some()
     }
     pub fn light(&self) -> Option<&Light> {
         if let ObjectKind::Light(l) = &self.kind {
@@ -682,6 +689,7 @@ impl Scene {
             particles: None,
             sim_frame: 0,
             scatter: None,
+            hair: None,
             posed: None,
             posed_key: 0,
         });
@@ -709,7 +717,49 @@ impl Scene {
         self.update_cloth();
         self.update_skins();
         self.update_scatter();
+        self.update_hair();
         self.update_particles();
+    }
+
+    /// Regrow hair whose settings or surface changed.
+    pub fn update_hair(&mut self) {
+        use std::hash::{Hash, Hasher};
+        if !self.objects.iter().any(|o| o.hair.is_some()) {
+            return;
+        }
+        for i in 0..self.objects.len() {
+            let Some(hr) = self.objects[i].hair.clone() else { continue };
+            let Some(tgt) = self.get(hr.target).filter(|t| t.id != self.objects[i].id && t.is_mesh()) else {
+                self.objects[i].posed = Some(std::sync::Arc::new(crate::mesh::PolyMesh::default()));
+                continue;
+            };
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for f in tgt.transform.matrix().to_cols_array().iter().chain(self.objects[i].transform.matrix().to_cols_array().iter()) {
+                f.to_bits().hash(&mut h);
+            }
+            (tgt.primitive as u8, tgt.detail, tgt.posed_key).hash(&mut h);
+            if let Some(m) = &tgt.mesh {
+                (m.verts.len(), m.faces.len()).hash(&mut h);
+                for v in m.verts.iter().step_by((m.verts.len() / 97).max(1)) {
+                    (v.x.to_bits(), v.y.to_bits(), v.z.to_bits()).hash(&mut h);
+                }
+            }
+            format!("{hr:?}").hash(&mut h);
+            let key = h.finish() | 1;
+            if self.objects[i].posed.is_some() && self.objects[i].posed_key == key {
+                continue;
+            }
+            let rest = tgt.poly();
+            let surface = match &tgt.posed {
+                Some(p) if p.faces.len() == rest.faces.len() && p.verts.len() == rest.verts.len() => (**p).clone(),
+                _ => rest.clone(),
+            };
+            let to_local = self.objects[i].transform.matrix().inverse();
+            let pm = crate::hair::build(&hr, &rest, &surface, tgt.transform.matrix(), to_local);
+            let o = &mut self.objects[i];
+            o.posed = Some(std::sync::Arc::new(pm));
+            o.posed_key = key;
+        }
     }
 
     /// Solve IK constraints (bones reaching for target objects) when targets or poses moved.
@@ -761,7 +811,7 @@ impl Scene {
     /// Blend shape keys of meshes that aren't skinned (skinned ones blend inside `update_skins`).
     pub fn update_shapes(&mut self) {
         use std::hash::{Hash, Hasher};
-        for o in self.objects.iter_mut().filter(|o| !o.shape_keys.is_empty() && o.skin.is_none() && o.scatter.is_none()) {
+        for o in self.objects.iter_mut().filter(|o| !o.shape_keys.is_empty() && o.skin.is_none() && !o.is_generated()) {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             for k in &o.shape_keys {
                 k.value.to_bits().hash(&mut h);
@@ -813,7 +863,7 @@ impl Scene {
             let Some(c) = o.cloth.as_ref() else { continue };
             let Some(pm) = o.mesh.as_ref() else { continue };
             if c.cache.is_empty() || c.cache[0].len() != pm.verts.len() {
-                if o.posed.is_some() && o.skin.is_none() && o.shape_keys.is_empty() && o.scatter.is_none() {
+                if o.posed.is_some() && o.skin.is_none() && o.shape_keys.is_empty() && !o.is_generated() {
                     o.posed = None;
                 }
                 continue;

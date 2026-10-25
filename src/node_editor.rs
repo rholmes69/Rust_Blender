@@ -26,14 +26,7 @@ fn node_height(k: &NodeKind) -> f32 {
 }
 
 fn param_rows(k: &NodeKind) -> usize {
-    match k {
-        NodeKind::Output { .. } | NodeKind::Checker { .. } | NodeKind::Image { .. } | NodeKind::Rgb { .. } | NodeKind::Value { .. } => 1,
-        NodeKind::Coords { .. } | NodeKind::Voronoi { .. } | NodeKind::Bricks { .. } | NodeKind::Waves { .. } => 2,
-        NodeKind::Noise { .. } | NodeKind::Math { .. } => 3,
-        NodeKind::Mix { .. } => 4,
-        NodeKind::Ramp { stops } => 2 + stops.len(),
-        NodeKind::Invert => 0,
-    }
+    crate::nodes::param_rows(k)
 }
 
 fn header_color(k: &NodeKind) -> Color32 {
@@ -41,7 +34,9 @@ fn header_color(k: &NodeKind) -> Color32 {
         NodeKind::Output { .. } => Color32::from_rgb(150, 60, 60),
         NodeKind::Coords { .. } => Color32::from_rgb(110, 60, 150),
         NodeKind::Image { .. } | NodeKind::Noise { .. } | NodeKind::Voronoi { .. } | NodeKind::Checker { .. } | NodeKind::Bricks { .. } | NodeKind::Waves { .. } => Color32::from_rgb(190, 120, 40),
-        NodeKind::Ramp { .. } | NodeKind::Mix { .. } | NodeKind::Invert | NodeKind::Rgb { .. } => Color32::from_rgb(70, 110, 150),
+        NodeKind::Gradient { .. } => Color32::from_rgb(190, 120, 40),
+        NodeKind::Ramp { .. } | NodeKind::Mix { .. } | NodeKind::Invert | NodeKind::Rgb { .. } | NodeKind::HueSat { .. } => Color32::from_rgb(70, 110, 150),
+        NodeKind::NormalMap { .. } => Color32::from_rgb(90, 90, 170),
         NodeKind::Math { .. } | NodeKind::Value { .. } => Color32::from_rgb(70, 120, 90),
     }
 }
@@ -300,9 +295,28 @@ fn params(ui: &mut egui::Ui, k: &mut NodeKind, textures: &[(u32, String)], id: u
     };
     match k {
         NodeKind::Output { bump } => dv(ui, bump, "Bump", 0.02),
-        NodeKind::Coords { scale, rotate } => {
+        NodeKind::Coords { scale, rotate, object } => {
+            ui.horizontal(|ui| {
+                ui.selectable_value(object, false, "UV");
+                ui.selectable_value(object, true, "Object");
+            });
             dv(ui, scale, "Scale", 0.05);
             dv(ui, rotate, "Rotate°", 1.0);
+        }
+        NodeKind::Gradient { mode } => {
+            egui::ComboBox::from_id_salt(("grad", id)).width(110.0).selected_text(format!("{mode:?}")).show_ui(ui, |ui| {
+                for m in [crate::nodes::GradMode::Linear, crate::nodes::GradMode::Radial, crate::nodes::GradMode::Spherical] {
+                    ui.selectable_value(mode, m, format!("{m:?}"));
+                }
+            });
+        }
+        NodeKind::HueSat { hue, saturation, value } => {
+            ui.add(egui::DragValue::new(hue).range(-0.5..=0.5).speed(0.005).prefix("Hue ").max_decimals(3));
+            ui.add(egui::DragValue::new(saturation).range(0.0..=4.0).speed(0.01).prefix("Saturation ").max_decimals(3));
+            ui.add(egui::DragValue::new(value).range(0.0..=4.0).speed(0.01).prefix("Value ").max_decimals(3));
+        }
+        NodeKind::NormalMap { strength } => {
+            ui.add(egui::DragValue::new(strength).range(0.0..=10.0).speed(0.02).prefix("Strength ").max_decimals(3));
         }
         NodeKind::Image { texture } => {
             let cur = textures.iter().find(|t| t.0 == *texture).map(|t| t.1.clone()).unwrap_or_else(|| "None".into());

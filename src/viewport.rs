@@ -246,6 +246,8 @@ pub struct Viewport {
     pub tex_cache: crate::textures::TextureCache,
     /// Baked node materials: (graph id, signature) → colour texture with bump shading.
     graph_bakes: std::collections::HashMap<(u32, u64), std::sync::Arc<crate::textures::TexImage>>,
+    /// Object-coordinate node materials evaluated per vertex: (object, graph signature ^ mesh hash) → linear colours.
+    obj_graph_cols: std::collections::HashMap<(u64, u64), (std::sync::Arc<Vec<Vec3>>, Option<std::sync::Arc<crate::textures::TexImage>>)>,
     /// Scene texture ids in `raster.textures` order for the current frame.
     /// textures used this frame: (base texture, normal map) ids
     frame_tex: Vec<(u32, u32)>,
@@ -338,6 +340,7 @@ impl Default for Viewport {
             render_mode: false,
             tex_cache: Default::default(),
             graph_bakes: Default::default(),
+            obj_graph_cols: Default::default(),
             frame_tex: vec![],
         }
     }
@@ -1280,15 +1283,73 @@ impl Viewport {
             };
             let smooth = mesh.smooth;
             // node materials bake their colour (and the material colour) into the texture
-            let base = if o.material.graph != 0 && ed.scene.graph(o.material.graph).is_some() && shading == Shading::Material { Vec3::ONE } else { lin(o.material.color) };
             let mat = o.material;
+            // node graphs on Object coordinates can't be baked over UVs: evaluate them per vertex
+            let obj_graph = ed.scene.graph(mat.graph).filter(|g| shading == Shading::Material && g.uses_object_coords());
+            let base = if obj_graph.is_none() && mat.graph != 0 && ed.scene.graph(mat.graph).is_some() && shading == Shading::Material { Vec3::ONE } else { lin(mat.color) };
+            let obj_sampler = obj_graph.map(|g| self.graph_images(ed, g));
+            // Material Preview: bake over the mesh's UVs at the 3D points (no UVs → per vertex);
+            // F12 evaluates exactly per tessellated point
+            let obj_hash = obj_graph.map(|g| {
+                let mut hh = g.signature() ^ (mat.color.iter().map(|c| c.to_bits() as u64).sum::<u64>() << 1);
+                for p in &mesh.positions {
+                    hh = hh.rotate_left(5) ^ (p.x.to_bits() as u64) ^ ((p.y.to_bits() as u64) << 21) ^ ((p.z.to_bits() as u64) << 42);
+                }
+                hh ^ (mesh.tri_uv.len() as u64).rotate_left(17)
+            });
+            let obj_baked = !self.render_mode && !mesh.tri_uv.is_empty();
+            let mut obj_tex = 0u32;
+            let vbase: Option<std::sync::Arc<Vec<Vec3>>> = match (obj_graph, &obj_sampler, obj_hash) {
+                (Some(g), Some(smp), Some(hh)) if !self.render_mode => {
+                    let key = (o.id, hh);
+                    let cached = self.obj_graph_cols.get(&key).cloned();
+                    let (cols, img) = match cached {
+                        Some(c) => c,
+                        None => {
+                            let c = if obj_baked {
+                                (std::sync::Arc::new(vec![]), Some(std::sync::Arc::new(crate::nodes::bake_object(g, mat, &mesh, 512, smp))))
+                            } else {
+                                (std::sync::Arc::new(mesh.positions.iter().map(|p| graph_base(g, *p, &mat, smp)).collect()), None)
+                            };
+                            self.obj_graph_cols.retain(|k, _| k.0 != o.id);
+                            self.obj_graph_cols.insert(key, c.clone());
+                            c
+                        }
+                    };
+                    if let Some(img) = img {
+                        let fkey = (0xC000_0000 | (o.id as u32 & 0x3fff_ffff), hh as u32);
+                        obj_tex = match self.frame_tex.iter().position(|t| *t == fkey) {
+                            Some(i) => i as u32 + 1,
+                            None => {
+                                self.frame_tex.push(fkey);
+                                self.raster.textures.push(img);
+                                self.frame_tex.len() as u32
+                            }
+                        };
+                    }
+                    Some(cols)
+                }
+                _ => None,
+            };
+            let base = if obj_tex != 0 { Vec3::ONE } else { base };
+            let cur_inv = std::cell::Cell::new(glam::Mat4::IDENTITY);
+            // the base colour at a world point (F12 tessellation evaluates object graphs exactly)
+            let pbase = |p: Vec3| -> Vec3 {
+                match (obj_graph, &obj_sampler) {
+                    (Some(g), Some(smp)) => graph_base(g, cur_inv.get().transform_point3(p), &mat, smp),
+                    _ => base,
+                }
+            };
+            let vb = |i: usize| -> Vec3 { vbase.as_ref().and_then(|v| v.get(i).copied()).unwrap_or(base) };
             // image / procedural texture (Material Preview and F12 renders)
-            let tex = if (mat.texture != 0 || mat.normal_tex != 0 || mat.graph != 0) && (shading == Shading::Material) { self.texture_slot(ed, &mat) } else { 0 };
-            let tsc = mat.tex_scale.max(1e-3);
+            let tex = if obj_tex != 0 {
+                obj_tex
+            } else if obj_graph.is_none() && (mat.texture != 0 || mat.normal_tex != 0 || mat.graph != 0) && (shading == Shading::Material) { self.texture_slot(ed, &mat) } else { 0 };
+            let tsc = if obj_tex != 0 { 1.0 } else { mat.tex_scale.max(1e-3) };
             let tri_uv = |fi: usize| -> [[f32; 2]; 3] { mesh.tri_uv.get(fi).map(|t| t.map(|u| [u[0] * tsc, u[1] * tsc])).unwrap_or([[0.0; 2]; 3]) };
             let alpha = if self.overlays.xray { 0.4 } else { mat.alpha };
             let blend = alpha < 0.999;
-            let shade = |p: Vec3, n: Vec3| -> Vec3 {
+            let shade = |p: Vec3, n: Vec3, base: Vec3| -> Vec3 {
                 let v = if ortho { -fwd } else { (eye - p).normalize() };
                 match shading {
                     Shading::Solid => {
@@ -1360,6 +1421,7 @@ impl Viewport {
             };
             for (inst_i, inst) in o.instance_matrices().into_iter().enumerate() {
                 let m = o.transform.matrix() * inst;
+                cur_inv.set(m.inverse());
                 let flip = m.determinant() < 0.0;
                 let nm = Mat3::from_mat4(m).inverse().transpose();
                 let wp: Vec<Vec3> = mesh
@@ -1396,6 +1458,8 @@ impl Viewport {
                     })
                     .collect();
 
+                // hair: thousands of thin strands — shade per vertex, no refinement
+                let max_depth = if o.hair.is_some() { 0 } else { 5 };
                 if rmode && shading != Shading::Wireframe {
                     // F12: tessellate by screen size so lighting and shadows are near per-pixel
                     for (fi, t) in mesh.tris.iter().enumerate() {
@@ -1425,7 +1489,7 @@ impl Viewport {
                         } else {
                             400.0
                         };
-                        let k = ((edge_px / 14.0).ceil() as usize).clamp(1, 256);
+                        let k = if o.hair.is_some() { 1 } else { ((edge_px / 14.0).ceil() as usize).clamp(1, 256) };
                         let (a, b, c) = (wp[ix[0]], wp[ix[1]], wp[ix[2]]);
                         let (na, nb, nc) = if smooth {
                             let cn = mesh.corner_normals.get(fi).copied().unwrap_or([mesh.normals[ix[0]], mesh.normals[ix[1]], mesh.normals[ix[2]]]);
@@ -1445,7 +1509,7 @@ impl Viewport {
                                 let p = a * w + b * u + c * v;
                                 let n = (na * w + nb * u + nc * v).normalize_or_zero();
                                 let t = [tuv[0][0] * w + tuv[1][0] * u + tuv[2][0] * v, tuv[0][1] * w + tuv[1][1] * u + tuv[2][1] * v];
-                                pts.push((p, n, tone(shade(p, n), alpha), t));
+                                pts.push((p, n, tone(shade(p, n, pbase(p)), alpha), t));
                             }
                         }
                         let start = |j: usize| -> usize { (0..j).map(|r| k + 1 - r).sum() };
@@ -1467,11 +1531,11 @@ impl Viewport {
                                             (c0[0] - c1[0]).abs().max((c0[1] - c1[1]).abs()).max((c0[2] - c1[2]).abs())
                                         })
                                         .fold(0.0f32, f32::max);
-                                    if depth < 5 && diff > 0.05 {
+                                    if depth < max_depth && diff > 0.05 {
                                         let mid = |a: &(Vec3, Vec3, [f32; 4], [f32; 2]), b: &(Vec3, Vec3, [f32; 4], [f32; 2])| {
                                             let p = (a.0 + b.0) * 0.5;
                                             let n = (a.1 + b.1).normalize_or_zero();
-                                            (p, n, tone(shade(p, n), alpha), [(a.3[0] + b.3[0]) * 0.5, (a.3[1] + b.3[1]) * 0.5])
+                                            (p, n, tone(shade(p, n, pbase(p)), alpha), [(a.3[0] + b.3[0]) * 0.5, (a.3[1] + b.3[1]) * 0.5])
                                         };
                                         let (m01, m12, m20) = (mid(&tv[0], &tv[1]), mid(&tv[1], &tv[2]), mid(&tv[2], &tv[0]));
                                         let d = depth + 1;
@@ -1490,7 +1554,7 @@ impl Viewport {
                 } else if shading != Shading::Wireframe {
                     let vcol: Vec<[f32; 4]> = if smooth {
                         (0..wp.len())
-                            .map(|i| srgb4(shade(wp[i], wn[i]), alpha))
+                            .map(|i| srgb4(shade(wp[i], wn[i], vb(i)), alpha))
                             .collect()
                     } else {
                         vec![]
@@ -1505,7 +1569,7 @@ impl Viewport {
                             let mut out = [[0.0; 4]; 3];
                             for k in 0..3 {
                                 let n = (nm * cn[k]).normalize_or_zero() * if flip { -1.0 } else { 1.0 };
-                                out[k] = srgb4(shade(wp[t[k] as usize], n), alpha);
+                                out[k] = srgb4(shade(wp[t[k] as usize], n, vb(t[k] as usize)), alpha);
                             }
                             out
                         } else if smooth && facing[fi] {
@@ -1515,7 +1579,7 @@ impl Viewport {
                                 (wp[t[0] as usize] + wp[t[1] as usize] + wp[t[2] as usize]) / 3.0;
                             let n = if facing[fi] { face_n[fi] } else { -face_n[fi] };
                             let k = if facing[fi] { 1.0 } else { 0.6 };
-                            [srgb4(shade(ctr, n) * k, alpha); 3]
+                            [srgb4(shade(ctr, n, (vb(t[0] as usize) + vb(t[1] as usize) + vb(t[2] as usize)) / 3.0) * k, alpha); 3]
                         };
                         let cols = match wp_skin {
                             Some(sk) if sk.joints.len() == wp.len() => {
@@ -3380,4 +3444,10 @@ mod tests {
         assert_eq!(t.rgba[3], 0, "corner is transparent");
         assert_eq!(t.rgba[(90 * 320 + 160) * 4 + 3], 255, "cube is opaque");
     }
+}
+
+/// Linear base colour of a node graph at an object-space point (raster preview of Object coords).
+fn graph_base(g: &crate::nodes::NodeGraph, local: Vec3, mat: &crate::scene::Material, smp: &dyn Fn(u32, glam::Vec2) -> Option<[f32; 4]>) -> Vec3 {
+    let c = g.eval(glam::Vec2::ZERO, local, smp).color.unwrap_or(Vec3::from(mat.color)).max(Vec3::ZERO);
+    Vec3::new(c.x.powf(2.2), c.y.powf(2.2), c.z.powf(2.2))
 }

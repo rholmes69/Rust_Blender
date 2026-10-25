@@ -16,6 +16,14 @@ pub enum MixMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum GradMode {
+    Linear,
+    Radial,
+    Spherical,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MathOp {
     Add,
     Multiply,
@@ -31,8 +39,13 @@ pub enum NodeKind {
     /// Material output: Color, Roughness, Metallic, Emission, Height (bump). Unconnected inputs
     /// fall back to the material's own values.
     Output { bump: f32 },
-    /// UV coordinates scaled and rotated.
-    Coords { scale: f32, rotate: f32 },
+    /// UV coordinates (or the object's own 3D coordinates, which have no seams) scaled and rotated.
+    Coords {
+        scale: f32,
+        rotate: f32,
+        #[serde(default)]
+        object: bool,
+    },
     Image { texture: u32 },
     Noise { scale: f32, detail: u32, distortion: f32 },
     Voronoi { scale: f32, randomness: f32 },
@@ -44,6 +57,11 @@ pub enum NodeKind {
     Mix { mode: MixMode, fac: f32, a: [f32; 3], b: [f32; 3] },
     Math { op: MathOp, a: f32, b: f32 },
     Invert,
+    /// Fac from the vector: left→right, around, or from the centre.
+    Gradient { mode: GradMode },
+    HueSat { hue: f32, saturation: f32, value: f32 },
+    /// A normal-map colour → tangent-space normal for the output's Normal input.
+    NormalMap { strength: f32 },
     Rgb { color: [f32; 3] },
     Value { value: f32 },
 }
@@ -63,13 +81,18 @@ impl NodeKind {
             NodeKind::Mix { .. } => "Mix Color",
             NodeKind::Math { .. } => "Math",
             NodeKind::Invert => "Invert",
+            NodeKind::Gradient { .. } => "Gradient Texture",
+            NodeKind::HueSat { .. } => "Hue/Saturation",
+            NodeKind::NormalMap { .. } => "Normal Map",
             NodeKind::Rgb { .. } => "RGB",
             NodeKind::Value { .. } => "Value",
         }
     }
     pub fn inputs(&self) -> &'static [&'static str] {
         match self {
-            NodeKind::Output { .. } => &["Color", "Roughness", "Metallic", "Emission", "Height"],
+            NodeKind::Output { .. } => &["Color", "Roughness", "Metallic", "Emission", "Height", "Normal"],
+            NodeKind::Gradient { .. } => &["Vector"],
+            NodeKind::HueSat { .. } | NodeKind::NormalMap { .. } => &["Color"],
             NodeKind::Coords { .. } | NodeKind::Rgb { .. } | NodeKind::Value { .. } => &[],
             NodeKind::Image { .. } | NodeKind::Noise { .. } | NodeKind::Voronoi { .. } | NodeKind::Checker { .. } | NodeKind::Bricks { .. } | NodeKind::Waves { .. } => &["Vector"],
             NodeKind::Ramp { .. } => &["Fac"],
@@ -81,19 +104,22 @@ impl NodeKind {
     pub fn outputs(&self) -> &'static [&'static str] {
         match self {
             NodeKind::Output { .. } => &[],
-            NodeKind::Coords { .. } => &["UV"],
+            NodeKind::Coords { .. } => &["Vector"],
             NodeKind::Image { .. } => &["Color", "Alpha"],
             NodeKind::Noise { .. } => &["Fac", "Color"],
             NodeKind::Voronoi { .. } => &["Distance", "Color", "Edge"],
             NodeKind::Checker { .. } | NodeKind::Bricks { .. } | NodeKind::Waves { .. } => &["Fac"],
-            NodeKind::Ramp { .. } | NodeKind::Mix { .. } | NodeKind::Invert | NodeKind::Rgb { .. } => &["Color"],
+            NodeKind::Ramp { .. } | NodeKind::Mix { .. } | NodeKind::Invert | NodeKind::Rgb { .. } | NodeKind::HueSat { .. } => &["Color"],
+            NodeKind::Gradient { .. } => &["Fac"],
+            NodeKind::NormalMap { .. } => &["Normal"],
             NodeKind::Math { .. } | NodeKind::Value { .. } => &["Value"],
         }
     }
     /// The kinds offered in the Add menu (with default settings).
     pub fn catalog() -> Vec<NodeKind> {
         vec![
-            NodeKind::Coords { scale: 1.0, rotate: 0.0 },
+            NodeKind::Coords { scale: 1.0, rotate: 0.0, object: false },
+            NodeKind::Coords { scale: 1.0, rotate: 0.0, object: true },
             NodeKind::Image { texture: 0 },
             NodeKind::Noise { scale: 5.0, detail: 4, distortion: 0.0 },
             NodeKind::Voronoi { scale: 5.0, randomness: 1.0 },
@@ -104,6 +130,9 @@ impl NodeKind {
             NodeKind::Mix { mode: MixMode::Mix, fac: 0.5, a: [0.8; 3], b: [0.2; 3] },
             NodeKind::Math { op: MathOp::Multiply, a: 1.0, b: 1.0 },
             NodeKind::Invert,
+            NodeKind::Gradient { mode: GradMode::Linear },
+            NodeKind::HueSat { hue: 0.0, saturation: 1.0, value: 1.0 },
+            NodeKind::NormalMap { strength: 1.0 },
             NodeKind::Rgb { color: [0.8, 0.3, 0.2] },
             NodeKind::Value { value: 0.5 },
         ]
@@ -164,6 +193,8 @@ pub struct Shade {
     pub emission: Option<f32>,
     pub height: Option<f32>,
     pub bump: f32,
+    /// tangent-space normal (from a Normal Map node)
+    pub normal: Option<Vec3>,
 }
 
 // ---- patterns ----
@@ -174,26 +205,86 @@ fn hash2(x: i32, y: i32, s: u32) -> f32 {
     ((h ^ (h >> 15)) & 0x00ff_ffff) as f32 / 16_777_215.0
 }
 
-fn vnoise(p: Vec2, seed: u32) -> f32 {
-    let (i, f) = (p.floor(), p - p.floor());
-    let u = f * f * (Vec2::splat(3.0) - 2.0 * f);
-    let (x, y) = (i.x as i32, i.y as i32);
-    let a = hash2(x, y, seed);
-    let b = hash2(x + 1, y, seed);
-    let c = hash2(x, y + 1, seed);
-    let d = hash2(x + 1, y + 1, seed);
-    (a + (b - a) * u.x) + (c - a + (a - b + d - c) * u.x) * u.y
+
+fn hash3(x: i32, y: i32, z: i32, s: u32) -> f32 {
+    hash2(x ^ z.wrapping_mul(0x27d4_eb2d), y.wrapping_add(z.wrapping_mul(0x1656_67b1u32 as i32)), s)
 }
 
-pub fn fbm(p: Vec2, octaves: u32, seed: u32) -> f32 {
+fn vnoise3(p: Vec3, seed: u32) -> f32 {
+    let i = p.floor();
+    let f = p - i;
+    let u = f * f * (Vec3::splat(3.0) - 2.0 * f);
+    let (x, y, z) = (i.x as i32, i.y as i32, i.z as i32);
+    let c = |dx, dy, dz| hash3(x + dx, y + dy, z + dz, seed);
+    let l = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let x00 = l(c(0, 0, 0), c(1, 0, 0), u.x);
+    let x10 = l(c(0, 1, 0), c(1, 1, 0), u.x);
+    let x01 = l(c(0, 0, 1), c(1, 0, 1), u.x);
+    let x11 = l(c(0, 1, 1), c(1, 1, 1), u.x);
+    l(l(x00, x10, u.y), l(x01, x11, u.y), u.z)
+}
+
+/// Fractal noise in 3D (2D inputs use z = 0).
+pub fn fbm3(p: Vec3, octaves: u32, seed: u32) -> f32 {
     let (mut s, mut amp, mut norm, mut q) = (0.0, 0.5, 0.0, p);
     for o in 0..octaves.clamp(1, 8) {
-        s += vnoise(q, seed + o) * amp;
+        s += vnoise3(q, seed + o) * amp;
         norm += amp;
         amp *= 0.5;
-        q = q * 2.03 + Vec2::new(17.3, 9.1);
+        q = q * 2.03 + Vec3::new(17.3, 9.1, 4.7);
     }
     s / norm
+}
+
+fn voronoi3(p: Vec3, randomness: f32) -> (f32, f32, f32) {
+    let (ix, iy, iz) = (p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+    let (mut d1, mut d2, mut id) = (9.0f32, 9.0f32, 0.0);
+    let r = randomness.clamp(0.0, 1.0);
+    // 2D inputs only need one z layer
+    let zr = if p.z == 0.0 { 0..=0 } else { -1..=1 };
+    for dz in zr {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let (cx, cy, cz) = (ix + dx, iy + dy, iz + dz);
+                let jz = if p.z == 0.0 { 0.0 } else { cz as f32 + 0.5 + (hash3(cx, cy, cz, 41) - 0.5) * r };
+                let pt = Vec3::new(cx as f32 + 0.5 + (hash3(cx, cy, cz, 11) - 0.5) * r, cy as f32 + 0.5 + (hash3(cx, cy, cz, 23) - 0.5) * r, jz);
+                let d = pt.distance(p);
+                if d < d1 {
+                    d2 = d1;
+                    d1 = d;
+                    id = hash3(cx, cy, cz, 37);
+                } else if d < d2 {
+                    d2 = d;
+                }
+            }
+        }
+    }
+    (d1, id, d2 - d1)
+}
+
+fn hsv_adjust(c: Vec3, hue: f32, sat: f32, val: f32) -> Vec3 {
+    let (r, g, b) = (c.x.max(0.0), c.y.max(0.0), c.z.max(0.0));
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    let d = mx - mn;
+    let mut h = if d < 1e-6 {
+        0.0
+    } else if mx == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if mx == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    let s = if mx > 1e-6 { d / mx } else { 0.0 };
+    h = (h + hue).rem_euclid(1.0);
+    let s = (s * sat).clamp(0.0, 1.0);
+    let v = mx * val;
+    let k = |n: f32| {
+        let k = (n + h * 6.0).rem_euclid(6.0);
+        v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    Vec3::new(k(5.0), k(3.0), k(1.0))
 }
 
 /// (F1 distance, cell id hash, F2 − F1)
@@ -301,12 +392,22 @@ impl NodeGraph {
     pub fn has_bump(&self) -> bool {
         self.output().is_some_and(|o| self.input_link(o.id, 4).is_some())
     }
+    /// Set the colour of the graph's first RGB node.
+    pub fn set_rgb(&mut self, c: [f32; 3]) {
+        if let Some(n) = self.nodes.iter_mut().find(|n| matches!(n.kind, NodeKind::Rgb { .. })) {
+            n.kind = NodeKind::Rgb { color: c };
+        }
+    }
+    /// Uses the object's 3D coordinates somewhere (so a UV bake can't show it).
+    pub fn uses_object_coords(&self) -> bool {
+        self.nodes.iter().any(|n| matches!(n.kind, NodeKind::Coords { object: true, .. }))
+    }
     pub fn drives(&self, input: usize) -> bool {
         self.output().is_some_and(|o| self.input_link(o.id, input).is_some())
     }
 
     /// Evaluate at `uv`. `tex` samples a scene texture (id, uv) → sRGB rgba.
-    pub fn eval(&self, uv: Vec2, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>) -> Shade {
+    pub fn eval(&self, uv: Vec2, pos: Vec3, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>) -> Shade {
         let Some(out) = self.output() else { return Shade::default() };
         let mut memo: [Option<[Val; 3]>; MAX_NODES] = [None; MAX_NODES];
         let bump = match out.kind {
@@ -315,7 +416,7 @@ impl NodeGraph {
         };
         let mut get = |i: usize| -> Option<Val> {
             let l = self.input_link(out.id, i)?;
-            Some(self.value(l.from.0, l.from.1, uv, tex, &mut memo, 0))
+            Some(self.value(l.from.0, l.from.1, uv, pos, tex, &mut memo, 0))
         };
         Shade {
             color: get(0).map(|v| v.c()),
@@ -323,19 +424,20 @@ impl NodeGraph {
             metallic: get(2).map(|v| v.f().clamp(0.0, 1.0)),
             emission: get(3).map(|v| v.f().max(0.0)),
             height: get(4).map(|v| v.f()),
+            normal: get(5).map(|v| v.c().normalize_or(Vec3::Z)),
             bump,
         }
     }
 
     /// Only the height (for bump finite differences).
-    pub fn height(&self, uv: Vec2, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>) -> f32 {
+    pub fn height(&self, uv: Vec2, pos: Vec3, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>) -> f32 {
         let Some(out) = self.output() else { return 0.0 };
         let Some(l) = self.input_link(out.id, 4) else { return 0.0 };
         let mut memo: [Option<[Val; 3]>; MAX_NODES] = [None; MAX_NODES];
-        self.value(l.from.0, l.from.1, uv, tex, &mut memo, 0).f()
+        self.value(l.from.0, l.from.1, uv, pos, tex, &mut memo, 0).f()
     }
 
-    fn value(&self, id: u32, out: usize, uv: Vec2, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>, memo: &mut [Option<[Val; 3]>; MAX_NODES], depth: usize) -> Val {
+    fn value(&self, id: u32, out: usize, uv: Vec2, pos: Vec3, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>, memo: &mut [Option<[Val; 3]>; MAX_NODES], depth: usize) -> Val {
         let Some(slot) = self.nodes.iter().position(|n| n.id == id) else { return Val::F(0.0) };
         if depth > MAX_NODES {
             return Val::F(0.0);
@@ -348,23 +450,29 @@ impl NodeGraph {
         let n = &self.nodes[slot];
         let inp = |i: usize, memo: &mut [Option<[Val; 3]>; MAX_NODES]| -> Option<Val> {
             let l = self.input_link(id, i)?;
-            Some(self.value(l.from.0, l.from.1, uv, tex, memo, depth + 1))
+            Some(self.value(l.from.0, l.from.1, uv, pos, tex, memo, depth + 1))
+        };
+        // pattern vectors are 3D (UVs have z = 0)
+        let vec3_in = |v: Option<Val>| -> Vec3 {
+            match v {
+                Some(Val::C(c)) => c,
+                Some(Val::F(f)) => Vec3::new(uv.x + f, uv.y + f, 0.0),
+                None => Vec3::new(uv.x, uv.y, 0.0),
+            }
         };
         let vec_in = |v: Option<Val>| -> Vec2 {
-            match v {
-                Some(Val::C(c)) => Vec2::new(c.x, c.y),
-                Some(Val::F(f)) => uv + Vec2::splat(f),
-                None => uv,
-            }
+            let c = vec3_in(v);
+            Vec2::new(c.x, c.y)
         };
         let z = Val::F(0.0);
         let r: [Val; 3] = match &n.kind {
             NodeKind::Output { .. } => [z; 3],
-            NodeKind::Coords { scale, rotate } => {
+            NodeKind::Coords { scale, rotate, object } => {
                 let a = rotate.to_radians();
                 let (s, c) = a.sin_cos();
-                let p = Vec2::new(uv.x * c - uv.y * s, uv.x * s + uv.y * c) * *scale;
-                [Val::C(Vec3::new(p.x, p.y, 0.0)), z, z]
+                let v = if *object { pos } else { Vec3::new(uv.x, uv.y, 0.0) };
+                let p = Vec3::new(v.x * c - v.y * s, v.x * s + v.y * c, v.z) * *scale;
+                [Val::C(p), z, z]
             }
             NodeKind::Image { texture } => {
                 let p = vec_in(inp(0, memo));
@@ -372,23 +480,25 @@ impl NodeGraph {
                 [Val::C(Vec3::new(c[0], c[1], c[2])), Val::F(c[3]), z]
             }
             NodeKind::Noise { scale, detail, distortion } => {
-                let mut p = vec_in(inp(0, memo)) * *scale;
+                let mut p = vec3_in(inp(0, memo)) * *scale;
+                let flat = p.z == 0.0;
                 if *distortion != 0.0 {
-                    p += Vec2::new(fbm(p + Vec2::splat(5.2), 2, 91) - 0.5, fbm(p + Vec2::splat(1.3), 2, 77) - 0.5) * *distortion;
+                    let dz = if flat { 0.0 } else { fbm3(p + Vec3::splat(8.1), 2, 63) - 0.5 };
+                    p += Vec3::new(fbm3(p + Vec3::splat(5.2), 2, 91) - 0.5, fbm3(p + Vec3::splat(1.3), 2, 77) - 0.5, dz) * *distortion;
                 }
-                let f = fbm(p, *detail, 3);
-                let col = Vec3::new(f, fbm(p + Vec2::splat(31.7), *detail, 5), fbm(p + Vec2::splat(-12.9), *detail, 7));
+                let f = fbm3(p, *detail, 3);
+                let col = Vec3::new(f, fbm3(p + Vec3::splat(31.7), *detail, 5), fbm3(p + Vec3::splat(-12.9), *detail, 7));
                 [Val::F(f), Val::C(col), z]
             }
             NodeKind::Voronoi { scale, randomness } => {
-                let p = vec_in(inp(0, memo)) * *scale;
-                let (d, idh, edge) = voronoi(p, *randomness);
+                let p3 = vec3_in(inp(0, memo)) * *scale;
+                let (d, idh, edge) = if p3.z == 0.0 { voronoi(Vec2::new(p3.x, p3.y), *randomness) } else { voronoi3(p3, *randomness) };
                 let col = Vec3::new(idh, (idh * 7.31).fract(), (idh * 13.17).fract());
                 [Val::F(d), Val::C(col), Val::F(edge)]
             }
             NodeKind::Checker { scale } => {
-                let p = vec_in(inp(0, memo)) * *scale;
-                let k = (p.x.floor() as i64 + p.y.floor() as i64).rem_euclid(2) as f32;
+                let p = vec3_in(inp(0, memo)) * *scale;
+                let k = (p.x.floor() as i64 + p.y.floor() as i64 + p.z.floor() as i64).rem_euclid(2) as f32;
                 [Val::F(k), z, z]
             }
             NodeKind::Bricks { scale, mortar } => {
@@ -403,9 +513,9 @@ impl NodeGraph {
                 [Val::F(if inside { 0.6 + 0.4 * var } else { 0.0 }), z, z]
             }
             NodeKind::Waves { scale, distortion } => {
-                let p = vec_in(inp(0, memo)) * *scale;
-                let d = if *distortion != 0.0 { (fbm(p, 3, 13) - 0.5) * *distortion * 2.0 } else { 0.0 };
-                let f = 0.5 + 0.5 * ((p.x + p.y) * std::f32::consts::TAU + d * std::f32::consts::TAU).sin();
+                let p = vec3_in(inp(0, memo)) * *scale;
+                let d = if *distortion != 0.0 { (fbm3(p, 3, 13) - 0.5) * *distortion * 2.0 } else { 0.0 };
+                let f = 0.5 + 0.5 * ((p.x + p.y + p.z) * std::f32::consts::TAU + d * std::f32::consts::TAU).sin();
                 [Val::F(f), z, z]
             }
             NodeKind::Ramp { stops } => {
@@ -448,6 +558,24 @@ impl NodeGraph {
                 let c = inp(0, memo).map(|v| v.c()).unwrap_or(Vec3::ZERO);
                 [Val::C(Vec3::ONE - c), z, z]
             }
+            NodeKind::Gradient { mode } => {
+                let p = vec3_in(inp(0, memo));
+                let f = match mode {
+                    GradMode::Linear => p.x,
+                    GradMode::Radial => p.y.atan2(p.x) / std::f32::consts::TAU + 0.5,
+                    GradMode::Spherical => 1.0 - p.length(),
+                };
+                [Val::F(f.clamp(0.0, 1.0)), z, z]
+            }
+            NodeKind::HueSat { hue, saturation, value } => {
+                let c = inp(0, memo).map(|v| v.c()).unwrap_or(Vec3::splat(0.5));
+                [Val::C(hsv_adjust(c, *hue, *saturation, *value)), z, z]
+            }
+            NodeKind::NormalMap { strength } => {
+                let c = inp(0, memo).map(|v| v.c()).unwrap_or(Vec3::new(0.5, 0.5, 1.0));
+                let n = crate::textures::texel_normal([c.x, c.y, c.z, 1.0], *strength);
+                [Val::C(n), z, z]
+            }
             NodeKind::Rgb { color } => [Val::C(Vec3::from(*color)), z, z],
             NodeKind::Value { value } => [Val::F(*value), z, z],
         };
@@ -472,7 +600,7 @@ impl NodeGraph {
         let low = name.to_lowercase();
         let mut g = NodeGraph { id, name: String::new(), nodes: vec![], links: vec![] };
         let out = g.add(NodeKind::Output { bump: 1.0 }, [640.0, 160.0]);
-        let co = |g: &mut NodeGraph, s: f32| g.add(NodeKind::Coords { scale: s, rotate: 0.0 }, [0.0, 120.0]);
+        let co = |g: &mut NodeGraph, s: f32| g.add(NodeKind::Coords { scale: s, rotate: 0.0, object: false }, [0.0, 120.0]);
         let title;
         if low.contains("rust") {
             title = "Rusty Metal";
@@ -557,6 +685,40 @@ impl NodeGraph {
             g.connect((c, 0), (ch, 0));
             g.connect((ch, 0), (mx, 0));
             g.connect((mx, 0), (out, 0));
+        } else if low.contains("strand") {
+            // hair: darker at the root, lighter at the tip (U runs along each strand)
+            title = "Hair Strands";
+            let c = co(&mut g, 1.0);
+            let gr = g.add(NodeKind::Gradient { mode: GradMode::Linear }, [160.0, 100.0]);
+            let r = g.add(NodeKind::Ramp { stops: vec![(0.0, [0.35, 0.35, 0.35]), (0.6, [0.85, 0.85, 0.85]), (1.0, [1.0, 1.0, 1.0])] }, [330.0, 100.0]);
+            let rgb = g.add(NodeKind::Rgb { color: [0.4, 0.25, 0.12] }, [330.0, 240.0]);
+            let mx = g.add(NodeKind::Mix { mode: MixMode::Multiply, fac: 1.0, a: [1.0; 3], b: [1.0; 3] }, [480.0, 100.0]);
+            let rough = g.add(NodeKind::Value { value: 0.45 }, [480.0, 240.0]);
+            g.connect((c, 0), (gr, 0));
+            g.connect((gr, 0), (r, 0));
+            g.connect((r, 0), (mx, 1));
+            g.connect((rgb, 0), (mx, 2));
+            g.connect((mx, 0), (out, 0));
+            g.connect((rough, 0), (out, 1));
+        } else if low.contains("granite") || low.contains("solid") {
+            // solid 3D texture on Object coordinates: no UV seams, works on any mesh
+            title = "Granite";
+            let c = g.add(NodeKind::Coords { scale: 1.0, rotate: 0.0, object: true }, [0.0, 120.0]);
+            let n = g.add(NodeKind::Noise { scale: 14.0, detail: 5, distortion: 0.4 }, [160.0, 60.0]);
+            let r = g.add(NodeKind::Ramp { stops: vec![(0.3, [0.12, 0.11, 0.11]), (0.45, [0.62, 0.6, 0.58]), (0.62, [0.85, 0.72, 0.66]), (0.75, [0.95, 0.94, 0.92])] }, [330.0, 60.0]);
+            let hs = g.add(NodeKind::HueSat { hue: 0.0, saturation: 0.8, value: 1.0 }, [480.0, 60.0]);
+            let vo = g.add(NodeKind::Voronoi { scale: 30.0, randomness: 1.0 }, [160.0, 240.0]);
+            let rough = g.add(NodeKind::Value { value: 0.35 }, [480.0, 200.0]);
+            g.connect((c, 0), (n, 0));
+            g.connect((c, 0), (vo, 0));
+            g.connect((n, 0), (r, 0));
+            g.connect((r, 0), (hs, 0));
+            g.connect((hs, 0), (out, 0));
+            g.connect((rough, 0), (out, 1));
+            g.connect((vo, 0), (out, 4));
+            if let Some(o) = g.nodes.iter_mut().find(|n| n.id == out) {
+                o.kind = NodeKind::Output { bump: 0.15 };
+            }
         } else if low.contains("brick") {
             title = "Bricks";
             let c = co(&mut g, 1.0);
@@ -614,19 +776,25 @@ impl NodeGraph {
 }
 
 /// Height of a node box in the editor (kept in sync with node_editor.rs).
-pub fn node_height_estimate(k: &NodeKind) -> f32 {
-    let params = match k {
+pub fn param_rows(k: &NodeKind) -> usize {
+    match k {
         NodeKind::Output { .. } | NodeKind::Checker { .. } | NodeKind::Image { .. } | NodeKind::Rgb { .. } | NodeKind::Value { .. } => 1,
-        NodeKind::Coords { .. } | NodeKind::Voronoi { .. } | NodeKind::Bricks { .. } | NodeKind::Waves { .. } => 2,
-        NodeKind::Noise { .. } | NodeKind::Math { .. } => 3,
+        NodeKind::Voronoi { .. } | NodeKind::Bricks { .. } | NodeKind::Waves { .. } => 2,
+        NodeKind::Coords { .. } | NodeKind::Noise { .. } | NodeKind::Math { .. } => 3,
         NodeKind::Mix { .. } => 4,
         NodeKind::Ramp { stops } => 2 + stops.len(),
         NodeKind::Invert => 0,
-    };
+        NodeKind::Gradient { .. } | NodeKind::NormalMap { .. } => 1,
+        NodeKind::HueSat { .. } => 3,
+    }
+}
+
+pub fn node_height_estimate(k: &NodeKind) -> f32 {
+    let params = param_rows(k);
     22.0 + k.outputs().len() as f32 * 18.0 + params as f32 * 22.0 + k.inputs().len() as f32 * 18.0 + 6.0
 }
 
-pub const PRESETS: &[&str] = &["Rusty Metal", "Wood", "Marble", "Cobblestone", "Lava", "Bricks", "Tiles"];
+pub const PRESETS: &[&str] = &["Rusty Metal", "Wood", "Marble", "Cobblestone", "Lava", "Bricks", "Tiles", "Granite"];
 
 /// Bake the colour (with bump shading for the raster renderers when `shade_bumps`), the
 /// roughness/metallic map and a normal map, each `size`² over UV 0..1.
@@ -640,21 +808,27 @@ pub fn bake(g: &NodeGraph, base: crate::scene::Material, size: usize, shade_bump
     let n = size.max(4);
     let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
     let mut heights = vec![0.0f32; n * n];
+    let mut tnorm: Vec<Vec3> = vec![];
+    let drives_n = g.drives(5);
     let mut col = Vec::with_capacity(n * n);
     let mut mr = Vec::with_capacity(n * n);
     let (drives_mr, bump) = (g.drives(1) || g.drives(2), g.has_bump());
     for y in 0..n {
         for x in 0..n {
             let uv = Vec2::new((x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32);
-            let s = g.eval(uv, tex);
+            // Object coordinates have no UV mapping: bake a planar slice (z = 0) through the object
+            let s = g.eval(uv, Vec3::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0), tex);
             let c = s.color.unwrap_or(Vec3::from(base.color));
             col.push(c);
             mr.push([255, q(s.roughness.unwrap_or(1.0)), q(s.metallic.unwrap_or(1.0)), 255]);
             heights[y * n + x] = s.height.unwrap_or(0.0);
+            if drives_n {
+                tnorm.push(s.normal.unwrap_or(Vec3::Z));
+            }
         }
     }
     let strength = g.output().map(|o| if let NodeKind::Output { bump } = o.kind { bump } else { 1.0 }).unwrap_or(1.0);
-    let normal = bump.then(|| {
+    let normal = (bump || drives_n).then(|| {
         let hi = |x: i64, y: i64| heights[(y.rem_euclid(n as i64) as usize) * n + x.rem_euclid(n as i64) as usize];
         let k = strength * n as f32 / 64.0;
         let mut rgba = Vec::with_capacity(n * n);
@@ -662,7 +836,11 @@ pub fn bake(g: &NodeGraph, base: crate::scene::Material, size: usize, shade_bump
             for x in 0..n as i64 {
                 let dx = (hi(x + 1, y) - hi(x - 1, y)) * 0.5;
                 let dy = (hi(x, y + 1) - hi(x, y - 1)) * 0.5;
-                let nn = Vec3::new(-dx * k, dy * k, 1.0).normalize();
+                let mut nn = Vec3::new(-dx * k, dy * k, 1.0).normalize();
+                if let Some(t) = tnorm.get(y as usize * n + x as usize) {
+                    // whiteout blend of the bump and the Normal Map node
+                    nn = Vec3::new(nn.x + t.x, nn.y + t.y, nn.z * t.z.max(0.0)).normalize_or(Vec3::Z);
+                }
                 let e = |c: f32| ((c * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
                 rgba.push([e(nn.x), e(nn.y), e(nn.z), 255]);
             }
@@ -678,17 +856,196 @@ pub fn bake(g: &NodeGraph, base: crate::scene::Material, size: usize, shade_bump
     Baked { color, mr: drives_mr.then(|| crate::textures::TexImage { w: n, h: n, rgba: mr }), normal }
 }
 
+/// Bake an Object-coordinate graph's colour into a mesh's own UV layout: every texel evaluates
+/// the graph at the 3D point it covers (like Blender's bake), so the raster previews match the
+/// path tracer without UV seams. Edges are dilated a few texels so filtering doesn't bleed.
+pub fn bake_object(g: &NodeGraph, base: crate::scene::Material, mesh: &crate::mesh::Mesh, size: usize, tex: &(dyn Fn(u32, Vec2) -> Option<[f32; 4]> + Sync)) -> crate::textures::TexImage {
+    let n = size.max(4);
+    // texel → (uv, local position), first triangle wins
+    let mut at: Vec<Option<(Vec2, Vec3)>> = vec![None; n * n];
+    for (ti, t) in mesh.tris.iter().enumerate() {
+        let Some(uv) = mesh.tri_uv.get(ti) else { continue };
+        let q = uv.map(|c| Vec2::new(c[0] * n as f32, c[1] * n as f32));
+        let p = t.map(|i| mesh.positions[i as usize]);
+        let (lo, hi) = (q[0].min(q[1]).min(q[2]), q[0].max(q[1]).max(q[2]));
+        let area = (q[1] - q[0]).perp_dot(q[2] - q[0]);
+        if area.abs() < 1e-9 || (hi - lo).max_element() > 4.0 * n as f32 {
+            continue;
+        }
+        // conservative: include texels whose centre is within half a texel of the triangle
+        let pad = 0.75 / area.abs().sqrt().max(1.0);
+        for y in (lo.y.floor() as i64 - 1)..=(hi.y.ceil() as i64) {
+            for x in (lo.x.floor() as i64 - 1)..=(hi.x.ceil() as i64) {
+                let c = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                let w1 = (c - q[0]).perp_dot(q[2] - q[0]) / area;
+                let w2 = (q[1] - q[0]).perp_dot(c - q[0]) / area;
+                let w0 = 1.0 - w1 - w2;
+                if w0 < -pad || w1 < -pad || w2 < -pad {
+                    continue;
+                }
+                let idx = y.rem_euclid(n as i64) as usize * n + x.rem_euclid(n as i64) as usize;
+                if at[idx].is_none() {
+                    let (w0, w1, w2) = (w0.clamp(0.0, 1.0), w1.clamp(0.0, 1.0), w2.clamp(0.0, 1.0));
+                    let ws = (w0 + w1 + w2).max(1e-6);
+                    let pos = (p[0] * w0 + p[1] * w1 + p[2] * w2) / ws;
+                    at[idx] = Some((c / n as f32, pos));
+                }
+            }
+        }
+    }
+    let fallback = Vec3::from(base.color);
+    let mut col: Vec<Option<Vec3>> = vec![None; n * n];
+    let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(4).clamp(1, 16);
+    let chunk = (n * n).div_ceil(threads);
+    std::thread::scope(|sc| {
+        for (src, dst) in at.chunks(chunk).zip(col.chunks_mut(chunk)) {
+            sc.spawn(move || {
+                for (a, d) in src.iter().zip(dst.iter_mut()) {
+                    if let Some((uv, pos)) = a {
+                        *d = Some(g.eval(*uv, *pos, tex).color.unwrap_or(fallback));
+                    }
+                }
+            });
+        }
+    });
+    // dilate into the gutters
+    for _ in 0..4 {
+        let prev = col.clone();
+        for y in 0..n {
+            for x in 0..n {
+                if prev[y * n + x].is_some() {
+                    continue;
+                }
+                let (mut sum, mut k) = (Vec3::ZERO, 0);
+                for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                    let (xx, yy) = ((x as i64 + dx).rem_euclid(n as i64) as usize, (y as i64 + dy).rem_euclid(n as i64) as usize);
+                    if let Some(c) = prev[yy * n + xx] {
+                        sum += c;
+                        k += 1;
+                    }
+                }
+                if k > 0 {
+                    col[y * n + x] = Some(sum / k as f32);
+                }
+            }
+        }
+    }
+    let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    crate::textures::TexImage { w: n, h: n, rgba: col.iter().map(|c| c.unwrap_or(fallback)).map(|c| [q(c.x), q(c.y), q(c.z), 255]).collect() }
+}
+
+/// A small lit sphere showing the graph's real result (colour, roughness, metallic, emission and
+/// bumps) for the Material tab; RGBA8, transparent around the ball. Object coordinates are the
+/// unit sphere, UVs a latitude/longitude mapping.
+pub fn preview_ball(g: &NodeGraph, base: crate::scene::Material, size: usize, tex: &dyn Fn(u32, Vec2) -> Option<[f32; 4]>) -> Vec<u8> {
+    let n = size.max(8);
+    let mut out = vec![0u8; n * n * 4];
+    let light = Vec3::new(-0.55, -0.7, 0.65).normalize();
+    // towards the viewer (who looks along +Y)
+    let view = Vec3::new(0.0, -1.0, 0.0);
+    let lin = |c: Vec3| Vec3::new(c.x.max(0.0).powf(2.2), c.y.max(0.0).powf(2.2), c.z.max(0.0).powf(2.2));
+    let uv_of = |p: Vec3| Vec2::new(p.y.atan2(p.x) / std::f32::consts::TAU + 0.5, p.z.clamp(-1.0, 1.0).acos() / std::f32::consts::PI);
+    for y in 0..n {
+        for x in 0..n {
+            let sx = (x as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+            let sy = 1.0 - (y as f32 + 0.5) / n as f32 * 2.0;
+            let r = (sx * sx + sy * sy).sqrt();
+            let cover = ((1.0 - r) * n as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
+            if cover <= 0.0 {
+                continue;
+            }
+            let rr = r.min(0.999);
+            let (sx, sy) = if r > 0.999 { (sx / r * rr, sy / r * rr) } else { (sx, sy) };
+            let mut nrm = Vec3::new(sx, -(1.0 - sx * sx - sy * sy).max(0.0).sqrt(), sy).normalize();
+            let p = nrm;
+            let uv = uv_of(p);
+            let s = g.eval(uv, p, tex);
+            if let Some(h0) = s.height {
+                // bump over the sphere's surface frame
+                let tu = Vec3::Z.cross(nrm).normalize_or(Vec3::X);
+                let tv = nrm.cross(tu);
+                let e = 0.004;
+                let hu = g.height(uv_of((p + tu * e).normalize()), p + tu * e, tex);
+                let hv = g.height(uv_of((p + tv * e).normalize()), p + tv * e, tex);
+                let grad = tu * ((hu - h0) / e) + tv * ((hv - h0) / e);
+                nrm = (nrm - grad * (s.bump * 0.05)).normalize_or(nrm);
+            }
+            let alb = lin(s.color.unwrap_or(Vec3::from(base.color)));
+            let rough = s.roughness.unwrap_or(base.roughness).clamp(0.04, 1.0);
+            let metal = s.metallic.unwrap_or(base.metallic).clamp(0.0, 1.0);
+            let emit = s.emission.unwrap_or(base.emission);
+            let ndl = nrm.dot(light).max(0.0);
+            let h = (light + view).normalize();
+            let shin = 2.0 / (rough * rough) + 2.0;
+            let f0 = Vec3::splat(0.04).lerp(alb, metal);
+            let nv = nrm.dot(view).max(0.0);
+            let fres = f0 + (Vec3::ONE - f0) * (1.0 - nv).powf(5.0);
+            let spec = fres * nrm.dot(h).max(0.0).powf(shin) * (shin + 8.0) / 25.0 * ndl;
+            let env = fres * (1.0 - rough * 0.7) * (0.25 + 0.2 * nrm.z);
+            let c = alb * (1.0 - metal) * (0.12 + 0.1 * (0.5 + 0.5 * nrm.z) + ndl * 1.1) + spec + env + alb * emit;
+            let c = Vec3::new(c.x.max(0.0).powf(1.0 / 2.2), c.y.max(0.0).powf(1.0 / 2.2), c.z.max(0.0).powf(1.0 / 2.2));
+            let i = (y * n + x) * 4;
+            let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            out[i..i + 4].copy_from_slice(&[q(c.x), q(c.y), q(c.z), q(cover)]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn object_coords_gradient_huesat_normalmap() {
+        let none = |_: u32, _: Vec2| None;
+        // object coords: same UV, different 3D points give different results; same point, any UV, same
+        let g = NodeGraph::preset(1, "granite").unwrap();
+        assert!(g.uses_object_coords());
+        let a = g.eval(Vec2::ZERO, Vec3::new(0.1, 0.2, 0.3), &none).color.unwrap();
+        let b = g.eval(Vec2::ZERO, Vec3::new(0.7, -0.4, 0.9), &none).color.unwrap();
+        let a2 = g.eval(Vec2::new(0.9, 0.9), Vec3::new(0.1, 0.2, 0.3), &none).color.unwrap();
+        assert!((a - b).length() > 1e-3 && (a - a2).length() < 1e-6);
+        // the z axis matters (true 3D noise)
+        let c = g.eval(Vec2::ZERO, Vec3::new(0.1, 0.2, 0.8), &none).color.unwrap();
+        assert!((a - c).length() > 1e-3);
+        // gradient (linear over x) → output colour
+        let mut g = NodeGraph::basic(2, "grad", [1.0; 3]);
+        let out = g.output().unwrap().id;
+        let co = g.add(NodeKind::Coords { scale: 1.0, rotate: 0.0, object: false }, [0.0, 0.0]);
+        let gr = g.add(NodeKind::Gradient { mode: GradMode::Linear }, [0.0, 0.0]);
+        g.connect((co, 0), (gr, 0));
+        g.connect((gr, 0), (out, 0));
+        let l = g.eval(Vec2::new(0.2, 0.5), Vec3::ZERO, &none).color.unwrap();
+        let r = g.eval(Vec2::new(0.8, 0.5), Vec3::ZERO, &none).color.unwrap();
+        assert!((l.x - 0.2).abs() < 0.02 && (r.x - 0.8).abs() < 0.02, "{l} {r}");
+        // hue/sat: saturation 0 → grey
+        let hs = hsv_adjust(Vec3::new(1.0, 0.2, 0.1), 0.0, 0.0, 1.0);
+        assert!((hs.x - hs.y).abs() < 1e-4 && (hs.y - hs.z).abs() < 1e-4);
+        let rot = hsv_adjust(Vec3::new(1.0, 0.0, 0.0), 1.0 / 3.0, 1.0, 1.0);
+        assert!(rot.y > 0.9 && rot.x < 0.1, "red + 120° = green, got {rot}");
+        // normal map node → Shade.normal and the baked normal texture
+        let mut g = NodeGraph::basic(3, "nm", [1.0; 3]);
+        let out = g.output().unwrap().id;
+        let rgb = g.add(NodeKind::Rgb { color: [0.8, 0.5, 0.9] }, [0.0, 0.0]);
+        let nm = g.add(NodeKind::NormalMap { strength: 1.0 }, [0.0, 0.0]);
+        g.connect((rgb, 0), (nm, 0));
+        assert!(g.connect((nm, 0), (out, 5)));
+        let s = g.eval(Vec2::ZERO, Vec3::ZERO, &none);
+        let n = s.normal.unwrap();
+        assert!(n.x > 0.3 && n.z > 0.5 && (n.length() - 1.0).abs() < 1e-3, "{n}");
+        let bk = bake(&g, crate::scene::Material::default(), 8, false, &none);
+        let px = bk.normal.expect("normal baked").rgba[0];
+        assert!(px[0] > 160, "tilted toward +x: {px:?}");
+    }
+
     #[test]
     fn presets_evaluate_and_bake() {
         let none = |_: u32, _: Vec2| None;
         for p in PRESETS {
             let g = NodeGraph::preset(1, p).unwrap_or_else(|| panic!("{p}"));
             assert_eq!(g.name, *p);
-            let a = g.eval(Vec2::new(0.1, 0.2), &none);
-            let b = g.eval(Vec2::new(0.6, 0.7), &none);
+            let a = g.eval(Vec2::new(0.1, 0.2), Vec3::ZERO, &none);
+            let b = g.eval(Vec2::new(0.6, 0.7), Vec3::ZERO, &none);
             assert!(a.color.is_some(), "{p} drives the colour");
             assert!(a.color.unwrap().is_finite() && b.color.unwrap().is_finite());
             let bk = bake(&g, crate::scene::Material::default(), 32, true, &none);
@@ -707,8 +1064,8 @@ mod tests {
         assert!(!g.connect((m, 0), (m, 1)), "self link");
         let out = g.output().unwrap().id;
         assert!(g.connect((m, 0), (out, 1)));
-        assert!((g.eval(Vec2::ZERO, &none).roughness.unwrap() - 0.3).abs() < 1e-6);
+        assert!((g.eval(Vec2::ZERO, Vec3::ZERO, &none).roughness.unwrap() - 0.3).abs() < 1e-6);
         g.remove_node(m);
-        assert!(g.eval(Vec2::ZERO, &none).roughness.is_none());
+        assert!(g.eval(Vec2::ZERO, Vec3::ZERO, &none).roughness.is_none());
     }
 }

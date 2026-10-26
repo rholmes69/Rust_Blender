@@ -9,6 +9,8 @@ mod armature;
 mod scatter;
 mod hair;
 mod templates;
+mod character;
+mod pencil;
 mod assets;
 mod shapekeys;
 mod physics;

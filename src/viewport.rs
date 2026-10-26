@@ -213,6 +213,7 @@ pub struct Viewport {
     pose_ui: pose::PoseUi,
     weight_ui: weightpaint::WeightUi,
     groom_ui: groom::GroomUi,
+    pencil_ui: pencil_ui::PencilUi,
     bone_ui: boneedit::BoneEditUi,
     /// (armature in edit mode, active bone, selected part) while building the frame
     bone_edit_draw: Option<(u64, usize, crate::armature::BonePart)>,
@@ -302,6 +303,7 @@ impl Default for Viewport {
             pose_ui: Default::default(),
             weight_ui: Default::default(),
             groom_ui: Default::default(),
+            pencil_ui: Default::default(),
             bone_ui: Default::default(),
             bone_edit_draw: None,
             pose_draw: None,
@@ -353,6 +355,7 @@ mod sculpt;
 mod pose;
 mod weightpaint;
 mod groom;
+mod pencil_ui;
 mod boneedit;
 mod knife;
 
@@ -836,7 +839,8 @@ impl Viewport {
             );
         }
         self.draw_cursor(&painter);
-        if ed.sculpt.is_none() && ed.weight_paint.is_none() && ed.hair_edit.is_none() {
+        self.draw_pencil(&painter, ui, ed);
+        if ed.sculpt.is_none() && ed.weight_paint.is_none() && ed.hair_edit.is_none() && ed.pencil_draw.is_none() {
             self.draw_gizmo(&painter, ed);
         }
         self.draw_sculpt_cursor(&painter, ui, ed);
@@ -1964,6 +1968,7 @@ impl Viewport {
                 }
             }
         }
+        crate::pencil::composite(&mut rgba, width, height, &cam, &crate::pencil::world_strokes(&ed.scene, false));
         RenderResult {
             width,
             height,
@@ -2500,6 +2505,7 @@ impl Viewport {
                     let posing = ed.pose.is_some();
                     let painting = ed.weight_paint.is_some();
                     let grooming = ed.hair_edit.is_some();
+                    let drawing = ed.pencil_draw.is_some();
                     let hair_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.hair.is_some() || ed.scene.objects.iter().any(|h| h.hair.as_ref().is_some_and(|hh| hh.target == o.id)));
                     let arm_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.armature.is_some());
                     let rigged_active = ed.active.and_then(|id| ed.scene.get(id)).is_some_and(|o| o.skin.is_some());
@@ -2513,6 +2519,8 @@ impl Viewport {
                         "⚖ Weight Paint"
                     } else if grooming {
                         "〰 Hair Edit"
+                    } else if drawing {
+                        "✏ Draw Mode"
                     } else {
                         "▣ Object Mode"
                     };
@@ -2521,7 +2529,7 @@ impl Viewport {
                         .selected_text(egui::RichText::new(label).size(12.5).color(if editing { Color32::from_rgb(255, 170, 90) } else if sculpting { Color32::from_rgb(140, 200, 255) } else { theme::TEXT }))
                         .width(118.0)
                         .show_ui(ui, |ui| {
-                            if ui.selectable_label(!editing && !sculpting && !posing && !painting && !grooming, "▣ Object Mode").clicked() {
+                            if ui.selectable_label(!editing && !sculpting && !posing && !painting && !grooming && !drawing, "▣ Object Mode").clicked() {
                                 pick = Some(0);
                             }
                             if ui.selectable_label(editing, "✎ Edit Mode   Tab").clicked() {
@@ -2544,9 +2552,16 @@ impl Viewport {
                                     pick = Some(5);
                                 }
                             }
+                            if ui.selectable_label(drawing, "✏ Draw (Grease Pencil)").clicked() {
+                                pick = Some(6);
+                            }
                         });
                     match pick {
                         Some(0) => ed.exit_edit(),
+                        Some(6) if !drawing => {
+                            let r = ed.toggle_draw();
+                            self.report(r);
+                        }
                         Some(5) if !grooming => {
                             let r = ed.toggle_groom();
                             self.report(r);
@@ -2592,6 +2607,10 @@ impl Viewport {
                     if grooming {
                         ui.separator();
                         self.groom_header(ui, ed);
+                    }
+                    if drawing {
+                        ui.separator();
+                        self.pencil_header(ui, ed);
                     }
                     if let Some(st) = ed.edit.as_mut() {
                         ui.separator();
@@ -3164,6 +3183,14 @@ impl Viewport {
         if ed.weight_paint.is_some() {
             self.gizmo_hover = None;
             if self.weight_input(&ctx, resp, ed, mouse, shift, ctrl) {
+                return;
+            }
+        }
+
+        // ---------- grease pencil ----------
+        if ed.pencil_draw.is_some() {
+            self.gizmo_hover = None;
+            if self.pencil_input(&ctx, resp, ed, mouse, ctrl) {
                 return;
             }
         }

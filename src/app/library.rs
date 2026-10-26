@@ -51,7 +51,7 @@ pub const TEMPLATE_THUMB: (usize, usize) = (224, 126);
 pub const ASSET_THUMB: usize = 112;
 
 fn template_key(name: &str) -> String {
-    format!("template:{name}:v2")
+    format!("template:{name}:v3")
 }
 
 impl Library {

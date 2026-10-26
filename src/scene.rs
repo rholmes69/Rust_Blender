@@ -247,6 +247,9 @@ pub struct Object {
     /// Copies of another object spread over a surface (the mesh is derived into `posed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scatter: Option<crate::scatter::Scatter>,
+    /// Grease Pencil drawings (on an Empty object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pencil: Option<crate::pencil::Pencil>,
     /// Hair / fur grown from another object's surface (strands derived into `posed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hair: Option<crate::hair::Hair>,
@@ -324,7 +327,7 @@ impl Object {
             ObjectKind::Mesh => self.primitive.label().to_string(),
             ObjectKind::Light(l) => format!("{} Light", l.light_type.label()),
             ObjectKind::Camera(_) => "Camera".into(),
-            ObjectKind::Empty => "Empty".into(),
+            ObjectKind::Empty => if self.pencil.is_some() { "Grease Pencil".into() } else { "Empty".into() },
             ObjectKind::Armature => format!("Armature, {} bones", self.armature.as_ref().map(|a| a.bones.len()).unwrap_or(0)),
         }
     }
@@ -690,6 +693,7 @@ impl Scene {
             sim_frame: 0,
             scatter: None,
             hair: None,
+            pencil: None,
             posed: None,
             posed_key: 0,
         });

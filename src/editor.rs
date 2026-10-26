@@ -68,6 +68,8 @@ pub struct Editor {
     pub weight_paint: Option<u64>,
     /// Hair object being groomed (Hair Edit mode).
     pub hair_edit: Option<u64>,
+    /// Grease Pencil object being drawn on (Draw mode).
+    pub pencil_draw: Option<u64>,
     /// Armature in Edit Mode (rest bones) and the selected part of `active_bone`.
     pub bone_edit: Option<u64>,
     pub bone_part: crate::armature::BonePart,
@@ -105,6 +107,7 @@ impl Default for Editor {
             active_bone: 0,
             weight_paint: None,
             hair_edit: None,
+            pencil_draw: None,
             bone_edit: None,
             bone_part: Default::default(),
             shape_edit: None,
@@ -799,6 +802,11 @@ impl Editor {
         if let Some(id) = self.hair_edit {
             if !self.scene.get(id).is_some_and(|o| o.hair.is_some()) {
                 self.hair_edit = None;
+            }
+        }
+        if let Some(id) = self.pencil_draw {
+            if !self.scene.get(id).is_some_and(|o| o.pencil.is_some()) {
+                self.pencil_draw = None;
             }
         }
         if let Some(id) = self.pose {
@@ -2104,7 +2112,75 @@ impl Editor {
                 let p = crate::assets::save(&dir, &a, None)?;
                 Ok(format!("Saved {} \"{name}\" to the asset library ({})", if mat_only { "material" } else { "asset" }, p.display()))
             }
+            "add_character" | "character" | "add_person" | "add_human" => {
+                let at = c.location.as_ref().and_then(|v| self.resolve_point(v)).unwrap_or(Vec3::ZERO);
+                let name = c.name.clone().unwrap_or_else(|| "Character".into());
+                let color = c.color.as_ref().and_then(parse_color).unwrap_or([0.78, 0.6, 0.48]);
+                let (arm, body) = crate::character::add(&mut self.scene, &name, at, color);
+                self.reset_parent_cache();
+                let mut msg = format!("Added \"{}\" with a {}-bone rig and actions {}", self.scene.get(body).unwrap().name, crate::character::BONES.len(), crate::character::ACTIONS.join(", "));
+                if c.align == Some(true) || c.modifier.as_deref().is_some_and(|m| m.contains("hair")) {
+                    let (scalp, hair) = crate::character::add_hair(&mut self.scene, body, [0.25, 0.14, 0.07]);
+                    let _ = (scalp, hair);
+                    msg += " and hair";
+                }
+                self.select_only(arm);
+                Ok(msg + " — play_action to animate it")
+            }
             "groom" | "hair_edit" | "comb_hair" | "groom_hair" => self.toggle_groom(),
+            "draw_mode" | "grease_pencil" | "annotate" => {
+                if self.pencil_draw.is_some() && c.name.as_deref() != Some("off") {
+                    return Ok("Already in Draw mode".into());
+                }
+                self.toggle_draw()
+            }
+            "draw" | "draw_line" | "sketch" | "draw_arrow" | "arrow" | "draw_circle" | "circle" => {
+                let color = c.color.as_ref().and_then(parse_color).unwrap_or([0.08, 0.08, 0.08]);
+                let width = c.number.map(|n| n as f32 / 100.0).unwrap_or(0.015).clamp(0.0005, 1.0);
+                let kind = c.name.clone().unwrap_or_default().to_lowercase();
+                let arrow = c.action.contains("arrow") || kind.contains("arrow");
+                let circle = c.action.contains("circle") || kind.contains("circle");
+                let pts: Vec<Vec3> = if circle {
+                    let centre = c.location.as_ref().and_then(|v| self.resolve_point(v)).unwrap_or(Vec3::ZERO);
+                    let r = vec3_or_scalar(&c.scale).map(|v| v.x).unwrap_or(1.0).max(0.01);
+                    (0..=48).map(|i| {
+                        let a = i as f32 / 48.0 * std::f32::consts::TAU;
+                        centre + Vec3::new(a.cos() * r, a.sin() * r, 0.0)
+                    }).collect()
+                } else if arrow && c.look_at.is_some() {
+                    let a = c.location.as_ref().and_then(|v| self.resolve_point(v)).ok_or("arrow needs location = start")?;
+                    let b = c.look_at.as_ref().and_then(|v| self.resolve_point(v)).ok_or("arrow needs look_at = end")?;
+                    vec![a, b]
+                } else {
+                    let list = c.vector.as_ref().and_then(|v| v.as_array()).ok_or("draw needs vector = [[x,y,z], …] points")?;
+                    list.iter().filter_map(|p| vec3(&Some(p.clone()))).collect()
+                };
+                if pts.len() < 2 {
+                    return Err("draw needs at least two points".into());
+                }
+                let id = c.target.as_deref().and_then(|t| self.scene.find_by_name(t)).filter(|id| self.scene.get(*id).is_some_and(|o| o.pencil.is_some())).or_else(|| self.pencil_object(true)).unwrap();
+                let frame = self.frame;
+                let o = self.scene.get_mut(id).unwrap();
+                let inv = o.transform.matrix().inverse();
+                let local: Vec<Vec3> = pts.iter().map(|p| inv.transform_point3(*p)).collect();
+                let end = *pts.last().unwrap();
+                let facing = self.scene.objects.iter().find(|o| matches!(o.kind, crate::scene::ObjectKind::Camera(_))).map(|cam| cam.transform.location - end).unwrap_or(Vec3::new(0.0, -1.0, 0.3));
+                let o = self.scene.get_mut(id).unwrap();
+                let facing = inv.transform_vector3(facing);
+                let strokes = crate::pencil::line(&local, [color[0], color[1], color[2], 1.0], width, arrow, facing);
+                let n = strokes.len();
+                o.pencil.as_mut().unwrap().target(frame, false).strokes.extend(strokes);
+                o.sim_frame = frame;
+                Ok(format!("Drew {} in \"{}\" ({n} stroke{})", if circle { "a circle" } else if arrow { "an arrow" } else { "a line" }, o.name, if n == 1 { "" } else { "s" }))
+            }
+            "clear_drawing" | "erase_drawing" | "clear_pencil" => {
+                let id = self.pencil_object(false).ok_or("there is no drawing")?;
+                let o = self.scene.get_mut(id).unwrap();
+                let p = o.pencil.as_mut().unwrap();
+                let n = p.stroke_count();
+                *p = Default::default();
+                Ok(format!("Cleared {n} strokes from \"{}\"", o.name))
+            }
             "hair_dynamics" | "bake_hair" | "simulate_hair" => {
                 let id = c
                     .target
@@ -2593,6 +2669,7 @@ impl Editor {
         self.pose = None;
         self.weight_paint = None;
         self.hair_edit = None;
+        self.pencil_draw = None;
         self.edit = Some(EditState {
             obj: id,
             mode: SelectMode::Vertex,
@@ -2609,6 +2686,38 @@ impl Editor {
         self.pose = None;
         self.weight_paint = None;
         self.hair_edit = None;
+        self.pencil_draw = None;
+    }
+
+    /// The Grease Pencil object to draw into: the active one, else the first, else a new one.
+    pub fn pencil_object(&mut self, create: bool) -> Option<u64> {
+        let is_p = |ed: &Editor, id: u64| ed.scene.get(id).is_some_and(|o| o.pencil.is_some());
+        if let Some(a) = self.active.filter(|a| is_p(self, *a)) {
+            return Some(a);
+        }
+        if let Some(o) = self.scene.objects.iter().find(|o| o.pencil.is_some()) {
+            return Some(o.id);
+        }
+        if !create {
+            return None;
+        }
+        let id = self.scene.add_empty(Some("Drawing"));
+        let o = self.scene.get_mut(id).unwrap();
+        o.pencil = Some(Default::default());
+        o.sim_frame = self.frame;
+        Some(id)
+    }
+
+    /// Enter / leave Draw mode (Grease Pencil) — creates a drawing object when there is none.
+    pub fn toggle_draw(&mut self) -> Result<String, String> {
+        if self.pencil_draw.take().is_some() {
+            return Ok("Object mode".into());
+        }
+        let id = self.pencil_object(true).unwrap();
+        self.exit_edit();
+        self.select_only(id);
+        self.pencil_draw = Some(id);
+        Ok(format!("Draw mode: \"{}\" — draw with the left mouse button", self.scene.get(id).unwrap().name))
     }
 
     /// Enter / leave Hair Edit (grooming) on the active hair object, or the hair of the active mesh.
@@ -2649,6 +2758,7 @@ impl Editor {
         self.pose = None;
         self.bone_edit = None;
         self.hair_edit = None;
+        self.pencil_draw = None;
         self.select_only(id);
         self.weight_paint = Some(id);
         let o = self.scene.get(id).unwrap();
@@ -2672,6 +2782,7 @@ impl Editor {
         self.sculpt = None;
         self.weight_paint = None;
         self.hair_edit = None;
+        self.pencil_draw = None;
         self.bone_edit = None;
         self.select_only(id);
         self.pose = Some(id);
@@ -2690,6 +2801,7 @@ impl Editor {
         self.pose = None;
         self.weight_paint = None;
         self.hair_edit = None;
+        self.pencil_draw = None;
         let name = o.name.clone();
         let mut pm = o.poly();
         let before = pm.verts.len();
@@ -2703,7 +2815,7 @@ impl Editor {
     }
 
     pub fn toggle_edit(&mut self) -> Result<String, String> {
-        if self.pose.take().is_some() || self.weight_paint.take().is_some() || self.bone_edit.take().is_some() || self.hair_edit.take().is_some() {
+        if self.pose.take().is_some() || self.weight_paint.take().is_some() || self.bone_edit.take().is_some() || self.hair_edit.take().is_some() || self.pencil_draw.take().is_some() {
             return Ok("Object mode".into());
         }
         if let Some(id) = self.active.filter(|id| self.scene.get(*id).is_some_and(|o| o.armature.is_some())) {
@@ -3693,6 +3805,35 @@ mod tests {
         ed.undo();
         assert!(ed.scene.find_by_name("Vase.001").is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn character_and_pencil_commands() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"add_character","name":"Bob","location":[2,0,0],"modifier":"hair"}"#),
+            cmd(r#"{"action":"play_action","target":"Bob Rig","name":"wave"}"#),
+            cmd(r#"{"action":"draw_arrow","location":[0,-3,1],"look_at":"Bob","color":"red"}"#),
+            cmd(r#"{"action":"draw","vector":[[0,0,0],[1,0,0],[1,1,0]],"number":3}"#),
+            cmd(r#"{"action":"draw_circle","location":[2,0,0],"scale":0.8}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        assert!(ed.scene.find_by_name("Bob Hair").is_some());
+        let rig = ed.scene.get(ed.scene.find_by_name("Bob Rig").unwrap()).unwrap();
+        let arm = rig.armature.as_ref().unwrap();
+        assert_eq!(arm.actions[arm.active_action].name, "Wave");
+        let d = ed.scene.objects.iter().find(|o| o.pencil.is_some()).unwrap();
+        let p = d.pencil.as_ref().unwrap();
+        assert_eq!(p.stroke_count(), 3 + 1 + 1, "arrow = shaft + 2 head strokes");
+        assert!((p.drawings[0].strokes[3].width - 0.03).abs() < 1e-6);
+        assert_eq!(crate::pencil::world_strokes(&ed.scene, false).len(), 5);
+        // draw mode toggles, a frame-by-frame drawing goes to its own frame
+        assert!(ed.execute(&[cmd(r#"{"action":"draw_mode"}"#)])[0].starts_with('✔'));
+        assert!(ed.pencil_draw.is_some());
+        ed.exit_edit();
+        assert!(ed.pencil_draw.is_none());
+        assert!(ed.execute(&[cmd(r#"{"action":"clear_drawing"}"#)])[0].starts_with('✔'));
+        assert_eq!(ed.scene.objects.iter().find(|o| o.pencil.is_some()).unwrap().pencil.as_ref().unwrap().stroke_count(), 0);
     }
 
     #[test]

@@ -360,7 +360,7 @@ pub fn delete(p: &Path) -> Result<(), String> {
 // Built-in assets
 // ---------------------------------------------------------------------------------------------
 
-pub const BUILTIN_OBJECTS: &[&str] = &["Vase", "Rock", "Pine Tree", "Bush", "Flower", "Table", "Chair", "Furry Ball", "Domino", "Lamp"];
+pub const BUILTIN_OBJECTS: &[&str] = &["Character", "Character with Hair", "Vase", "Rock", "Pine Tree", "Bush", "Flower", "Table", "Chair", "Furry Ball", "Domino", "Lamp"];
 
 pub const BUILTIN_MATERIALS: &[&str] = &[
     "Gold", "Chrome", "Copper", "Glass", "Red Plastic", "Rubber", "Ceramic", "Neon Glow", "Rusty Metal", "Wood", "Wood Floor", "Marble", "Cobblestone", "Lava", "Bricks", "Tiles", "Granite",
@@ -397,6 +397,13 @@ pub fn builtin(name: &str) -> Option<Asset> {
         ed.execute(&c);
     };
     let roots: Vec<u64> = match low.as_str() {
+        "character" | "character with hair" => {
+            let (arm, body) = crate::character::add(&mut ed.scene, "Character", Vec3::ZERO, [0.78, 0.6, 0.48]);
+            if low.contains("hair") {
+                crate::character::add_hair(&mut ed.scene, body, [0.25, 0.14, 0.07]);
+            }
+            vec![arm]
+        }
         "vase" => {
             let id = ed.scene.add(Primitive::Cylinder, Some("Vase"));
             let o = ed.scene.get_mut(id).unwrap();

@@ -21,6 +21,7 @@ pub const TEMPLATES: &[Template] = &[
     Template { name: "Interior", blurb: "A sunlit room with a wooden floor, a table and a lamp." },
     Template { name: "Physics Playground", blurb: "Dominoes, a block tower and a ball — press Play." },
     Template { name: "Hair & Fur", blurb: "A furry ball, long hair and grass in the studio." },
+    Template { name: "Character", blurb: "A rigged mannequin with hair and Idle, Walk, Run, Wave and Jump actions." },
 ];
 
 fn cmd(json: &str) -> Command {
@@ -407,6 +408,15 @@ pub fn build(name: &str) -> Option<Scene> {
             ed.scene.get_mut(id).unwrap().rigid = Some(crate::physics::RigidBody { passive: true, ..Default::default() });
         }
         run(&mut ed, &[r#"{"action":"bake_physics"}"#]);
+    } else if low.contains("character") || low.contains("person") || low.contains("human") {
+        studio(&mut ed);
+        let (arm, body) = crate::character::add(&mut ed.scene, "Character", Vec3::ZERO, [0.78, 0.6, 0.48]);
+        let (_, hair) = crate::character::add_hair(&mut ed.scene, body, [0.25, 0.14, 0.07]);
+        ed.reset_parent_cache();
+        let an = ed.scene.get(arm).unwrap().name.clone();
+        run(&mut ed, &[&format!(r#"{{"action":"set_action","target":"{an}","name":"Walk"}}"#), r#"{"action":"set_transform","target":"Camera","location":[1.3,-4.6,1.35]}"#, r#"{"action":"look_at","target":"Camera","look_at":[0,0,0.95]}"#]);
+        let _ = ed.bake_hair(hair);
+        ed.set_frame(ed.scene.frame_start);
     } else if low.contains("hair") || low.contains("fur") {
         studio(&mut ed);
         run(&mut ed, &[

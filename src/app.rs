@@ -2299,6 +2299,29 @@ impl App {
                         ui.menu_button("Add", |ui| {
                             self.add_menu_items(ui);
                             ui.separator();
+                            if ui.button("🧍 Character (rigged, with actions)").clicked() {
+                                let at = self.vp.cursor;
+                                let log = self.ed.execute(&[Command { action: "add_character".into(), location: Some(serde_json::json!([at.x, at.y, at.z])), ..Default::default() }]);
+                                if let Some(l) = log.first() {
+                                    self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                                }
+                                ui.close();
+                            }
+                            if ui.button("✏ Grease Pencil drawing").clicked() {
+                                self.ed.snapshot();
+                                let id = self.ed.scene.add_empty(Some("Drawing"));
+                                let f = self.ed.frame;
+                                let o = self.ed.scene.get_mut(id).unwrap();
+                                o.pencil = Some(Default::default());
+                                o.sim_frame = f;
+                                self.ed.select_only(id);
+                                let r = self.ed.toggle_draw();
+                                if let Ok(m) = r {
+                                    self.toast(m, theme::OK);
+                                }
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui.button("📚 Asset Library…   Shift+F1").clicked() {
                                 self.lib.show_assets = true;
                                 ui.close();

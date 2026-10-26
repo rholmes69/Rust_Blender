@@ -42,6 +42,8 @@ struct Light {
 
 /// Everything the tracer needs, gathered on the UI thread.
 pub struct PtScene {
+    /// Grease Pencil strokes drawn over the result.
+    pencil: Vec<crate::pencil::WStroke>,
     bvh: Bvh,
     shadow_bvh: Bvh,
     /// per triangle: corner normals, corner UVs, material index
@@ -199,6 +201,7 @@ impl PtScene {
         let bg = scene.world.background;
         let n = tris.len();
         PtScene {
+            pencil: crate::pencil::world_strokes(scene, false),
             bvh: Bvh::new(tris),
             shadow_bvh: Bvh::new(opaque),
             normals,
@@ -685,7 +688,9 @@ pub fn start(scene: PtScene, w: usize, h: usize, samples: u32, denoised: bool, r
                     if dn {
                         last_denoise = std::time::Instant::now();
                     }
-                    if tx.send(PtUpdate { rgba: develop(&acc, w, h, done, dn), width: w, height: h, samples: done, total, secs: t0.elapsed().as_secs_f32() }).is_err() {
+                    let mut rgba = develop(&acc, w, h, done, dn);
+                    crate::pencil::composite(&mut rgba, w, h, &scene.cam, &scene.pencil);
+                    if tx.send(PtUpdate { rgba, width: w, height: h, samples: done, total, secs: t0.elapsed().as_secs_f32() }).is_err() {
                         return;
                     }
                     repaint();
@@ -702,7 +707,9 @@ pub fn render_blocking(scene: &PtScene, w: usize, h: usize, samples: u32, denois
     for s in 0..samples.max(1) {
         scene.pass(w, h, &mut acc, s);
     }
-    develop(&acc, w, h, samples.max(1), denoised)
+    let mut rgba = develop(&acc, w, h, samples.max(1), denoised);
+    crate::pencil::composite(&mut rgba, w, h, &scene.cam, &scene.pencil);
+    rgba
 }
 
 #[cfg(test)]

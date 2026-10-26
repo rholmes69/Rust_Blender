@@ -430,6 +430,12 @@ pub const ACTIONS: &[&str] = &[
     "hair",
     "groom",
     "hair_dynamics",
+    "add_character",
+    "draw",
+    "draw_arrow",
+    "draw_circle",
+    "clear_drawing",
+    "draw_mode",
     "template",
     "add_asset",
     "save_asset",
@@ -536,6 +542,14 @@ Each command is an object with "action" plus only the fields it needs:
   steepness in degrees (30 keeps things on flat ground), align = true to stand along the surface (planets),
   rotation = [tilt,tilt,spin]. Repeating it with the same target and name updates the scatter. realize: target
   = scatter object (bake to a real mesh). "a forest" = tree scatter; "a rocky field" = rock scatter.
+- add_character: a rigged humanoid mannequin (1.8 m, facing −Y) with actions Idle, Walk, Run, Wave, Jump;
+  name, location, color (skin/clothes); modifier = "hair" also gives it long hair. Then animate it with
+  play_action (target = its rig, name = Walk …). "add a person waving" = add_character + play_action Wave.
+- draw: Grease Pencil strokes drawn on top of the scene (they show in renders too) — vector = [[x,y,z], …]
+  points, color, number = thickness in cm (default 1.5); draw_arrow: location = start, look_at = end (point
+  or object name); draw_circle: location = centre, scale = radius (on the ground plane). Use for
+  annotations, storyboards and diagrams ("draw an arrow to the cube", "circle the tree in red").
+  clear_drawing removes all strokes; draw_mode enters freehand Draw mode for the user.
 - template: name = General | Empty | Product Shot | Turntable | Landscape | Interior | Physics Playground |
   Hair & Fur — REPLACES the whole scene with a ready-made one (studio, lights, camera, content). Only when the
   user asks for a new scene / a fresh start ("start a product shot", "new landscape scene").
@@ -1047,6 +1061,7 @@ pub fn parse_simple(text: &str) -> Option<Vec<Command>> {
         "new interior" | "interior scene" | "new room" | "start an interior" => return Some(vec![Command { action: "template".into(), name: Some("Interior".into()), ..Default::default() }]),
         "physics playground" | "new physics scene" => return Some(vec![Command { action: "template".into(), name: Some("Physics Playground".into()), ..Default::default() }]),
         "save as asset" | "save it as an asset" | "add to library" | "add it to the library" | "save to library" => return Some(vec![Command::new("save_asset")]),
+        "add a character" | "add character" | "add a person" | "add a human" | "add a mannequin" => return Some(vec![Command::new("add_character")]),
         "add fur" | "make it furry" | "furry" | "give it fur" => return Some(vec![Command { action: "hair".into(), name: Some("fur".into()), ..Default::default() }]),
         "add hair" | "give it hair" | "grow hair" => return Some(vec![Command { action: "hair".into(), name: Some("hair".into()), ..Default::default() }]),
         "remove hair" | "remove the hair" | "remove fur" | "remove the fur" | "shave it" => return Some(vec![Command { action: "hair".into(), name: Some("none".into()), ..Default::default() }]),

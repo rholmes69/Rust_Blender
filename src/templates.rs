@@ -211,7 +211,7 @@ fn studio(ed: &mut Editor) {
         r#"{"action":"look_at","target":"Camera","look_at":[0,0,0.85]}"#,
         r#"{"action":"set_background","color":[0.78,0.79,0.82]}"#,
     ]);
-    set_mesh(ed, "Backdrop", cyclorama(16.0, 12.0, 7.0, 2.5), true);
+    set_mesh(ed, "Backdrop", cyclorama(30.0, 14.0, 8.0, 2.5), true);
     let lights = [("Key Light", 1600.0, [1.0, 0.95, 0.88], 50.0), ("Fill Light", 300.0, [0.85, 0.9, 1.0], 0.0), ("Rim Light", 1200.0, [1.0, 1.0, 1.0], 40.0)];
     for (n, p, c, ang) in lights {
         if let Some(id) = ed.scene.find_by_name(n) {
@@ -410,11 +410,24 @@ pub fn build(name: &str) -> Option<Scene> {
         run(&mut ed, &[r#"{"action":"bake_physics"}"#]);
     } else if low.contains("character") || low.contains("person") || low.contains("human") {
         studio(&mut ed);
-        let (arm, body) = crate::character::add(&mut ed.scene, "Character", Vec3::ZERO, [0.78, 0.6, 0.48]);
+        let (arm, body) = crate::character::add(&mut ed.scene, "Character", Vec3::new(-1.6, 1.4, 0.0), [0.78, 0.6, 0.48]);
         let (_, hair) = crate::character::add_hair(&mut ed.scene, body, [0.25, 0.14, 0.07]);
         ed.reset_parent_cache();
         let an = ed.scene.get(arm).unwrap().name.clone();
-        run(&mut ed, &[&format!(r#"{{"action":"set_action","target":"{an}","name":"Walk"}}"#), r#"{"action":"set_transform","target":"Camera","location":[1.3,-4.6,1.35]}"#, r#"{"action":"look_at","target":"Camera","look_at":[0,0,0.95]}"#]);
+        // a little performance: idle, walk to the front, wave, idle
+        run(&mut ed, &[
+            r#"{"action":"set_frame","number":1}"#,
+            &format!(r#"{{"action":"perform","target":"{an}","name":"Idle","number":20}}"#),
+            &format!(r#"{{"action":"walk_to","target":"{an}","location":[0.3,-0.9,0]}}"#),
+            &format!(r#"{{"action":"perform","target":"{an}","name":"Wave"}}"#),
+            &format!(r#"{{"action":"perform","target":"{an}","name":"Idle","number":30}}"#),
+            r#"{"action":"set_transform","target":"Camera","location":[2.4,-6.2,1.6]}"#,
+            r#"{"action":"look_at","target":"Camera","look_at":[-0.4,0.2,0.9]}"#,
+        ]);
+        if let Some(a) = ed.scene.get(arm).and_then(|o| o.armature.as_ref()) {
+            let end = a.strips.iter().map(|s| s.end).max().unwrap_or(120);
+            ed.scene.frame_end = end;
+        }
         let _ = ed.bake_hair(hair);
         ed.set_frame(ed.scene.frame_start);
     } else if low.contains("hair") || low.contains("fur") {

@@ -381,7 +381,14 @@ impl Object {
             self.transform = t;
         }
         if let Some(a) = self.armature.as_mut() {
-            a.evaluate(frame as f32);
+            match a.home {
+                Some(home) if !a.strips.is_empty() => {
+                    if let Some(t) = crate::motion::evaluate(a, &home, frame as f32) {
+                        self.transform = t;
+                    }
+                }
+                _ => a.evaluate(frame as f32),
+            }
         }
         for k in &mut self.shape_keys {
             if let Some(v) = k.sample(frame as f32) {

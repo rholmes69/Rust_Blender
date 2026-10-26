@@ -4035,6 +4035,26 @@ impl App {
                         }
                         _ => {}
                     }
+                    if let Some(h) = ui.ctx().data_mut(|d| d.remove_temp::<crate::scene::Transform>(egui::Id::unique("rig_home_restore"))) {
+                        o.transform = h;
+                    }
+                    if let Some(a) = ui.ctx().data_mut(|d| d.remove_temp::<String>(egui::Id::unique("motion_action"))) {
+                        if o != orig {
+                            self.ed.snapshot();
+                            *self.ed.scene.get_mut(id).unwrap() = o.clone();
+                        }
+                        let cur = self.vp.cursor;
+                        let cmd = match a.as_str() {
+                            "walk" | "run" => Command { action: format!("{a}_to"), target: Some(o.name.clone()), location: Some(serde_json::json!([cur.x, cur.y, cur.z])), ..Default::default() },
+                            "path" => Command { action: "walk_path".into(), target: Some(o.name.clone()), ..Default::default() },
+                            p => Command { action: "perform".into(), target: Some(o.name.clone()), name: Some(p.trim_start_matches("perform:").to_string()), ..Default::default() },
+                        };
+                        let log = self.ed.execute(&[cmd]);
+                        if let Some(l) = log.first() {
+                            self.toast(l.trim_start_matches(['✔', '✖', ' ']).to_string(), if l.starts_with('✔') { theme::OK } else { theme::WARN });
+                        }
+                        return;
+                    }
                     if let Some(a) = ui.ctx().data_mut(|d| d.remove_temp::<String>(egui::Id::unique("hair_action"))) {
                         if o != orig {
                             self.ed.snapshot();
@@ -4414,6 +4434,22 @@ impl App {
                             col,
                             Stroke::new(1.0, Color32::BLACK),
                         ));
+                    }
+                }
+                // action strips of the selected character
+                let rig = self.ed.character_rig(None).filter(|_| !self.ed.selection.is_empty());
+                if let Some(arm) = rig.and_then(|r| self.ed.scene.get(r)).and_then(|o| o.armature.as_ref()) {
+                    for (i, st) in arm.strips.iter().enumerate() {
+                        let (a, b) = (x_of(st.start.max(fs)), x_of(st.end.min(fe)));
+                        if b <= a {
+                            continue;
+                        }
+                        let col = [Color32::from_rgb(70, 120, 190), Color32::from_rgb(90, 160, 110), Color32::from_rgb(190, 130, 60), Color32::from_rgb(160, 90, 170)][i % 4];
+                        let r = egui::Rect::from_min_max(egui::pos2(a + 1.0, rect.bottom() - 9.0), egui::pos2(b - 1.0, rect.bottom() - 1.0));
+                        p.rect_filled(r, 2.0, col.gamma_multiply(0.85));
+                        if r.width() > 30.0 {
+                            p.text(r.left_center() + vec2(3.0, 0.0), Align2::LEFT_CENTER, &st.action, FontId::proportional(8.5), Color32::WHITE);
+                        }
                     }
                 }
                 let x = x_of(self.ed.frame.clamp(fs, fe));
@@ -5754,6 +5790,73 @@ fn armature_props(ui: &mut Ui, o: &mut crate::scene::Object) {
     } else if arm.has_keys() && ui.small_button("Store as Action").on_hover_text("Keep this animation as a named action and start another").clicked() {
         arm.new_action("Action");
     }
+    section(ui, "Performance (action strips)", |ui| {
+        let names: Vec<String> = arm.actions.iter().map(|a| a.name.clone()).collect();
+        let mut remove = None;
+        let mut up = None;
+        egui::Grid::new("strips").num_columns(5).spacing(vec2(4.0, 3.0)).show(ui, |ui| {
+            for (i, st) in arm.strips.iter_mut().enumerate() {
+                let label = if st.path.len() >= 2 { format!("🚶 {} ({:.1} m)", st.action, crate::motion::path_len(&st.path)) } else { st.action.clone() };
+                egui::ComboBox::from_id_salt(("strip", i)).width(110.0).selected_text(RichText::new(label).small()).show_ui(ui, |ui| {
+                    for n in &names {
+                        ui.selectable_value(&mut st.action, n.clone(), n);
+                    }
+                });
+                let len = st.end - st.start;
+                if ui.add(egui::DragValue::new(&mut st.start).speed(0.3).prefix("▶ ")).changed() {
+                    st.end = st.start + len;
+                }
+                ui.add(egui::DragValue::new(&mut st.end).speed(0.3).range(st.start + 1..=100_000).prefix("■ "));
+                if i > 0 && ui.small_button("⏶").on_hover_text("Play earlier (swap with the strip before)").clicked() {
+                    up = Some(i);
+                }
+                if ui.small_button("✕").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(i) = remove {
+            arm.strips.remove(i);
+            if arm.strips.is_empty() {
+                if let Some(h) = arm.home.take() {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("rig_home_restore"), h));
+                }
+            }
+        }
+        if let Some(i) = up {
+            // swap order, keeping the time slots
+            let (a, b) = (arm.strips[i - 1].clone(), arm.strips[i].clone());
+            let la = a.end - a.start;
+            let lb = b.end - b.start;
+            arm.strips[i - 1] = crate::motion::Strip { start: a.start, end: a.start + lb, ..b };
+            arm.strips[i] = crate::motion::Strip { start: a.start + lb, end: a.start + lb + la, ..a };
+        }
+        ui.horizontal_wrapped(|ui| {
+            for n in names.iter().filter(|n| !n.eq_ignore_ascii_case("walk") && !n.eq_ignore_ascii_case("run")) {
+                if ui.small_button(format!("+ {n}")).on_hover_text("Play this action next").clicked() {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("motion_action"), format!("perform:{n}")));
+                }
+            }
+            if names.iter().any(|n| n.eq_ignore_ascii_case("walk")) && ui.small_button("🚶 Walk to 3D cursor").clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("motion_action"), "walk".to_string()));
+            }
+            if names.iter().any(|n| n.eq_ignore_ascii_case("run")) && ui.small_button("🏃 Run to 3D cursor").clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("motion_action"), "run".to_string()));
+            }
+            if names.iter().any(|n| n.eq_ignore_ascii_case("walk")) && ui.small_button("✏ Walk the drawn path").on_hover_text("Follows the last Grease Pencil stroke").clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("motion_action"), "path".to_string()));
+            }
+        });
+        if arm.strips.is_empty() {
+            ui.label(RichText::new("Sequence actions here (Idle, then walk to the cursor, wave …). Walk/Run strips move the character along their path at the speed its feet move.").small().color(theme::TEXT_DIM));
+        } else if ui.small_button("Clear all strips").clicked() {
+            arm.strips.clear();
+            if let Some(h) = arm.home.take() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("rig_home_restore"), h));
+            }
+        }
+    });
     section(ui, "Bones (pose)", |ui| {
         egui::ScrollArea::vertical().max_height(260.0).id_salt("bones").show(ui, |ui| {
             for b in arm.bones.iter_mut() {

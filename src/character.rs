@@ -320,9 +320,9 @@ fn add_actions(arm: &mut Armature) {
         let mut v = arms_down(a, g, 0.0, 0.0, 10.0);
         v.retain(|(i, _)| *i != uar && *i != far);
         let down = aim(a, g, uar, Vec3::new(-0.12, 0.0, -1.0));
-        let raised = aim(a, g, uar, Vec3::new(-0.75, -0.15, 0.55));
+        let raised = aim(a, g, uar, Vec3::new(-0.95, -0.1, 0.4));
         v.push((uar, rot(down.slerp(raised, up))));
-        v.push((far, rot(Quat::IDENTITY.slerp(turn(a, g, far, Vec3::new(1.0, 0.0, -0.3), -95.0) * turn(a, g, far, Vec3::Y, 25.0 * w), up))));
+        v.push((far, rot(Quat::IDENTITY.slerp(turn(a, g, far, Vec3::new(1.0, 0.0, -0.3), -70.0) * turn(a, g, far, Vec3::Y, 25.0 * w), up))));
         v.push((har, rot(turn(a, g, har, Vec3::Y, 15.0 * w * up))));
         v.push((head, rot(turn(a, g, head, Vec3::Z, -12.0 * up))));
         v.push((hal, rot(Quat::IDENTITY)));

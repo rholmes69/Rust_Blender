@@ -94,6 +94,12 @@ pub struct Armature {
     pub blend: Option<(Vec<BonePose>, f32, f32)>,
     #[serde(skip)]
     pub blend_last: f32,
+    /// NLA-lite: a sequence of action strips with root motion (overrides the active action).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strips: Vec<crate::motion::Strip>,
+    /// Where the strips start from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<crate::scene::Transform>,
 }
 
 /// IK constraint: rotate this bone and `chain - 1` parents (0 = up to the root) so the bone's
@@ -473,6 +479,10 @@ impl Armature {
             b.pose = BonePose::default();
         }
     }
+}
+
+pub fn sample_pub(keys: &[BoneKey], frame: f32) -> Option<BonePose> {
+    sample(keys, frame)
 }
 
 /// Linear between keys (imported animation is baked per frame; hand keys get an ease).

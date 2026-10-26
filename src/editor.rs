@@ -2127,6 +2127,98 @@ impl Editor {
                 self.select_only(arm);
                 Ok(msg + " — play_action to animate it")
             }
+            "walk_to" | "run_to" | "go_to" | "walk" | "run" | "walk_path" | "follow_path" => {
+                let rig = self.character_rig(c.target.as_deref()).ok_or("which character? (target = its name or rig)")?;
+                let mut action = c.name.clone().unwrap_or_else(|| if c.action.starts_with("run") { "Run".into() } else { "Walk".into() });
+                if action.eq_ignore_ascii_case("walk_path") || action.is_empty() {
+                    action = "Walk".into();
+                }
+                // the destination: a drawn path, a list of points, or a point / object
+                let mut points: Vec<Vec3> = vec![];
+                if c.action.contains("path") {
+                    let pid = c.object.as_deref().and_then(|n| self.scene.find_by_name(n)).filter(|id| self.scene.get(*id).is_some_and(|o| o.pencil.is_some())).or_else(|| self.pencil_object(false)).ok_or("draw the path first (Draw mode) — or give vector = points")?;
+                    let o = self.scene.get(pid).unwrap();
+                    let m = o.transform.matrix();
+                    let p = o.pencil.as_ref().unwrap();
+                    let s = p.shown(o.sim_frame).and_then(|i| p.drawings[i].strokes.last()).ok_or("the drawing has no strokes")?;
+                    points = s.points.iter().map(|q| m.transform_point3(*q)).collect();
+                } else if let Some(list) = c.vector.as_ref().and_then(|v| v.as_array()).filter(|l| l.first().is_some_and(|x| x.is_array())) {
+                    points = list.iter().filter_map(|p| vec3(&Some(p.clone()))).collect();
+                } else {
+                    let spec = c.look_at.as_ref().or(c.location.as_ref()).ok_or("walk_to needs location (a point or an object name)")?;
+                    let mut dest = self.resolve_point(spec).ok_or("can't find where to walk to")?;
+                    // walking up to an object: stop in front of it, not inside
+                    if let Some(name) = spec.as_str() {
+                        if let Some(o) = self.scene.find_by_name(name).and_then(|id| self.scene.get(id)) {
+                            let a = self.scene.get(rig).unwrap();
+                            let from = a.armature.as_ref().and_then(|arm| arm.home.map(|h| crate::motion::end_state(arm, &h).0)).unwrap_or(a.transform.location);
+                            let (lo, hi) = crate::assets::bounds_of(&self.scene, o.id);
+                            let r = ((hi - lo) * Vec3::new(0.5, 0.5, 0.0)).length() + 0.35;
+                            let d = (Vec3::new(dest.x, dest.y, 0.0) - Vec3::new(from.x, from.y, 0.0)).normalize_or(Vec3::Y);
+                            dest -= d * r;
+                        }
+                    }
+                    points.push(dest);
+                }
+                let frame = self.frame;
+                let fs = self.scene.frame_start;
+                let o = self.scene.get_mut(rig).unwrap();
+                let tr = o.transform;
+                let arm = o.armature.as_mut().unwrap();
+                if arm.find_action(&action).is_none() {
+                    return Err(format!("the rig has no {action} action"));
+                }
+                let home = *arm.home.get_or_insert(tr);
+                let (pos, _, end) = crate::motion::end_state(arm, &home);
+                let start = if arm.strips.is_empty() { frame.max(fs) } else { end };
+                let mut path = vec![pos];
+                path.extend(points.iter().map(|p| Vec3::new(p.x, p.y, pos.z)));
+                let n = crate::motion::frames_for(arm, &action, &path);
+                let ai = arm.find_action(&action).unwrap();
+                let speed = crate::motion::ground_speed(arm, ai);
+                let len = crate::motion::path_len(&path);
+                let canonical = arm.actions[ai].name.clone();
+                arm.strips.push(crate::motion::Strip { action: canonical.clone(), start, end: start + n, blend: 6.0, path, speed });
+                let name = o.name.clone();
+                self.scene.frame_end = self.scene.frame_end.max(start + n + 24);
+                self.set_frame(self.frame);
+                Ok(format!("\"{name}\" will {} {len:.1} m over frames {start}–{} — press play", canonical.to_lowercase(), start + n))
+            }
+            "perform" | "then" | "add_strip" | "do_action" => {
+                let rig = self.character_rig(c.target.as_deref()).ok_or("which character? (target = its name or rig)")?;
+                let frame = self.frame;
+                let fs = self.scene.frame_start;
+                let o = self.scene.get_mut(rig).unwrap();
+                let tr = o.transform;
+                let arm = o.armature.as_mut().unwrap();
+                let list: Vec<String> = arm.actions.iter().map(|a| a.name.clone()).collect();
+                let want = c.name.clone().ok_or(format!("perform needs name = an action ({})", list.join(", ")))?;
+                let ai = arm.find_action(&want).ok_or(format!("no action {want:?} ({})", list.join(", ")))?;
+                let (lo, hi) = arm.actions[ai].range().unwrap_or((1, 24));
+                let len = c.number.map(|n| n as i32).unwrap_or(hi - lo).max(1);
+                let home = *arm.home.get_or_insert(tr);
+                let (_, _, end) = crate::motion::end_state(arm, &home);
+                let start = c.segments.map(|s| s as i32).unwrap_or(if arm.strips.is_empty() { frame.max(fs) } else { end });
+                let an = arm.actions[ai].name.clone();
+                arm.strips.push(crate::motion::Strip { action: an.clone(), start, end: start + len, blend: 6.0, path: vec![], speed: 0.0 });
+                let name = o.name.clone();
+                self.scene.frame_end = self.scene.frame_end.max(start + len + 24);
+                self.set_frame(self.frame);
+                Ok(format!("\"{name}\": {an} over frames {start}–{}", start + len))
+            }
+            "clear_motion" | "clear_strips" | "stop_motion" => {
+                let rig = self.character_rig(c.target.as_deref()).ok_or("which character?")?;
+                let o = self.scene.get_mut(rig).unwrap();
+                let arm = o.armature.as_mut().unwrap();
+                let n = arm.strips.len();
+                arm.strips.clear();
+                if let Some(h) = arm.home.take() {
+                    o.transform = h;
+                }
+                let name = o.name.clone();
+                self.set_frame(self.frame);
+                Ok(format!("Cleared {n} strips from \"{name}\""))
+            }
             "groom" | "hair_edit" | "comb_hair" | "groom_hair" => self.toggle_groom(),
             "draw_mode" | "grease_pencil" | "annotate" => {
                 if self.pencil_draw.is_some() && c.name.as_deref() != Some("off") {
@@ -2687,6 +2779,28 @@ impl Editor {
         self.weight_paint = None;
         self.hair_edit = None;
         self.pencil_draw = None;
+    }
+
+    /// The rig of a character: the named armature, the armature deforming the named mesh, else the
+    /// active one / the only one with a Walk action.
+    pub fn character_rig(&self, name: Option<&str>) -> Option<u64> {
+        let rig_of = |id: u64| -> Option<u64> {
+            let o = self.scene.get(id)?;
+            if o.armature.is_some() {
+                return Some(id);
+            }
+            if let Some(s) = &o.skin {
+                return Some(s.armature);
+            }
+            o.parent.filter(|p| self.scene.get(*p).is_some_and(|a| a.armature.is_some()))
+        };
+        if let Some(n) = name {
+            return self.scene.find_by_name(n).and_then(rig_of);
+        }
+        self.active
+            .and_then(rig_of)
+            .or_else(|| self.selection.iter().find_map(|s| rig_of(*s)))
+            .or_else(|| self.scene.objects.iter().find(|o| o.armature.as_ref().is_some_and(|a| a.find_action("walk").is_some())).map(|o| o.id))
     }
 
     /// The Grease Pencil object to draw into: the active one, else the first, else a new one.
@@ -3805,6 +3919,50 @@ mod tests {
         ed.undo();
         assert!(ed.scene.find_by_name("Vase.001").is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn character_walks_to_things_and_performs() {
+        let mut ed = Editor::default();
+        let log = ed.execute(&[
+            cmd(r#"{"action":"add_character","name":"Bob"}"#),
+            cmd(r#"{"action":"set_transform","target":"Cube","location":[0,-6,1]}"#),
+            cmd(r#"{"action":"walk_to","target":"Bob","location":"Cube"}"#),
+            cmd(r#"{"action":"perform","target":"Bob","name":"wave"}"#),
+            cmd(r#"{"action":"run_to","target":"Bob","location":[4,-6,0]}"#),
+        ]);
+        assert!(log.iter().all(|l| l.starts_with('✔')), "{log:?}");
+        let rig = ed.scene.find_by_name("Bob Rig").unwrap();
+        let body = ed.scene.find_by_name("Bob").unwrap();
+        let strips = ed.scene.get(rig).unwrap().armature.as_ref().unwrap().strips.clone();
+        assert_eq!(strips.iter().map(|s| s.action.as_str()).collect::<Vec<_>>(), ["Walk", "Wave", "Run"]);
+        assert!(strips[1].start == strips[0].end && strips[2].start == strips[1].end);
+        // the walk stops in front of the cube (about 1.35 m short of its centre)
+        let stop = *strips[0].path.last().unwrap();
+        assert!(stop.y < -4.0 && stop.y > -5.6, "{stop}");
+        assert!(ed.scene.frame_end >= strips[2].end);
+        // body follows the rig
+        let centre = |ed: &Editor| {
+            let o = ed.scene.get(body).unwrap();
+            let m = o.transform.matrix();
+            let p = o.posed.as_ref().unwrap();
+            p.verts.iter().map(|v| m.transform_point3(*v)).sum::<Vec3>() / p.verts.len() as f32
+        };
+        ed.set_frame(1);
+        let c0 = centre(&ed);
+        ed.set_frame((strips[0].start + strips[0].end) / 2);
+        let c1 = centre(&ed);
+        assert!(c1.y < c0.y - 1.0, "walked towards −Y: {c0} → {c1}");
+        ed.set_frame(strips[2].end + 5);
+        let c2 = centre(&ed);
+        assert!((c2.x - 4.0).abs() < 0.4 && (c2.y + 6.0).abs() < 0.4, "ran to [4,-6]: {c2}");
+        // scrubbing back gives the same place again
+        ed.set_frame((strips[0].start + strips[0].end) / 2);
+        assert!(centre(&ed).distance(c1) < 1e-3);
+        // clear: back home
+        ed.execute(&[cmd(r#"{"action":"clear_motion","target":"Bob"}"#)]);
+        ed.set_frame(1);
+        assert!(centre(&ed).distance(c0) < 1e-3, "{} vs {c0}", centre(&ed));
     }
 
     #[test]

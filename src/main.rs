@@ -11,6 +11,7 @@ mod hair;
 mod templates;
 mod character;
 mod pencil;
+mod motion;
 mod assets;
 mod shapekeys;
 mod physics;

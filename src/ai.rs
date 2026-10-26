@@ -431,6 +431,11 @@ pub const ACTIONS: &[&str] = &[
     "groom",
     "hair_dynamics",
     "add_character",
+    "walk_to",
+    "run_to",
+    "walk_path",
+    "perform",
+    "clear_motion",
     "draw",
     "draw_arrow",
     "draw_circle",
@@ -545,6 +550,11 @@ Each command is an object with "action" plus only the fields it needs:
 - add_character: a rigged humanoid mannequin (1.8 m, facing −Y) with actions Idle, Walk, Run, Wave, Jump;
   name, location, color (skin/clothes); modifier = "hair" also gives it long hair. Then animate it with
   play_action (target = its rig, name = Walk …). "add a person waving" = add_character + play_action Wave.
+- walk_to / run_to: target = the character, location = a point or an object name (it stops in front of
+  it) — the character walks there at its natural speed, turning to face the way it goes; walk_path follows
+  the last Grease Pencil stroke; perform: target, name = action (Wave, Jump, Idle …), number = frames.
+  These queue one after another (NLA strips): "walk to the table, wave, then run to the door" = walk_to,
+  perform Wave, run_to. clear_motion removes the sequence.
 - draw: Grease Pencil strokes drawn on top of the scene (they show in renders too) — vector = [[x,y,z], …]
   points, color, number = thickness in cm (default 1.5); draw_arrow: location = start, look_at = end (point
   or object name); draw_circle: location = centre, scale = radius (on the ground plane). Use for

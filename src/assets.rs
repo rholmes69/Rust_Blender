@@ -79,6 +79,27 @@ fn material_deps(scene: &Scene, m: &Material, textures: &mut Vec<crate::textures
     }
 }
 
+/// World-space bounding box of an object (its location when it has no mesh).
+pub fn bounds_of(scene: &Scene, id: u64) -> (Vec3, Vec3) {
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    if let Some(o) = scene.get(id) {
+        if o.is_mesh() {
+            let m = o.transform.matrix();
+            let pm = o.posed.as_ref().map(|p| (**p).clone()).unwrap_or_else(|| o.poly());
+            for v in &pm.verts {
+                let w = m.transform_point3(*v);
+                lo = lo.min(w);
+                hi = hi.max(w);
+            }
+        }
+        if lo.x > hi.x {
+            lo = o.transform.location;
+            hi = lo;
+        }
+    }
+    (lo, hi)
+}
+
 /// World-space bottom centre of some objects.
 pub fn pivot_of(scene: &Scene, ids: &[u64]) -> Vec3 {
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));

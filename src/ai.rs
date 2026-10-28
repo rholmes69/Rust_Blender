@@ -59,6 +59,10 @@ pub enum AiRequest {
     Review { model: String, prompt: String, round: u32 },
     /// Ask a vision model to describe a picture as a buildable 3D scene.
     Describe { model: String, image_b64: String, request: String },
+    /// OpenRouter's model catalogue.
+    RemoteModels,
+    /// Check the OpenRouter API key.
+    RemoteKey,
 }
 
 #[derive(Debug)]
@@ -89,6 +93,8 @@ pub enum AiEvent {
     PullDone(Result<String, String>),
     /// Vision model description of an attached picture.
     Described { model: String, text: Result<String, String>, secs: f32 },
+    RemoteModels(Result<Vec<crate::openrouter::ModelInfo>, String>),
+    RemoteKey(Result<String, String>),
 }
 
 pub struct AiClient {
@@ -121,6 +127,13 @@ impl AiClient {
                         AiRequest::ListModels => {
                             let _ = ev_tx.send(AiEvent::Models(list_models(&agent, &host)));
                         }
+                        AiRequest::RemoteModels => {
+                            let _ = ev_tx.send(AiEvent::RemoteModels(crate::openrouter::list_models(&agent)));
+                        }
+                        AiRequest::RemoteKey => {
+                            let _ = ev_tx.send(AiEvent::RemoteKey(crate::openrouter::check_key(&agent)));
+                        }
+                        AiRequest::Ps(model) if crate::openrouter::is_remote(&model) => {}
                         AiRequest::Ps(model) => {
                             if let Some(f) = vram_fraction(&agent, &host, &model) {
                                 let _ = ev_tx.send(AiEvent::Ps(model, f));
@@ -143,7 +156,7 @@ impl AiClient {
                             };
                             // ---- stage 1: decision model ----
                             if let Some(rm) = router.filter(|r| *r != model) {
-                                let tool_mode = *tool_caps.entry(rm.clone()).or_insert_with(|| crate::router::capabilities(&agent, &host, &rm).iter().any(|c| c == "tools" || c == "decision"));
+                                let tool_mode = crate::openrouter::is_remote(&rm) || *tool_caps.entry(rm.clone()).or_insert_with(|| crate::router::capabilities(&agent, &host, &rm).iter().any(|c| c == "tools" || c == "decision"));
                                 match crate::router::decide(&agent, &host, &rm, &history, &scene, &prompt, tool_mode, decide_modes.entry(rm.clone()).or_default()) {
                                     Ok((route, raw)) => {
                                         let secs = t0.elapsed().as_secs_f32();
@@ -192,6 +205,7 @@ impl AiClient {
                                     raw,
                                     secs: t0.elapsed().as_secs_f32(),
                                 },
+                                Err(e) if crate::openrouter::is_remote(&model) => AiEvent::Error(e),
                                 Err(e) => AiEvent::Error(friendly_error(&e, &model)),
                             };
                             let _ = ev_tx.send(ev);
@@ -293,6 +307,11 @@ fn describe_image(agent: &ureq::Agent, host: &str, model: &str, image_b64: &str,
     let mut prompt = DESCRIBE_PROMPT.to_string();
     if !request.trim().is_empty() {
         prompt += &format!("\nThe user wants: {request}");
+    }
+    if crate::openrouter::is_remote(model) {
+        let msg = crate::openrouter::complete(agent, model, &[crate::openrouter::image_message(&prompt, image_b64)], &crate::openrouter::Opts { temperature: 0.2, ..Default::default() })?;
+        let text = msg["content"].as_str().unwrap_or("").trim().to_string();
+        return if text.is_empty() { Err(format!("{model} returned an empty description")) } else { Ok(text) };
     }
     let body = json!({
         "model": model,
@@ -775,6 +794,31 @@ fn chat(
     }
     messages.extend(recent.into_iter().rev());
     messages.push(json!({"role": "user", "content": prompt}));
+    if crate::openrouter::is_remote(model) {
+        // no schema-constrained decoding here: JSON mode plus the format spelled out
+        messages[0]["content"] = json!(format!("{}\n\nAnswer with ONE JSON object only, no prose around it: {{\"reply\": \"short sentence\", \"commands\": [ ... ]}}. Each command follows this JSON schema: {}", system_prompt(scene), command_schema()["properties"]["commands"]["items"]));
+        let mut parser = StreamParser::default();
+        let mut all_cmds: Vec<Command> = vec![];
+        let mut last_reply_len = 0;
+        let o = crate::openrouter::Opts { temperature: 0.15, json: true, ..Default::default() };
+        let raw = crate::openrouter::stream(agent, model, &messages, &o, cancel, &mut |chunk| {
+            let new_cmds = parser.push(chunk);
+            let reply = parser.reply_so_far();
+            if !new_cmds.is_empty() || reply.len() != last_reply_len {
+                last_reply_len = reply.len();
+                all_cmds.extend(new_cmds.iter().cloned());
+                let _ = tx.send(AiEvent::Delta { reply, commands: new_cmds });
+                repaint();
+            }
+        })?;
+        return match parse_ai_content(&raw) {
+            Ok((reply, cmds, raw)) => Ok((reply, cmds.into_iter().skip(all_cmds.len()).collect(), raw)),
+            Err(_) if !all_cmds.is_empty() => Ok((parser.reply_so_far(), vec![], raw)),
+            // a model that answered in plain words: show them
+            Err(_) if !raw.trim().is_empty() && !raw.contains('{') => Ok((raw.trim().to_string(), vec![], raw)),
+            Err(e) => Err(e),
+        };
+    }
     let mut body = json!({
         "model": model,
         "messages": messages,

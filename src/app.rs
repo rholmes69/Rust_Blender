@@ -50,6 +50,10 @@ pub struct Settings {
     pub wake_phrase: String,
     /// Vision model for pictures ("" = pick automatically).
     pub vision_model: String,
+    /// OpenRouter API key (cloud models as `openrouter:<id>`); empty = $OPENROUTER_API_KEY.
+    pub openrouter_key: String,
+    /// OpenRouter models picked before (shown in the model menus).
+    pub remote_models: Vec<String>,
     /// Templates + recent files when the app starts.
     pub show_start_screen: bool,
     /// Most recent first.
@@ -92,6 +96,8 @@ impl Default for Settings {
             vision_model: String::new(),
             show_start_screen: true,
             recent_files: vec![],
+            openrouter_key: String::new(),
+            remote_models: vec![],
         }
     }
 }
@@ -193,6 +199,12 @@ struct Toast {
 
 pub struct App {
     lib: library::Library,
+    /// OpenRouter catalogue (loaded on demand), its status, the search box and what a click picks
+    remote_catalog: Vec<crate::openrouter::ModelInfo>,
+    remote_status: Option<Result<String, String>>,
+    remote_search: String,
+    remote_target: u8,
+    remote_loading: bool,
     ed: Editor,
     vp: Viewport,
     ai: AiClient,
@@ -338,8 +350,14 @@ impl App {
             Role::System,
             "Welcome to Rust Blender! Type or speak what you want to build — e.g. “make a snowman”, “add a ring of 8 glowing cubes”, or “rotate it 45 degrees”. Simple commands run instantly; complex ones go to your local Ollama model.",
         ));
+        crate::openrouter::set_key(&settings.openrouter_key);
         let mut app = Self {
             lib: library::Library::new(false),
+            remote_catalog: vec![],
+            remote_status: None,
+            remote_search: String::new(),
+            remote_target: 0,
+            remote_loading: false,
             ed: Editor::default(),
             vp,
             ai,
@@ -447,9 +465,10 @@ impl App {
                     if self.settings.auto_decision_model {
                         self.settings.decision_model = crate::router::pick_decision_model(&self.models).unwrap_or_default();
                     }
-                    if self.settings.auto_select_model
+                    let remote = crate::openrouter::is_remote(&self.settings.model);
+                    if !remote && (self.settings.auto_select_model
                         || self.settings.model.is_empty()
-                        || !self.models.contains(&self.settings.model)
+                        || !self.models.contains(&self.settings.model))
                     {
                         if let Some(best) = ai::pick_best_model(&self.models) {
                             if self.settings.model != best
@@ -464,6 +483,17 @@ impl App {
                 AiEvent::Models(Err(e)) => {
                     self.ollama = OllamaStatus::Offline(e);
                 }
+                AiEvent::RemoteModels(r) => {
+                    self.remote_loading = false;
+                    match r {
+                        Ok(list) => {
+                            self.remote_status = Some(Ok(format!("{} OpenRouter models", list.len())));
+                            self.remote_catalog = list;
+                        }
+                        Err(e) => self.remote_status = Some(Err(e)),
+                    }
+                }
+                AiEvent::RemoteKey(r) => self.remote_status = Some(r),
                 AiEvent::Reviewed { model, reply, commands, round, secs, error } => self.on_reviewed(model, reply, commands, round, secs, error),
                 AiEvent::Routed { router, route, detail, secs } => {
                     match route.as_str() {
@@ -672,7 +702,7 @@ impl App {
     // ---------------------------------------------------------------------------------------
     fn reviewer_model(&self) -> String {
         let d = &self.settings.decision_model;
-        if !d.is_empty() && self.models.contains(d) { d.clone() } else { self.settings.model.clone() }
+        if self.model_ready(d) { d.clone() } else { self.settings.model.clone() }
     }
 
     /// Called after an AI answer was applied (one undo snapshot was taken before it).
@@ -778,7 +808,7 @@ impl App {
         u.secs = stt_secs;
         self.chat.push(u);
 
-        let online = self.ollama == OllamaStatus::Online && !self.settings.model.is_empty();
+        let online = self.model_ready(&self.settings.model);
         if self.settings.instant_commands || !online {
             if let Some(cmds) = ai::parse_simple(&text) {
                 let log = self.ed.execute(&cmds);
@@ -812,6 +842,7 @@ impl App {
         }
         if !online {
             let msg = match &self.ollama {
+                _ if crate::openrouter::is_remote(&self.settings.model) => format!("{} needs an OpenRouter API key — add it in the Copilot settings (⚙). Get one at {}.", self.settings.model, crate::openrouter::KEYS_URL),
                 OllamaStatus::Offline(_) => "Ollama isn't running, so I can only do simple commands right now. Start Ollama (ollama serve) and pull a model — see the Copilot settings.".to_string(),
                 _ => "No Ollama model is installed yet. Pull one from the Copilot settings (recommended: qwen3:8b).".to_string(),
             };
@@ -819,7 +850,7 @@ impl App {
             return;
         }
         let scene = self.ed.scene.summary(&self.ed.selection);
-        let router = Some(self.settings.decision_model.clone()).filter(|d| !d.is_empty() && self.models.contains(d));
+        let router = Some(self.settings.decision_model.clone()).filter(|d| self.model_ready(d));
         self.route_stage = router.as_ref().map(|r| format!("{r} deciding"));
         self.ai.send(AiRequest::Chat {
             model: self.settings.model.clone(),
@@ -914,8 +945,20 @@ impl App {
         }
     }
 
+    /// Can this model take requests now? (Ollama models: installed and Ollama up; OpenRouter
+    /// models: a key is set.)
+    fn model_ready(&self, m: &str) -> bool {
+        if m.is_empty() {
+            return false;
+        }
+        if crate::openrouter::is_remote(m) {
+            return crate::openrouter::has_key();
+        }
+        self.ollama == OllamaStatus::Online && self.models.iter().any(|x| x == m)
+    }
+
     fn vision_model(&self) -> Option<String> {
-        if !self.settings.vision_model.is_empty() && self.models.contains(&self.settings.vision_model) {
+        if !self.settings.vision_model.is_empty() && self.model_ready(&self.settings.vision_model) {
             return Some(self.settings.vision_model.clone());
         }
         ai::pick_vision_model(&self.models)
@@ -929,8 +972,9 @@ impl App {
         u.voice = from_voice;
         self.chat.push(u);
         self.last_prompt = request.clone();
-        if self.ollama != OllamaStatus::Online {
-            self.chat.push(ChatEntry::new(Role::System, "Ollama isn't running, so pictures can't be read right now. Start Ollama and try again."));
+        let remote_vision = self.vision_model().is_some_and(|m| crate::openrouter::is_remote(&m));
+        if self.ollama != OllamaStatus::Online && !remote_vision {
+            self.chat.push(ChatEntry::new(Role::System, "Ollama isn't running, so pictures can't be read right now. Start Ollama and try again — or pick an OpenRouter vision model in the Copilot settings."));
             return;
         }
         let Some(vm) = self.vision_model() else {
@@ -2625,6 +2669,18 @@ impl App {
                             self.mic_button(ui, 15.0);
                             ui.add_space(6.0);
                             let (dot, label) = match &self.ollama {
+                                _ if crate::openrouter::is_remote(&self.settings.model) => {
+                                    if crate::openrouter::has_key() {
+                                        let d = &self.settings.decision_model;
+                                        if self.model_ready(d) && d != &self.settings.model {
+                                            (theme::OK, format!("✦ {} → ☁ {}", short_model(d), short_model(&self.settings.model)))
+                                        } else {
+                                            (theme::OK, format!("✦ ☁ {}", short_model(&self.settings.model)))
+                                        }
+                                    } else {
+                                        (theme::WARN, "✦ OpenRouter: no key".into())
+                                    }
+                                }
                                 OllamaStatus::Online if !self.settings.model.is_empty() => {
                                     if !self.settings.decision_model.is_empty() && self.models.contains(&self.settings.decision_model) {
                                         (theme::OK, format!("✦ {} → {}", short_model(&self.settings.decision_model), short_model(&self.settings.model)))
@@ -2920,7 +2976,7 @@ impl App {
                     self.copilot_settings(ui);
                     ui.separator();
                 }
-                if let OllamaStatus::Offline(e) = self.ollama.clone() {
+                if let (OllamaStatus::Offline(e), false) = (self.ollama.clone(), crate::openrouter::is_remote(&self.settings.model)) {
                     egui::Frame::new()
                         .fill(Color32::from_rgb(64, 40, 40))
                         .corner_radius(6.0)
@@ -2941,6 +2997,7 @@ impl App {
                                 RichText::new("Install Ollama, then in a terminal run:").small(),
                             );
                             ui.code(format!("ollama pull {}", ai::RECOMMENDED_MODEL));
+                            ui.label(RichText::new("…or use cloud models: add an OpenRouter API key in the Copilot settings (⚙).").small());
                             ui.label(
                                 RichText::new("Simple commands still work offline.")
                                     .small()
@@ -3363,6 +3420,111 @@ impl App {
             });
     }
 
+    /// Cloud models through OpenRouter: the key, the catalogue and picking models from it.
+    fn openrouter_settings(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Cloud models (OpenRouter)").strong()).on_hover_text("Claude, GPT, Gemini, Llama, Qwen, DeepSeek … through one API key. Requests go over the internet to OpenRouter and are billed to your OpenRouter account.");
+        ui.horizontal(|ui| {
+            ui.label("API key");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.settings.openrouter_key).password(true).hint_text(if std::env::var("OPENROUTER_API_KEY").is_ok() { "using $OPENROUTER_API_KEY" } else { "sk-or-…" }).desired_width(170.0));
+            if r.changed() {
+                crate::openrouter::set_key(&self.settings.openrouter_key);
+            }
+            if r.lost_focus() {
+                self.settings.save();
+            }
+            if ui.add_enabled(crate::openrouter::has_key(), egui::Button::new(RichText::new("Test").small())).clicked() {
+                self.remote_status = Some(Ok("checking the key…".into()));
+                self.ai.send(AiRequest::RemoteKey);
+            }
+            ui.hyperlink_to(RichText::new("get a key").small(), crate::openrouter::KEYS_URL);
+        });
+        match &self.remote_status {
+            Some(Ok(m)) => {
+                ui.label(RichText::new(m).small().color(theme::OK));
+            }
+            Some(Err(e)) => {
+                ui.add(egui::Label::new(RichText::new(e).small().color(theme::ERR)).wrap());
+            }
+            None => {}
+        }
+        if self.remote_catalog.is_empty() {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.remote_loading, egui::Button::new(RichText::new(if self.remote_loading { "Loading models…" } else { "☁ Browse OpenRouter models" }).small())).clicked() {
+                    self.remote_loading = true;
+                    self.ai.send(AiRequest::RemoteModels);
+                }
+                if crate::openrouter::is_remote(&self.settings.model) {
+                    ui.label(RichText::new(format!("builder: {}", crate::openrouter::model_id(&self.settings.model))).small().color(theme::TEXT_DIM));
+                }
+            });
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Pick as").small());
+            ui.selectable_value(&mut self.remote_target, 0, RichText::new("Builder").small());
+            ui.selectable_value(&mut self.remote_target, 1, RichText::new("Decision").small());
+            ui.selectable_value(&mut self.remote_target, 2, RichText::new("Vision").small());
+            ui.add(egui::TextEdit::singleline(&mut self.remote_search).hint_text("🔍 claude, gpt, gemini, free …").desired_width(130.0));
+        });
+        let q = self.remote_search.to_lowercase();
+        let want_vision = self.remote_target == 2;
+        // suggestions first when there's no search
+        let mut list: Vec<&crate::openrouter::ModelInfo> = if q.is_empty() {
+            let mut v: Vec<&crate::openrouter::ModelInfo> = crate::openrouter::SUGGESTED.iter().filter_map(|id| self.remote_catalog.iter().find(|m| m.id == *id)).collect();
+            if v.len() < 6 {
+                let have: Vec<String> = v.iter().map(|m| m.id.clone()).collect();
+                let n = 12 - v.len();
+                v.extend(self.remote_catalog.iter().filter(|m| !have.contains(&m.id)).take(n));
+            }
+            v
+        } else {
+            self.remote_catalog.iter().filter(|m| m.id.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q) || (q == "free" && m.price_in == 0.0 && m.price_out == 0.0)).collect()
+        };
+        if want_vision {
+            list.retain(|m| m.vision);
+        }
+        let mut pick: Option<String> = None;
+        egui::ScrollArea::vertical().id_salt("or_models").max_height(170.0).show(ui, |ui| {
+            for m in list.iter().take(80) {
+                let full = format!("{}{}", crate::openrouter::PREFIX, m.id);
+                let current = [&self.settings.model, &self.settings.decision_model, &self.settings.vision_model][self.remote_target.min(2) as usize] == &full;
+                let price = if m.price_in == 0.0 && m.price_out == 0.0 { "free".to_string() } else { format!("${:.2} / ${:.2} per M", m.price_in, m.price_out) };
+                let tags = format!("{}{}", if m.vision { " 👁" } else { "" }, if m.tools { " 🛠" } else { "" });
+                let r = ui.selectable_label(current, RichText::new(format!("{}{tags}", m.id)).small()).on_hover_text(format!("{}
+{} tokens context · {price}{}", m.name, m.context, if m.tools { "
+tool calling (good decision model)" } else { "" }));
+                if r.clicked() {
+                    pick = Some(full);
+                }
+                ui.label(RichText::new(format!("   {price} · {}k ctx", m.context / 1000)).small().color(theme::TEXT_DIM));
+            }
+            if list.is_empty() {
+                ui.label(RichText::new("No matching models").small().color(theme::TEXT_DIM));
+            }
+        });
+        if let Some(m) = pick {
+            match self.remote_target {
+                0 => {
+                    self.settings.model = m.clone();
+                    self.settings.auto_select_model = false;
+                }
+                1 => {
+                    self.settings.decision_model = m.clone();
+                    self.settings.auto_decision_model = false;
+                }
+                _ => self.settings.vision_model = m.clone(),
+            }
+            self.settings.remote_models.retain(|x| *x != m);
+            self.settings.remote_models.insert(0, m.clone());
+            self.settings.remote_models.truncate(12);
+            self.settings.save();
+            if !crate::openrouter::has_key() {
+                self.remote_status = Some(Err(format!("Picked {} — now add your API key above", crate::openrouter::model_id(&m))));
+            }
+        }
+        ui.label(RichText::new("👁 reads pictures · 🛠 tool calling. Prices are per million input / output tokens. Ollama models stay local; ☁ models run on OpenRouter.").small().color(theme::TEXT_DIM));
+    }
+
     fn copilot_settings(&mut self, ui: &mut Ui) {
         egui::Frame::new()
             .fill(Color32::from_rgb(42, 40, 48))
@@ -3370,7 +3532,7 @@ impl App {
             .inner_margin(8.0)
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width());
-                ui.label(RichText::new("Language model (Ollama)").strong());
+                ui.label(RichText::new("Language model (Ollama, local)").strong());
                 egui::Grid::new("ai_settings")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -3401,6 +3563,12 @@ impl App {
                                 })
                                 .width(160.0)
                                 .show_ui(ui, |ui| {
+                                    for m in self.settings.remote_models.clone() {
+                                        if ui.selectable_label(self.settings.model == m, format!("☁ {}", crate::openrouter::model_id(&m))).clicked() {
+                                            self.settings.model = m;
+                                            self.settings.auto_select_model = false;
+                                        }
+                                    }
                                     for m in self.models.clone() {
                                         let best = ai::pick_best_model(&self.models).as_deref()
                                             == Some(m.as_str());
@@ -3442,11 +3610,12 @@ impl App {
                                     self.settings.decision_model.clear();
                                     self.settings.auto_decision_model = false;
                                 }
-                                for m in self.models.clone() {
+                                for m in self.settings.remote_models.iter().cloned().chain(self.models.clone()) {
                                     if m == self.settings.model {
                                         continue;
                                     }
-                                    if ui.selectable_label(self.settings.decision_model == m, &m).clicked() {
+                                    let label = if crate::openrouter::is_remote(&m) { format!("☁ {}", crate::openrouter::model_id(&m)) } else { m.clone() };
+                                    if ui.selectable_label(self.settings.decision_model == m, label).clicked() {
                                         self.settings.decision_model = m;
                                         self.settings.auto_decision_model = false;
                                     }
@@ -3494,6 +3663,12 @@ impl App {
                                 for m in self.models.iter().filter(|m| ai::VISION_MODELS.iter().any(|v| m.starts_with(v))) {
                                     ui.selectable_value(&mut self.settings.vision_model, m.clone(), m.as_str());
                                 }
+                                for m in &self.settings.remote_models {
+                                    let vision = self.remote_catalog.iter().find(|i| i.id == crate::openrouter::model_id(m)).is_none_or(|i| i.vision);
+                                    if vision {
+                                        ui.selectable_value(&mut self.settings.vision_model, m.clone(), format!("☁ {}", crate::openrouter::model_id(m)));
+                                    }
+                                }
                             }).response.on_hover_text("Reads pictures you attach (📎 or drop on this panel) so the Copilot can build them");
                             let have = self.models.iter().any(|m| m.starts_with("qwen2.5vl"));
                             if !have && ui.add_enabled(self.pull.is_none() && self.ollama == OllamaStatus::Online, egui::Button::new(RichText::new(format!("Pull {}", ai::RECOMMENDED_VISION)).small())).clicked() {
@@ -3539,6 +3714,8 @@ impl App {
                         );
                         ui.end_row();
                     });
+                ui.add_space(4.0);
+                self.openrouter_settings(ui);
                 ui.add_space(4.0);
                 ui.label(RichText::new("Voice (Whisper, on-device)").strong());
                 egui::Grid::new("voice_settings")
@@ -5883,6 +6060,9 @@ fn armature_props(ui: &mut Ui, o: &mut crate::scene::Object) {
 }
 
 fn short_model(m: &str) -> &str {
+    if let Some(id) = m.strip_prefix(crate::openrouter::PREFIX) {
+        return id.rsplit('/').next().unwrap_or(id);
+    }
     m.strip_suffix(":latest").unwrap_or(m)
 }
 

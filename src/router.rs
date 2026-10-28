@@ -24,6 +24,9 @@ pub enum Route {
 
 /// Model capabilities from `/api/show` (e.g. ["completion", "tools"]).
 pub fn capabilities(agent: &ureq::Agent, host: &str, model: &str) -> Vec<String> {
+    if crate::openrouter::is_remote(model) {
+        return vec!["completion".into(), "tools".into()];
+    }
     let Ok(mut resp) = agent.post(&format!("{host}/api/show")).send_json(json!({"model": model})) else { return vec![] };
     let v: Value = resp.body_mut().read_json().unwrap_or_default();
     v["capabilities"].as_array().map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect()).unwrap_or_default()
@@ -111,6 +114,9 @@ pub fn decide(agent: &ureq::Agent, host: &str, model: &str, history: &[ChatMsg],
         messages.push(json!({"role": m.role, "content": c}));
     }
     messages.push(json!({"role": "user", "content": prompt}));
+    if crate::openrouter::is_remote(model) {
+        return decide_remote(agent, model, messages, scene, tool_mode, mode_cache);
+    }
     // Try the richest mode first and degrade gracefully: tool calling -> JSON schema ->
     // plain JSON instructions (some models, e.g. ones exposing a "decision" capability,
     // reject `tools`, `format` or `think`).
@@ -168,6 +174,36 @@ pub fn decide(agent: &ureq::Agent, host: &str, model: &str, history: &[ChatMsg],
     let raw = v["message"].to_string();
     let route = parse_decision(&v["message"])?;
     Ok((route, raw))
+}
+
+/// The decision step on OpenRouter: tool calling, else JSON mode, else plain instructions.
+fn decide_remote(agent: &ureq::Agent, model: &str, messages: Vec<Value>, scene: &str, tool_mode: bool, mode_cache: &mut Option<String>) -> Result<(Route, String), String> {
+    use crate::openrouter::{Opts, complete};
+    let modes: Vec<&str> = match mode_cache.as_deref() {
+        Some("json") => vec!["json", "plain"],
+        Some("plain") => vec!["plain"],
+        _ if tool_mode => vec!["tools", "json", "plain"],
+        _ => vec!["json", "plain"],
+    };
+    let mut last_err = String::new();
+    for mode in modes {
+        let mut msgs = messages.clone();
+        if mode != "tools" {
+            msgs[0] = json!({"role": "system", "content": decision_prompt(scene, false)});
+        }
+        let o = Opts { temperature: 0.0, json: mode == "json", tools: (mode == "tools").then(tools), max_tokens: Some(1500) };
+        match complete(agent, model, &msgs, &o) {
+            Ok(msg) => match parse_decision(&msg) {
+                Ok(route) => {
+                    *mode_cache = Some(mode.to_string());
+                    return Ok((route, msg.to_string()));
+                }
+                Err(e) => last_err = e,
+            },
+            Err(e) => last_err = e,
+        }
+    }
+    Err(format!("decision model error: {last_err}"))
 }
 
 /// Interpret a decision-model message (tool calls or JSON content).
@@ -280,6 +316,11 @@ mod tests {
 
 /// Agent loop "check" stage: ask a model to review flagged issues and return fix commands.
 pub fn review(agent: &ureq::Agent, host: &str, model: &str, prompt: &str) -> Result<(String, Vec<Command>), String> {
+    if crate::openrouter::is_remote(model) {
+        let msg = crate::openrouter::complete(agent, model, &[json!({"role": "user", "content": prompt})], &crate::openrouter::Opts { temperature: 0.1, json: true, ..Default::default() })?;
+        let (reply, cmds, _) = crate::ai::parse_ai_content(msg["content"].as_str().unwrap_or(""))?;
+        return Ok((reply, cmds));
+    }
     let mut last_err = String::new();
     for (use_format, think_flag) in [(true, true), (false, false)] {
         let mut body = json!({
